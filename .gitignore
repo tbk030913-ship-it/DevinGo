@@ -1,0 +1,38 @@
+# Android / Gradle
+app/build/
+app/.gradle/
+app/local.properties
+app/app/build/
+app/app/release/
+*.apk
+*.aab
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+
+# Go bridge
+bridge/devingo-bridge
+bridge/devingo-bridge*.exe
+bridge/acptest.exe
+bridge/*.log
+*.exe~
+nul
+
+# Local tool indexes / test artifacts
+.codegraph/
+.playwright-mcp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Release signing (local only)
+app/app/signing.properties
+app/app/*.jks
+app/tailnet/build/
+bridge/acptest/probe-logs/
+shot-*.png
+
+hs_err_pid*.log
+replay_pid*.log

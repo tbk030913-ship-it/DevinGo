@@ -1,0 +1,320 @@
+package com.devingo.app.acp
+
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+
+// ACP (Agent Client Protocol) v1 — https://agentclientprotocol.com
+// Only the slice DevinGo needs is modelled; unknown fields are ignored on
+// decode and extension notifications (`_cognition.ai/*`) pass through as
+// raw JsonObjects.
+
+@Serializable
+data class InitializeParams(
+    val protocolVersion: Int,
+    val clientCapabilities: ClientCapabilities,
+    val clientInfo: ClientInfo,
+    /**
+     * Pass-through for capability metadata (e.g. future revert / elicitation
+     * declarations); null until those are negotiated.
+     */
+    val _meta: JsonObject? = null,
+)
+
+@Serializable
+data class ClientCapabilities(
+    val fs: FsCapabilities = FsCapabilities(),
+    val terminal: Boolean = false,
+)
+
+@Serializable
+data class FsCapabilities(
+    val readTextFile: Boolean = false,
+    val writeTextFile: Boolean = false,
+)
+
+@Serializable
+data class ClientInfo(val name: String, val version: String)
+
+@Serializable
+data class InitializeResult(
+    val protocolVersion: Int = 1,
+    val authMethods: List<AuthMethod> = emptyList(),
+    val agentInfo: AgentInfo? = null,
+    val agentCapabilities: JsonObject? = null,
+)
+
+@Serializable
+data class AuthMethod(
+    val id: String,
+    val name: String,
+    val description: String? = null,
+)
+
+@Serializable
+data class AgentInfo(
+    val name: String? = null,
+    val title: String? = null,
+    val version: String? = null,
+)
+
+@Serializable
+data class AuthenticateParams(
+    val methodId: String,
+    /** Devin accepts `_meta.api_key` to authenticate without browser login. */
+    val _meta: JsonObject? = null,
+)
+
+@Serializable
+data class SessionNewParams(
+    val cwd: String,
+    val mcpServers: List<JsonObject> = emptyList(),
+)
+
+@Serializable
+data class SessionLoadParams(
+    val sessionId: String,
+    val cwd: String,
+    val mcpServers: List<JsonObject> = emptyList(),
+)
+
+@Serializable
+data class SessionNewResult(
+    /** May be absent in `session/load` replies — the caller knows the id. */
+    val sessionId: String = "",
+    val modes: SessionModes? = null,
+    val models: SessionModels? = null,
+    /**
+     * Devin's unified config surface: `session/new` and `session/load`
+     * return the available modes and models as configOptions entries with
+     * category "mode" / "model", superseding the ACP `modes`/`models` fields.
+     */
+    val configOptions: List<ConfigOption> = emptyList(),
+) {
+    fun resolvedModes(): SessionModes? =
+        modes ?: configOption("mode")?.let { opt ->
+            SessionModes(
+                currentModeId = opt.currentValue,
+                availableModes = opt.options.map {
+                    SessionMode(id = it.value, name = it.name, description = it.description)
+                },
+            )
+        }
+
+    fun resolvedModels(): SessionModels? =
+        models ?: configOption("model")?.let { opt ->
+            SessionModels(
+                currentModelId = opt.currentValue,
+                availableModels = opt.options.map {
+                    SessionModel(modelId = it.value, name = it.name, description = it.description)
+                },
+            )
+        }
+
+    private fun configOption(id: String): ConfigOption? =
+        configOptions.firstOrNull { it.id == id || it.category == id }
+}
+
+/** A configurable session option (modes, models, …) from `configOptions`. */
+@Serializable
+data class ConfigOption(
+    val id: String,
+    val name: String? = null,
+    val category: String? = null,
+    val type: String? = null,
+    val description: String? = null,
+    val currentValue: String? = null,
+    val options: List<ConfigOptionChoice> = emptyList(),
+)
+
+@Serializable
+data class ConfigOptionChoice(
+    val value: String,
+    val name: String,
+    val description: String? = null,
+)
+
+@Serializable
+data class SessionModes(
+    val currentModeId: String? = null,
+    val availableModes: List<SessionMode> = emptyList(),
+)
+
+@Serializable
+data class SessionMode(
+    val id: String,
+    val name: String,
+    val description: String? = null,
+)
+
+@Serializable
+data class SessionModels(
+    val currentModelId: String? = null,
+    val availableModels: List<SessionModel> = emptyList(),
+)
+
+@Serializable
+data class SessionModel(
+    val modelId: String,
+    val name: String,
+    val description: String? = null,
+)
+
+@Serializable
+data class PromptParams(
+    val sessionId: String,
+    val prompt: List<ContentBlock>,
+)
+
+@Serializable
+data class ContentBlock(
+    val type: String,
+    /** text blocks. */
+    val text: String? = null,
+    /** image/audio blocks: base64 payload plus its media type. */
+    val data: String? = null,
+    val mimeType: String? = null,
+    /** resource_link blocks. */
+    val uri: String? = null,
+    val name: String? = null,
+)
+
+@Serializable
+data class PromptResult(val stopReason: String? = null)
+
+@Serializable
+data class CancelParams(val sessionId: String)
+
+@Serializable
+data class SetModeParams(val sessionId: String, val modeId: String)
+
+@Serializable
+data class SetModelParams(val sessionId: String, val modelId: String)
+
+@Serializable
+data class SessionDeleteParams(val sessionId: String)
+
+@Serializable
+data class SessionListParams(val cwd: String? = null)
+
+/** Devin's unified config setter (`configId` covers "mode"/"model"/…). */
+@Serializable
+data class SetConfigOptionParams(
+    val sessionId: String,
+    val configId: String,
+    val value: String,
+)
+
+/** Devin extension: `_cognition.ai/session/rename`. */
+@Serializable
+data class RenameSessionParams(val sessionId: String, val title: String)
+
+/**
+ * One entry of `session/list`. Devin returns the richer fields
+ * (lock/plan/user-message flags) flat on each session object; verified
+ * against the 3000.12.x agent.
+ */
+data class AcpSession(
+    val sessionId: String,
+    val title: String? = null,
+    val cwd: String? = null,
+    val isLocked: Boolean = false,
+    val lockHolderPid: Long? = null,
+    val lockHolderClient: String? = null,
+    val planFilePath: String? = null,
+    val hasUserMessages: Boolean = false,
+    val lastActivity: String? = null,
+)
+
+@Serializable
+data class RevertListStepsParams(val sessionId: String)
+
+/**
+ * `_cognition.ai/revert/forkFromStep` — fork a NEW session branching off
+ * [stepId]. The binary's param table shows `stepId`/`forkTargetNodeId`/
+ * `userMessageId`/`summary`; stepId is what listSteps hands back.
+ */
+@Serializable
+data class RevertForkParams(
+    val sessionId: String,
+    val stepId: String,
+)
+
+/** One entry of `_cognition.ai/revert/listSteps` (parsed loosely). */
+data class RevertStep(
+    val stepId: String,
+    val summary: String? = null,
+    val kind: String? = null,
+    val userMessageId: String? = null,
+)
+
+// Agent -> client
+@Serializable
+data class SessionUpdateParams(
+    val sessionId: String,
+    val update: JsonObject,
+)
+
+@Serializable
+data class RequestPermissionParams(
+    val sessionId: String,
+    val toolCall: ToolCallInfo,
+    val options: List<PermissionOption> = emptyList(),
+)
+
+@Serializable
+data class ToolCallInfo(
+    val toolCallId: String,
+    val title: String? = null,
+    val kind: String? = null,
+    val status: String? = null,
+    val rawInput: JsonElement? = null,
+    val content: JsonElement? = null,
+    val locations: JsonElement? = null,
+)
+
+/** A slash command advertised via `available_commands_update`. */
+data class AvailableCommand(
+    val name: String,
+    val description: String? = null,
+    val inputHint: String? = null,
+    /** Devin extras carried in the command's `_meta` object. */
+    val category: String? = null,
+    val icon: String? = null,
+)
+
+@Serializable
+data class PermissionOption(
+    val optionId: String,
+    val name: String,
+    val kind: String? = null,
+)
+
+object AcpMethods {
+    const val INITIALIZE = "initialize"
+    const val AUTHENTICATE = "authenticate"
+    const val SESSION_NEW = "session/new"
+    const val SESSION_LOAD = "session/load"
+    const val SESSION_PROMPT = "session/prompt"
+    const val SESSION_CANCEL = "session/cancel"
+    const val SESSION_SET_MODE = "session/set_mode"
+    const val SESSION_SET_MODEL = "session/set_model"
+    const val SESSION_SET_CONFIG_OPTION = "session/set_config_option"
+    const val SESSION_DELETE = "session/delete"
+    const val SESSION_LIST = "session/list"
+    const val SESSION_RENAME = "_cognition.ai/session/rename"
+    const val SESSION_UPDATE = "session/update"
+    const val SESSION_REQUEST_PERMISSION = "session/request_permission"
+    const val SESSION_CLOSE = "session/close"
+
+    // Devin revert extension (negotiated via clientCapabilities._meta).
+    const val REVERT_LIST_STEPS = "_cognition.ai/revert/listSteps"
+    const val REVERT_FORK_FROM_STEP = "_cognition.ai/revert/forkFromStep"
+    const val REVERT_PREVIEW = "_cognition.ai/revert/preview"
+    const val REVERT_EXECUTE = "_cognition.ai/revert/execute"
+    const val REVERT_STEPS_UPDATED = "_cognition.ai/revert/stepsUpdated"
+}
+
+// JSON-RPC error code used by ACP when the agent requires authenticate first.
+const val ACP_ERROR_AUTH_REQUIRED = -32000
+const val JSONRPC_METHOD_NOT_FOUND = -32601

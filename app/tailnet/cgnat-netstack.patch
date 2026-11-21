@@ -1,0 +1,23 @@
+diff --git a/tsnet/tsnet.go b/tsnet/tsnet.go
+--- a/tsnet/tsnet.go
++++ b/tsnet/tsnet.go
+@@ -51,6 +51,7 @@ import (
+ 	"tailscale.com/net/netmon"
+ 	"tailscale.com/net/proxymux"
+ 	"tailscale.com/net/socks5"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/net/tsdial"
+ 	"tailscale.com/tailcfg"
+ 	"tailscale.com/tsd"
+@@ -688,6 +689,11 @@ func (s *Server) start() (reterr error) {
+ 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
+ 	s.netstack = ns
+ 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
++		// A missing peer route must fail in netstack. UserDial otherwise
++		// falls back to a system socket for the same CGNAT address.
++		if tsaddr.CGNATRange().Contains(ip.Unmap()) {
++			return true
++		}
+ 		_, ok := eng.PeerForIP(ip)
+ 		return ok
+ 	}

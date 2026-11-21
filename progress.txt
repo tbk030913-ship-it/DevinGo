@@ -1,0 +1,10 @@
+2026-11-21 17:18（北京时间）| DevinGo v2 UI 审查修复：Home 空会话判定/滑动删除透明度/短状态词、Settings 去重与灰阶、sheet 标题对齐、transcript 左边距、权限卡中文文案与选项排序、通知允许仅 allow_once、720dp 宽屏限宽、LiveStatus 防抖+settingsVersion+时钟按需更新；修复抽屉会话列表为空（session/list cwd 斜杠不匹配+作用域未共享+打开不刷新）。
+2026-11-21 22:56 | v3 UI: grouped Home/drawer、内联 work log+DiffCard、effort selector、半屏 model sheet 已实现并截图验证；三项 review（+/effort 位置/代码块 pill）未开始；assembleDebug+Profile 绿；tailnet 未开始
+2026-11-21 22:59（北京时间）| v3 完成：项目分组侧边栏、内嵌工作过程+DiffCard、推理强度、模型弹层半屏；剩余任务（+号对齐、推理强度位置/中文、代码块样式、内置 Tailscale、最终报告）已写入交接提示词 Temp\devingo-next-session-prompt.md
+2026-11-21 23:25（北京时间）| 任务1-3完成：分组"+"右对齐、推理强度中文化上移、代码块Devin化（白底无边栏+悬浮胶囊+GitHub浅色系）
+2026-11-21 23:41（北京时间）| 任务4a-d阶段：libdevingotailnet.so 双架构编译成功（5个JNI符号），设置页Tailscale分组+Kotlin接线完成，MuMu上已到"需要登录"状态，授权URL已交用户
+2026-11-22 08:08 | 任务4收尾：tailnet授权后Running、100.x转发会话成功、重启免登、反向验证通过；assembleDebug/Profile双过；待review+报告
+2026-11-22 08:47 | 任务4-5全部完成：review修复8项（生命周期互斥/转发锁/authUrl过期/超时/重试），原生+APK重编装验，tailnet全链路复验通过，地址已还原，守护进程已停；交付最终报告
+2026-11-22 09:15 | 新增：扫码连接（bridge /pair+ASCII二维码 → app相机扫描/粘贴配对码 → 探测选址）+ release正式签名包；bridge已换devingo-bridge-new.exe运行；双包编译通过并实测
+2026-11-22 01:42 | 修复 release 扫码闪退：R8 fullMode 关闭（根因是其激进合并/内联导致 invokeSuspend NPE），加 compose.animation keep；release 三架构包重出，x86_64 模拟器实测扫码/粘贴/配对全流程无崩溃
+2026-11-22 02:10 | 两处提速修复：bridge 自动注入 authenticate（读 credentials.toml 的 windsurf_api_key，devin acp 不再用本地凭据导致每会话弹浏览器）+ 配对探测并行化带进度提示；v3 桥已上线 :8790，WS 实测 session/new 免登录直建
