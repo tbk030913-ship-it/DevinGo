@@ -154,6 +154,40 @@ func TestFsWriteRejectsEscapes(t *testing.T) {
 	}
 }
 
+// A symlink planted at the final path component must be replaced, never
+// followed — otherwise /fs/write escapes the workspace through it.
+func TestFsWriteReplacesTargetSymlink(t *testing.T) {
+	setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+	c := dialClient(t, srv)
+	workspace := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("seed outside file: %v", err)
+	}
+	link := filepath.Join(workspace, "plan.md")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable (Windows dev mode?): %v", err)
+	}
+	sid := initAndNewCwd(t, c, filepath.ToSlash(workspace))
+
+	status, m := fsPost(t, srv, "", `{"sessionId":"`+sid+
+		`","path":"plan.md","content":"# Plan\n"}`)
+	if status != http.StatusOK {
+		t.Fatalf("/fs/write over symlink: status %d (%v), want 200", status, m)
+	}
+	if got, _ := os.ReadFile(outside); string(got) != "secret" {
+		t.Fatalf("write followed the symlink — outside file = %q", got)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("target still a symlink after write: %v %v", fi, err)
+	}
+	if got, _ := os.ReadFile(link); string(got) != "# Plan\n" {
+		t.Fatalf("plan.md content = %q", got)
+	}
+}
+
 // Malformed JSON, missing fields and an oversized body are all rejected
 // before the session lookup happens.
 func TestFsWriteBadRequests(t *testing.T) {

@@ -179,7 +179,10 @@ internal fun Composer(
     }
     var sendMenu by remember { mutableStateOf(false) }
     var modeMenu by remember { mutableStateOf(false) }
-    val canSend = input.isNotBlank() || attachments.isNotEmpty() || citation != null
+    // A blank-quote citation isn't sendable content, but a queue edit's
+    // blank 保存 is — it's the delete-item affordance.
+    val canSend = queueEditing || input.isNotBlank() || attachments.isNotEmpty() ||
+        citation?.quotedText?.isNotBlank() == true
 
     var fieldValue by remember { mutableStateOf(TextFieldValue(input)) }
     LaunchedEffect(input) {
@@ -214,7 +217,7 @@ internal fun Composer(
 
     // Expanded layer: focused (the user's own expansion), multi-line input,
     // an over-long single line, or attachments/citation needing the strip.
-    var focused by remember { mutableStateOf(false) }
+    var focused by remember(ui.sessionId) { mutableStateOf(false) }
     var compactFieldWidth by remember { mutableIntStateOf(0) }
     val textMeasurer = rememberTextMeasurer()
     val fieldStyle = MaterialTheme.typography.bodyLarge

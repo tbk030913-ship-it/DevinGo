@@ -876,8 +876,12 @@ class SessionStore(
      * Returns false when nothing was sent — the caller must keep the input
      * and attachments so the user doesn't lose them.
      */
-    fun send(text: String, attachments: List<ImageAttachment> = emptyList()): Boolean {
-        val citation = _draftCitation.value
+    fun send(
+        text: String,
+        attachments: List<ImageAttachment> = emptyList(),
+        mergeCitation: Boolean = true,
+    ): Boolean {
+        val citation = if (mergeCitation) _draftCitation.value else null
         val trimmed = text.trimEnd()
         if (trimmed.isBlank() && attachments.isEmpty() && citation == null) return false
         val total = attachments.sumOf { it.bytes.size.toLong() }
@@ -885,8 +889,12 @@ class SessionStore(
             append(Kind.Error, "图片合计超过 3MB，未发送")
             return false
         }
-        _draftCitation.value = null
         val merged = mergedWithCitation(trimmed, citation)
+        // A citation whose quote was blanked merges to nothing — don't
+        // ship an empty prompt; the draft keeps its state so the user
+        // can fix the quote or drop the chip.
+        if (merged.isBlank() && attachments.isEmpty()) return false
+        if (mergeCitation) _draftCitation.value = null
         if (_ui.value.running || promptJob?.isActive == true) {
             // Queued prompts carry the attachments themselves — the bytes go
             // out when the queue drains, nothing is dropped.
@@ -921,8 +929,9 @@ class SessionStore(
     /** Interrupt the running turn with a new instruction right now. */
     fun steer(text: String) {
         val trimmed = text.trimEnd()
-        if (trimmed.isBlank() && _draftCitation.value == null) return
         val merged = mergedWithCitation(trimmed, _draftCitation.value).trimEnd()
+        // Blank text + a blanked quote = nothing to steer; keep the draft.
+        if (merged.isBlank()) return
         _draftCitation.value = null
         steerMerged(merged)
     }
@@ -1026,7 +1035,6 @@ class SessionStore(
         // A citation added during the edit merges into the item's text —
         // its chip belongs to the edit session, not the stashed draft.
         val text = mergedWithCitation(_draft.value.trimEnd(), _draftCitation.value)
-        _draftCitation.value = null
         val attachments = _draftAttachments.value
         var stillQueued = true
         _queuedPrompts.update { q ->
@@ -1043,6 +1051,10 @@ class SessionStore(
                 }
             }
         }
+        // The citation merged into the saved item is spent; when the item
+        // already went out on its own, keepDraft leaves it attached to the
+        // live draft alongside the typed text.
+        if (stillQueued) _draftCitation.value = null
         // A target that already went out on its own keeps the typed text
         // as the new draft rather than restoring the pre-edit stash.
         endQueuedEdit(keepDraft = !stillQueued)
@@ -1082,7 +1094,9 @@ class SessionStore(
             append(Kind.Error, "图片未被缓存，无法随消息重发")
             return
         }
-        if (!send(item.text, item.attachments)) return
+        // The resent text is verbatim — a draft citation pinned now belongs
+        // to the next message, not this failed echo.
+        if (!send(item.text, item.attachments, mergeCitation = false)) return
         mutateMessages { list -> list.filterNot { it.id == item.id } }
     }
 

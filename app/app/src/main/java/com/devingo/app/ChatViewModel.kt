@@ -204,11 +204,16 @@ class ChatViewModel(
     /** The bound session's working directory (fixed at store creation). */
     val boundCwd: String get() = store?.cwd.orEmpty()
 
-    fun send(text: String, attachments: List<ImageAttachment> = emptyList()): Boolean =
-        store?.send(text, attachments) ?: false
+    fun send(): Boolean {
+        val s = store ?: return false
+        // The store's draft is the truth — a keystroke in the same frame
+        // as the tap hasn't reached the collected UI state yet.
+        return s.send(s.draft.value, s.draftAttachments.value)
+    }
 
-    fun steer(text: String) {
-        store?.steer(text)
+    fun steer() {
+        val s = store ?: return
+        s.steer(s.draft.value)
     }
 
     fun cancelQueued(id: Long) {

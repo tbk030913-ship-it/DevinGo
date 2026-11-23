@@ -1140,6 +1140,8 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64,
 	// A session the hub re-created lazily (journal eviction, proc restart)
 	// lost its recorded workspace — the client's hint re-homes /fs/write.
 	// A recorded cwd stays authoritative; the hint only fills a gap.
+	// It's trusted client input — a token holder can already pick any
+	// cwd via session/new, so honoring it here widens nothing.
 	if s.cwd == "" && cwd != "" {
 		s.cwd = cwd
 	}
@@ -1690,9 +1692,12 @@ func truncStr(s string, n int) string {
 // ---------------------------------------------------------------- fs -----
 
 // Sentinel errors for /fs/write — the handler maps them to status codes.
+// errWriteFailed sanitizes filesystem errors: raw err strings carry
+// absolute server paths and must not reach the client.
 var (
 	errSessionNotHosted = errors.New("session has no hosted workspace")
 	errPathOutside      = errors.New("path escapes the session workspace")
+	errWriteFailed      = errors.New("write failed")
 )
 
 // writeSessionFile writes content at path inside the session's recorded
@@ -1717,7 +1722,7 @@ func (h *Hub) writeSessionFile(sid, path, content string) error {
 	}
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
-		return err // workspace no longer exists
+		return errSessionNotHosted // workspace no longer exists
 	}
 	clean := filepath.Clean(path)
 	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" ||
@@ -1752,9 +1757,33 @@ func (h *Hub) writeSessionFile(sid, path, content string) error {
 		return errPathOutside
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
+		return errWriteFailed
 	}
-	return os.WriteFile(target, []byte(content), 0o644)
+	// Write via a temp file inside root + rename: os.WriteFile would
+	// follow a final-component symlink or share an inode through a
+	// hardlink — both escape the containment checks above. Rename
+	// replaces the directory entry outright; readers also get the file
+	// atomically instead of a mid-write truncation.
+	tmp, err := os.CreateTemp(root, ".devingo-write-*")
+	if err != nil {
+		return errWriteFailed
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return errWriteFailed
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return errWriteFailed
+	}
+	if err := tmp.Close(); err != nil {
+		return errWriteFailed
+	}
+	if err := os.Rename(tmp.Name(), target); err != nil {
+		return errWriteFailed
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- rpc ----

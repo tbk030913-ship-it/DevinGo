@@ -45,3 +45,4 @@
 2026-11-24 04:17 | U5.4审查修复：胶囊遮挡StatusLine加动态bottom inset、失效重连提示改为不可点、草稿附件统一3MB上限、reduced-motion门控、忙碌期滑动删除复位
 2026-11-24 04:40 | U5.4质量审查修复：编辑重入不再丢弃已输入内容、忙碌窗口滑动删除可靠复位、steerQueued校验运行态、队列预览按id键控、inset/拨号态细节
 2026-11-24 05:10 | U5.5 spec审查修复：展开层工具栏fadeIn(160ms)、紧凑胶囊BasicTextField回到真52dp、空引用不再闪退sheet、清死import
+2026-11-24 05:45 | U5.5质量审查修复：fs/write末级symlink/hardlink逃逸用temp+rename封死并加测试、空引用不可发送、resend不吃草稿引用、send/steer直读store草稿、canSend/焦点细节

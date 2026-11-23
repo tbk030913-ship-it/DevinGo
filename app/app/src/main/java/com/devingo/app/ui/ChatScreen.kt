@@ -323,14 +323,14 @@ fun ChatScreen(
                     // rewrites the parked prompt, nothing is sent.
                     vm.saveQueuedEdit()
                     haptic.performHapticFeedback(HapticFeedbackType.Confirm)
-                } else if (vm.send(input, attachments)) {
+                } else if (vm.send()) {
                     haptic.performHapticFeedback(HapticFeedbackType.Confirm)
                     vm.setDraft("")
                     vm.setDraftAttachments(emptyList())
                 }
             },
             onSteer = {
-                vm.steer(input)
+                vm.steer()
                 vm.setDraft("")
             },
             onAttach = { vm.setDraftAttachments(attachments + it) },
