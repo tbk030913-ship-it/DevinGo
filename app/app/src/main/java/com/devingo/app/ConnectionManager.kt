@@ -76,6 +76,12 @@ class ConnectionManager private constructor(private val app: Application) {
          * whether a session is bound (background sessions still stream).
          */
         val connected: Boolean = false,
+        /**
+         * Optimistic agent-capability flag: a `_cognition.ai/revert/…` call
+         * returning method_not_found flips it (per-bridge — the capability
+         * belongs to the resident devin build, not to one session).
+         */
+        val revertSupported: Boolean = true,
     )
 
     companion object {
@@ -266,6 +272,9 @@ class ConnectionManager private constructor(private val app: Application) {
                     client.disconnect()
                     socketLive = false
                     dropEpoch()
+                    // A different bridge may run a different devin build —
+                    // forget the old revert probe and re-detect on demand.
+                    _conn.update { it.copy(revertSupported = true) }
                 }
             }
             lastCandKey = cand.joinToString("|")
@@ -588,6 +597,9 @@ class ConnectionManager private constructor(private val app: Application) {
                 scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]),
             ),
             onSessionReady = { sid, c -> onSessionReady?.invoke(sid, c) },
+            onRevertUnsupported = {
+                _conn.update { it.copy(revertSupported = false) }
+            },
         )
         // U7: show the last cached transcript right away — the attach replay
         // aligns it with the hub behind the staged commit.

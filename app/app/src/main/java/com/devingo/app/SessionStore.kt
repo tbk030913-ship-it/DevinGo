@@ -3,6 +3,7 @@ package com.devingo.app
 import android.util.Base64
 import com.devingo.app.acp.AcpClient
 import com.devingo.app.acp.AcpEvent
+import com.devingo.app.acp.AcpException
 import com.devingo.app.acp.AcpMethods
 import com.devingo.app.acp.AttachResult
 import com.devingo.app.acp.ConfigOption
@@ -60,6 +61,12 @@ class SessionStore(
     private val notifier: Notifier,
     internal val scope: CoroutineScope,
     private val onSessionReady: ((sessionId: String, cwd: String) -> Unit)? = null,
+    /**
+     * Fired once when a `_cognition.ai/revert/…` call answers
+     * method_not_found — the revert surface doesn't exist on this agent.
+     * Connection-level capability; the owner hides the menu entry.
+     */
+    private val onRevertUnsupported: (() -> Unit)? = null,
 ) {
 
     private companion object {
@@ -1036,6 +1043,11 @@ class SessionStore(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // -32601 is the capability probe's negative answer — the
+                // agent build simply has no revert surface (P4).
+                if ((e as? AcpException)?.code == JSONRPC_METHOD_NOT_FOUND) {
+                    onRevertUnsupported?.invoke()
+                }
                 _revertSteps.value = emptyList()
                 append(Kind.Error, "回退步骤获取失败: ${e.display()}")
             }

@@ -95,6 +95,7 @@ class ChatViewModel(
             usageCacheRead = sui.usageCacheRead,
             running = sui.running,
             extraConfigOptions = sui.extraConfigOptions,
+            revertSupported = conn.revertSupported,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState())
 

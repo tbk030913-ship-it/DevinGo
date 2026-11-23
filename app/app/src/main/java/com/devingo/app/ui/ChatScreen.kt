@@ -182,8 +182,10 @@ fun ChatScreen(
                         expandedWork[key] = expandedWork[key] != true
                     },
                     onUserLongPress = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        vm.loadRevertSteps()
+                        if (ui.revertSupported) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            vm.loadRevertSteps()
+                        }
                     },
                     onResend = { vm.resend(it) },
                     listState = listState,
@@ -372,10 +374,13 @@ private fun ChatTopBar(
                             menuOpen = false
                             onOpenInfo()
                         })
-                        DevinMenuItem("回退 / 分叉", onClick = {
-                            menuOpen = false
-                            onRevert()
-                        })
+                        // P4: agents without the revert surface get no entry.
+                        if (ui.revertSupported) {
+                            DevinMenuItem("回退 / 分叉", onClick = {
+                                menuOpen = false
+                                onRevert()
+                            })
+                        }
                         DevinMenuDivider()
                         DevinMenuItem(
                             "清除会话状态",
