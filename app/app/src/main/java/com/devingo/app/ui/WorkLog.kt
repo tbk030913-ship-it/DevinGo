@@ -117,8 +117,8 @@ internal fun WorkLogColumn(
     // Row-detail expansion is lifted here so the container can relax its
     // cap while a detail card or diff is open inside.
     val expandedDetails = remember { mutableStateMapOf<Long, Boolean>() }
-    val hasDiffs = entries.any {
-        it is WorkEntry.Step && it.item.diffs.isNotEmpty()
+    val hasDiffs = remember(entries) {
+        entries.any { it is WorkEntry.Step && it.item.diffs.isNotEmpty() }
     }
     val relaxed = hasDiffs || expandedDetails.values.any { it }
     val maxH by animateDpAsState(
@@ -532,7 +532,13 @@ private fun CommandOutputBox(
 ) {
     val cs = MaterialTheme.colorScheme
     val (window, headDropped) = remember(detail) {
-        val tail = foldCarriageReturn(detail).takeLast(COMMAND_OUT_MAX_CHARS)
+        val folded = foldCarriageReturn(detail)
+        var tail = folded.takeLast(COMMAND_OUT_MAX_CHARS)
+        // The char cap can slice an ANSI sequence at the window start —
+        // drop the leading fragment (an escape tail can't be styled).
+        if (tail.length < folded.length) {
+            tail = LEADING_ESC_FRAGMENT.replace(tail, "")
+        }
         val lines = tail.split('\n')
         val kept = if (lines.size > COMMAND_OUT_MAX_LINES) {
             lines.takeLast(COMMAND_OUT_MAX_LINES)
@@ -540,7 +546,7 @@ private fun CommandOutputBox(
             lines
         }
         (kept.joinToString("\n")) to
-            (tail.length < detail.length || kept.size < lines.size)
+            (tail.length < folded.length || kept.size < lines.size)
     }
     val styled = remember(window) { ansiToAnnotatedString(window) }
     val scroll = rememberScrollState()

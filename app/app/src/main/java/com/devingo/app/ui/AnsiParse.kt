@@ -32,11 +32,16 @@ private val Sgr = Regex("$ESC\\[([0-9;]*)m")
  * These are stripped from visible text, never styled.
  */
 private val OtherEscape = Regex(
-    "$ESC\\[[0-9;:?]*[A-Za-z]|" +              // CSI with a non-m final byte
+    "$ESC\\[[0-?]*[ -/]*[@-~]|" +              // CSI: params 0x30-0x3F, intermediates 0x20-0x2F, final 0x40-0x7E
         "$ESC][^\u0007$ESC]*(?:\u0007|$ESC\\\\)|" + // OSC, BEL- or ST-ended
+        "$ESC[PX^_][^$ESC]*(?:$ESC\\\\)|" +       // DCS/SOS/PM/APC payload up to ST
         "$ESC[()][0-9A-B]|" +                  // charset designate
-        "$ESC[@-Z\\\\-_]",                     // two-byte escapes (ESC + byte)
+        "$ESC[@-_]",                            // two-byte escapes (ESC + 0x40-0x5F)
 )
+
+/** A leading fragment left when a window cap sliced through an escape. */
+internal val LEADING_ESC_FRAGMENT =
+    Regex("^\\[?[0-9;?]*[ -/]*[@-~]|^[0-9;]*[A-Za-z~]")
 
 /**
  * `\r` overwrites the current terminal line — for each line keep only the

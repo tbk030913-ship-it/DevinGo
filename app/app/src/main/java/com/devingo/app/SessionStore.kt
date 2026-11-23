@@ -1475,7 +1475,7 @@ class SessionStore(
      * pass through any name already in the ACP set.
      */
     private fun toolKindOf(call: ToolCallInfo): String? {
-        call.kind?.let { return it }
+        call.kind?.takeIf { it.isNotBlank() }?.let { return it }
         val name = (call._meta?.get("cognition.ai/inferenceToolName")
             as? JsonPrimitive)?.strOrNull()
         return when {
