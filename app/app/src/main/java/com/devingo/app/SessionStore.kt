@@ -87,6 +87,11 @@ class SessionStore(
         const val MAX_ATTACHMENT_BYTES = 3_000_000L
         /** Sentinel completing a permission whose answer came from a peer client. */
         const val RESOLVED_BY_PEER = "__peer__"
+        /**
+         * Draft cap — the text also rides SavedStateHandle (a Bundle) and
+         * DataStore, so a paste-bomb must be bounded before it fans out.
+         */
+        const val MAX_DRAFT_CHARS = 64_000
     }
 
     /**
@@ -763,7 +768,7 @@ class SessionStore(
     // ---- drafts ----------------------------------------------------------------
 
     fun setDraft(text: String) {
-        _draft.value = text
+        _draft.value = text.take(MAX_DRAFT_CHARS)
     }
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {

@@ -2,15 +2,17 @@ package com.devingo.app
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 
 /**
  * View/binder for the currently selected session. The WebSocket, reconnect
@@ -24,10 +26,40 @@ import kotlinx.coroutines.flow.stateIn
  * disconnects, and the other sessions keep streaming off-screen.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
-class ChatViewModel(app: Application) : AndroidViewModel(app) {
+class ChatViewModel(
+    app: Application,
+    private val savedState: SavedStateHandle,
+) : AndroidViewModel(app) {
 
     private val cm = ConnectionManager.get(app)
     private val notifier = Notifier(app)
+
+    private companion object {
+        const val KEY_DRAFT_SID = "draft_session_id"
+        const val KEY_DRAFT_TEXT = "draft_text"
+    }
+
+    init {
+        // C6: the bound session's draft also rides the SavedStateHandle —
+        // the activity Bundle persists it on process death independently
+        // of the debounced DataStore write. It seeds back only when the
+        // store itself came up empty (its own restore hadn't landed).
+        viewModelScope.launch {
+            cm.currentStore.collectLatest { store ->
+                if (store == null) return@collectLatest
+                val savedText = savedState.get<String>(KEY_DRAFT_TEXT).orEmpty()
+                if (savedState.get<String>(KEY_DRAFT_SID) == store.sessionId &&
+                    savedText.isNotEmpty() && store.draft.value.isEmpty()
+                ) {
+                    store.setDraft(savedText)
+                }
+                store.draft.collect { text ->
+                    savedState[KEY_DRAFT_SID] = store.sessionId
+                    savedState[KEY_DRAFT_TEXT] = text
+                }
+            }
+        }
+    }
 
     private fun <T> bound(produce: SessionStore.() -> StateFlow<T>, initial: T): StateFlow<T> =
         cm.currentStore

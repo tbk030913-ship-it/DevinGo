@@ -134,6 +134,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.datetime)
     implementation(libs.androidx.exifinterface)
+    implementation(libs.androidx.datastore.preferences)
 
     // RikkaHub-sourced rich text stack (AGPL — ported files keep their
     // package names under me.rerere.*).

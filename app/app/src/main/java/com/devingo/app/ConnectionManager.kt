@@ -85,6 +85,8 @@ class ConnectionManager private constructor(private val app: Application) {
         private const val CLOSE_TIMEOUT_MS = 2_000L
         /** Transcript cache writes ride a debounce — one save per quiet stretch. */
         private const val CACHE_SAVE_DEBOUNCE_MS = 5_000L
+        /** Draft persistence is per keystroke-burst, not per keystroke. */
+        private const val DRAFT_SAVE_DEBOUNCE_MS = 500L
         private const val TAG = "ConnectionManager"
         /** Identifier this client reports in `_devingo/hello`. */
         private const val clientId = "devingo-android"
@@ -107,6 +109,7 @@ class ConnectionManager private constructor(private val app: Application) {
     private val client = AcpClient(json)
     private val notifier = Notifier(app)
     private val cache = TranscriptCache(app, json)
+    private val drafts = DraftStore(app)
 
     /** All session/connection work serializes here (the demux included). */
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -576,6 +579,8 @@ class ConnectionManager private constructor(private val app: Application) {
         cache.load(sessionId)
             ?.takeIf { it.host == lastHost }
             ?.let { store.restoreFromCache(it) }
+        // C6: a draft that outlived the process comes back with the session.
+        drafts.load(sessionId)?.let(store::setDraft)
         seqStash.remove(sessionId)?.let { store.seedSeq(it) }
         stores[sessionId] = store
         watchStore(store)
@@ -604,8 +609,13 @@ class ConnectionManager private constructor(private val app: Application) {
         reattachJobs.remove(sessionId)?.cancel()
         if (gone) {
             scope.launch { cache.remove(sessionId) }
+            scope.launch { runCatching { drafts.remove(sessionId) } }
         } else {
             scope.launch { cache.save(store.cacheSnapshot(lastHost)) }
+            // The cancelled draft watcher's debounce may hold the newest
+            // text — flush it now so the drop loses nothing. The session
+            // still exists hub-side, so its draft does too.
+            scope.launch { runCatching { drafts.save(sessionId, store.draft.value) } }
         }
         store.drop()
         seqStash.remove(sessionId)
@@ -738,13 +748,23 @@ class ConnectionManager private constructor(private val app: Application) {
                     runCatching { cache.save(store.cacheSnapshot(lastHost)) }
                 }
             }
+            launch {
+                store.draft.debounce(DRAFT_SAVE_DEBOUNCE_MS).collect {
+                    runCatching { drafts.save(store.sessionId, it) }
+                }
+            }
         }
     }
 
-    /** Snapshot every live store — called when the app goes to background. */
+    /**
+     * Snapshot every live store — called when the app goes to background.
+     * Drafts flush too: a process killed inside the debounce window still
+     * keeps the text typed moments before.
+     */
     fun persistCaches() {
         stores.values.forEach { s ->
             scope.launch { runCatching { cache.save(s.cacheSnapshot(lastHost)) } }
+            scope.launch { runCatching { drafts.save(s.sessionId, s.draft.value) } }
         }
     }
 
