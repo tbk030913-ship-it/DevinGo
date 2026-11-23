@@ -116,6 +116,8 @@ class ChatViewModel(
     val sessionsLoading: StateFlow<Boolean> = cm.sessionsLoading
     val sessionsError: StateFlow<String?> = cm.sessionsError
     val badges: StateFlow<Map<String, SessionBadge>> = cm.badges
+    /** Pending approvals across all sessions — the notification's count. */
+    val pendingApprovals: StateFlow<Int> = cm.pendingApprovals
     val openTarget: StateFlow<OpenTarget?> = cm.openTarget
     val alerts = cm.alerts
 

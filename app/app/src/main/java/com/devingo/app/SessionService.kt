@@ -59,6 +59,9 @@ class SessionService : Service() {
                     allowLabel = intent.getStringExtra(EXTRA_ALLOW_LABEL) ?: "允许",
                     denyLabel = intent.getStringExtra(EXTRA_DENY_LABEL) ?: "拒绝",
                     sessionId = intent.getStringExtra(Notifier.EXTRA_SESSION_ID),
+                    permissionRequestId = intent.getLongExtra(EXTRA_REQUEST_ID, 0L),
+                    permissionToolCallId = intent.getStringExtra(EXTRA_TOOL_CALL_ID),
+                    pendingCount = intent.getIntExtra(EXTRA_PENDING_COUNT, 0),
                 )
                 scheduleIdleRepost()
             }
@@ -118,15 +121,18 @@ class SessionService : Service() {
             .setContentIntent(openIntent(REQ_CONTENT))
             .addAction(0, "打开", openIntent(REQ_OPEN))
 
-        if (status.state == LiveStatus.State.NeedsPermission) {
+        // Broadcast actions answer the exact request in the background —
+        // but only when it is THE pending approval; with several waiting the
+        // card shows the count and tapping opens the app to handle them.
+        if (status.state == LiveStatus.State.NeedsPermission && status.pendingCount <= 1) {
             builder
                 .addAction(
                     0, status.allowLabel,
-                    openIntent(REQ_ALLOW, EXTRA_ACTION_ALLOW, status.sessionId),
+                    broadcastIntent(requestKey(status) * 2, PermissionActionReceiver.ACTION_ALLOW, status),
                 )
                 .addAction(
                     0, status.denyLabel,
-                    openIntent(REQ_DENY, EXTRA_ACTION_DENY, status.sessionId),
+                    broadcastIntent(requestKey(status) * 2 + 1, PermissionActionReceiver.ACTION_DENY, status),
                 )
         }
 
@@ -190,25 +196,49 @@ class SessionService : Service() {
 
     private fun notificationText(status: LiveStatus): String = when (status.state) {
         LiveStatus.State.Working -> status.detail.ifBlank { "处理中" }
-        LiveStatus.State.NeedsPermission -> status.detail.ifBlank { "等待授权" }
+        LiveStatus.State.NeedsPermission -> if (status.pendingCount > 1) {
+            "${status.pendingCount} 个审批待处理"
+        } else {
+            status.detail.ifBlank { "等待授权" }
+        }
         LiveStatus.State.Reconnecting -> "连接中断，正在重试"
         LiveStatus.State.Done, LiveStatus.State.Failed -> status.detail
         LiveStatus.State.Idle -> "等待指令"
     }
 
-    private fun openIntent(
+    private fun openIntent(requestCode: Int): PendingIntent = PendingIntent.getActivity(
+        this, requestCode,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    /**
+     * The permission actions fire a broadcast, not the activity: the
+     * receiver answers the exact (sessionId, requestId, toolCallId) request
+     * in the background and refreshes this card itself.
+     */
+    /**
+     * Per-request PendingIntent identity: a stale rendered card keeps ITS
+     * request's extras instead of having them overwritten by the next
+     * buildNotification — a tap then resolves nothing and opens the app.
+     * (Extras don't count toward PendingIntent identity; requestCode does.)
+     */
+    private fun requestKey(status: LiveStatus): Int =
+        31 * (status.sessionId?.hashCode() ?: 0) + (status.permissionRequestId?.hashCode() ?: 0)
+
+    private fun broadcastIntent(
         requestCode: Int,
-        action: String? = null,
-        sessionId: String? = null,
-    ): PendingIntent {
-        val intent = Intent(this, MainActivity::class.java)
-        if (action != null) intent.putExtra(EXTRA_NOTIFICATION_ACTION, action)
-        if (sessionId != null) intent.putExtra(Notifier.EXTRA_SESSION_ID, sessionId)
-        return PendingIntent.getActivity(
-            this, requestCode, intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-    }
+        action: String,
+        status: LiveStatus,
+    ): PendingIntent = PendingIntent.getBroadcast(
+        this, requestCode,
+        Intent(this, PermissionActionReceiver::class.java)
+            .setAction(action)
+            .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId)
+            .putExtra(PermissionActionReceiver.EXTRA_REQUEST_ID, status.permissionRequestId)
+            .putExtra(PermissionActionReceiver.EXTRA_TOOL_CALL_ID, status.permissionToolCallId),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
 
     private fun startForegroundWithType(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -241,9 +271,13 @@ class SessionService : Service() {
         private const val EXTRA_ALLOW_LABEL = "live_allow_label"
         private const val EXTRA_DENY_LABEL = "live_deny_label"
         private const val EXTRA_FALLBACK_TITLE = "title"
+        private const val EXTRA_REQUEST_ID = "live_permission_request_id"
+        private const val EXTRA_TOOL_CALL_ID = "live_permission_tool_call_id"
+        private const val EXTRA_PENDING_COUNT = "live_pending_count"
 
-        /** Survives START_STICKY restarts while the process lives. */
-        @Volatile private var lastStatus: LiveStatus? = null
+        /** Survives START_STICKY restarts while the process lives. Read by
+         *  [PermissionActionReceiver] to keep the chronometer continuous. */
+        @Volatile internal var lastStatus: LiveStatus? = null
         @Volatile private var fallbackTitle: String? = null
 
         fun start(context: Context, title: String?) {
@@ -265,7 +299,10 @@ class SessionService : Service() {
                     .putExtra(EXTRA_PROMOTE, status.promoteOngoing)
                     .putExtra(EXTRA_ALLOW_LABEL, status.allowLabel)
                     .putExtra(EXTRA_DENY_LABEL, status.denyLabel)
-                    .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId),
+                    .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId)
+                    .putExtra(EXTRA_REQUEST_ID, status.permissionRequestId)
+                    .putExtra(EXTRA_TOOL_CALL_ID, status.permissionToolCallId)
+                    .putExtra(EXTRA_PENDING_COUNT, status.pendingCount),
             )
         }
 

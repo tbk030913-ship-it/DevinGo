@@ -33,6 +33,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
@@ -129,6 +130,20 @@ class ConnectionManager private constructor(private val app: Application) {
 
     private val _badges = MutableStateFlow<Map<String, SessionBadge>>(emptyMap())
     val badges = _badges.asStateFlow()
+
+    /**
+     * Per-session pending-approval counts — summed into [pendingApprovals]
+     * for the live notification's "N 个审批" surface. Updated by
+     * [watchStore]; keyed so one store's queue contributes its real depth.
+     */
+    private val _permissionCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val pendingApprovals: StateFlow<Int> = _permissionCounts
+        .map { it.values.sum() }
+        .stateIn(scope, SharingStarted.Eagerly, 0)
+
+    /** The same total, synchronously — the broadcast answer path can't wait. */
+    fun pendingApprovalCount(): Int =
+        stores.values.sumOf { it.pendingPermissionCount.value }
 
     /** Heads-up events for sessions other than the one on screen. */
     private val _alerts = MutableSharedFlow<SessionAlert>(extraBufferCapacity = 8)
@@ -625,6 +640,7 @@ class ConnectionManager private constructor(private val app: Application) {
             scope.launch { runCatching { client.detach(sessionId) } }
         }
         _badges.update { it - sessionId }
+        _permissionCounts.update { it - sessionId }
         if (gone) _sessions.update { list -> list?.filterNot { it.sessionId == sessionId } }
         if (_currentStore.value === store) {
             _currentStore.value = null
@@ -741,6 +757,13 @@ class ConnectionManager private constructor(private val app: Application) {
                     )
                 }.collect { b ->
                     _badges.update { it + (store.sessionId to b) }
+                }
+            }
+            launch {
+                store.pendingPermissionCount.collect { n ->
+                    _permissionCounts.update {
+                        if (n == 0) it - store.sessionId else it + (store.sessionId to n)
+                    }
                 }
             }
             launch {

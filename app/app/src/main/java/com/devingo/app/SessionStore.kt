@@ -143,6 +143,10 @@ class SessionStore(
     private val _pendingPermission = MutableStateFlow<PendingPermission?>(null)
     val pendingPermission = _pendingPermission.asStateFlow()
 
+    /** Depth of the internal queue — feeds the notification's "N 个审批" count. */
+    private val _pendingPermissionCount = MutableStateFlow(0)
+    val pendingPermissionCount = _pendingPermissionCount.asStateFlow()
+
     private val _queuedPrompts = MutableStateFlow<List<QueuedPrompt>>(emptyList())
     val queuedPrompts = _queuedPrompts.asStateFlow()
 
@@ -1124,11 +1128,13 @@ class SessionStore(
     private fun pushPermission(p: PendingPermission) = synchronized(permissionLock) {
         permissionQueue.addLast(p)
         _pendingPermission.value = permissionQueue.firstOrNull()
+        _pendingPermissionCount.value = permissionQueue.size
     }
 
     private fun popPermission(p: PendingPermission) = synchronized(permissionLock) {
         permissionQueue.remove(p)
         _pendingPermission.value = permissionQueue.firstOrNull()
+        _pendingPermissionCount.value = permissionQueue.size
     }
 
     /**
@@ -1142,11 +1148,40 @@ class SessionStore(
         permissionQueue.clear()
         openRequests.clear()
         _pendingPermission.value = null
+        _pendingPermissionCount.value = 0
     }
 
     /** Called by the permission dialog; null = user dismissed -> "cancelled". */
     fun resolvePermission(optionId: String?) {
         _pendingPermission.value?.choice?.complete(optionId)
+    }
+
+    /**
+     * The notification-action path: answer the SPECIFIC request named by
+     * [requestId] (+ [toolCallId] cross-check — a recycled wire id can't
+     * resolve a different tool call), wherever it sits in the queue.
+     * 允许 only ever picks `allow_once` — a persistent grant must not be
+     * handed out from the shade. `choice.complete` is the atomic
+     * check-and-set: it returns false when the request is already answered
+     * (in-app, a double tap, or `_devingo/permission_resolved`), so the
+     * caller learns the action was stale and never decides twice.
+     */
+    fun resolvePermissionRequest(
+        requestId: Long,
+        toolCallId: String?,
+        allow: Boolean,
+    ): Boolean = synchronized(permissionLock) {
+        val p = openRequests[requestId]?.pending ?: return@synchronized false
+        if (toolCallId != null && p.toolCall.toolCallId != toolCallId) {
+            return@synchronized false
+        }
+        val option = if (allow) {
+            p.options.firstOrNull { it.kind == "allow_once" }
+        } else {
+            p.options.firstOrNull { it.kind == "reject_once" }
+                ?: p.options.firstOrNull { it.kind == "reject_always" }
+        }
+        p.choice.complete(option?.optionId)
     }
 
     // ---- transcript assembly ---------------------------------------------------

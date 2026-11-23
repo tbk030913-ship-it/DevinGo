@@ -108,9 +108,11 @@ class MainActivity : ComponentActivity() {
                             vm.ui,
                             vm.transcript,
                             vm.pendingPermission,
+                            vm.pendingApprovals,
                             prefs.settingsVersion,
-                        ) { u, m, p, _ -> Triple(u, m, p) }
-                            .map { (u, m, p) ->
+                        ) { u, m, p, count, _ -> Triple(u, m, p) to count }
+                            .map { (t, count) ->
+                                val (u, m, p) = t
                                 if (u.running && !wasRunning) {
                                     turnStart = System.currentTimeMillis()
                                     finished = null
@@ -135,6 +137,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 var status = deriveLiveStatus(
                                     u, m.runningDetail, p, turnStart, finished,
+                                    pendingCount = count,
                                 )
                                 // The user is looking at the chat: the finished
                                 // card collapses back to plain idle text.

@@ -40,6 +40,11 @@
             android:name=".SessionService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!-- Notification 允许/拒绝 — answers permissions from the lock
+             screen without launching the activity. Explicit intents only. -->
+        <receiver
+            android:name=".PermissionActionReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

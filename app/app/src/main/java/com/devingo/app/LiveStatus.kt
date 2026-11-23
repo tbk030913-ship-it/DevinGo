@@ -23,6 +23,18 @@ data class LiveStatus(
      * THIS session's pending request even if the user has since switched.
      */
     val sessionId: String? = null,
+    /**
+     * Identity of the pending request the lock-screen actions answer —
+     * the wire requestKey plus its toolCallId cross-check, so a stale
+     * PendingIntent can never resolve a different request by accident.
+     */
+    val permissionRequestId: Long = 0,
+    val permissionToolCallId: String? = null,
+    /**
+     * Pending approvals across every live session. >1 swaps the 允许/拒绝
+     * actions for a "N 个审批" count — tapping then opens the app instead.
+     */
+    val pendingCount: Int = 0,
 ) {
     enum class State { Working, NeedsPermission, Idle, Reconnecting, Done, Failed }
 }
@@ -40,6 +52,8 @@ fun deriveLiveStatus(
     turnStartedAtMillis: Long,
     /** Set by the caller for a few minutes after a turn ends: Done or Failed. */
     finished: LiveStatus.State? = null,
+    /** Pending approvals across all sessions (ConnectionManager.total). */
+    pendingCount: Int = 0,
 ): LiveStatus {
     val title = ui.sessionTitle?.takeIf { it.isNotBlank() }
         ?: ui.agentTitle?.takeIf { it.isNotBlank() }
@@ -60,6 +74,9 @@ fun deriveLiveStatus(
             allowLabel = allowOpt?.let(::permissionOptionLabel) ?: "允许",
             denyLabel = denyOpt?.let(::permissionOptionLabel) ?: "拒绝",
             sessionId = ui.sessionId,
+            permissionRequestId = p.requestId,
+            permissionToolCallId = p.toolCall.toolCallId,
+            pendingCount = pendingCount,
         )
     }
 
