@@ -65,6 +65,7 @@ import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Brain
 import me.rerere.hugeicons.stroke.ChevronRight
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
@@ -77,6 +78,57 @@ internal fun formatTokens(n: Long): String = when {
 private fun workDurationLabel(sec: Long): String = when {
     sec < 60 -> "工作了 $sec 秒"
     else -> "工作了 ${sec / 60} 分 ${sec % 60} 秒"
+}
+
+// ---- live thought preview ------------------------------------------------------
+// Text shapers ported 1:1 from t3code (MIT):
+//   .research/t3code-20261123/packages/client-runtime/src/work-log/presentation.ts
+//     (liveThoughtLine)
+//   .research/t3code-20261123/apps/mobile/src/lib/threadActivity.ts
+//     (compactWorkEntryText, WORK_LOG_LABEL_MAX_LENGTH)
+//   .research/t3code-20261123/packages/shared/src/String.ts (truncate)
+
+private val ThoughtHeading =
+    Regex("^\\s*\\*\\*([^*\r\n]+)\\*\\*[ \t]*\r?(?:\n|$)")
+private val ThoughtLink = Regex("!?\\[([^\\]]*)]\\([^)]*\\)")
+private val ThoughtMarks =
+    Regex("^[ \t]*(?:#{1,6}|[-*+]|\\d+\\.)[ \t]+", RegexOption.MULTILINE)
+private val ThoughtEmphasis = Regex("`+|\\*\\*|~~")
+private val ThoughtItalic = Regex("(^|[^\\w*])[*_]([^*_\n]+)[*_](?![\\w*])")
+private val CompactedWs = Regex("\\s+")
+private val ThoughtSentenceEnd =
+    Regex("[.?!][\"'”’)]?(?=\\s)|[。！？][\"'”’）」』]?")
+
+private const val THOUGHT_PREVIEW_MAX_LENGTH = 200
+
+/**
+ * The line a live thought preview shows: a leading `**bold**` heading
+ * wins outright; otherwise markdown is flattened and the text cuts at the
+ * first sentence end (half- or full-width punctuation).
+ */
+private fun liveThoughtLine(markdown: String): String {
+    val heading = ThoughtHeading.find(markdown)?.groupValues?.get(1)
+    val text = (heading ?: markdown)
+        .replace(ThoughtLink, "$1")
+        .replace(ThoughtMarks, "")
+        .replace(ThoughtEmphasis, "")
+        .replace(ThoughtItalic, "$1$2")
+        .replace(CompactedWs, " ")
+        .trim()
+    if (heading != null) return text
+    val end = ThoughtSentenceEnd.find(text) ?: return text
+    return text.substring(0, end.range.first + end.value.length)
+}
+
+/** Whitespace-collapsed, code-point-capped preview (200 chars + "..."). */
+private fun compactWorkEntryText(value: String): String =
+    truncate(value.replace(CompactedWs, " "), THOUGHT_PREVIEW_MAX_LENGTH)
+
+/** JS `Array.from` counts code points, not UTF-16 units — match that. */
+private fun truncate(text: String, maxLength: Int): String {
+    val trimmed = text.trim()
+    if (trimmed.codePointCount(0, trimmed.length) <= maxLength) return trimmed
+    return trimmed.substring(0, trimmed.offsetByCodePoints(0, maxLength)) + "..."
 }
 
 /**
@@ -288,6 +340,20 @@ private fun WorkRow(
     }?.text?.takeIf { it.isNotBlank() }
         ?: if (items.any { it.kind == Kind.Thought }) "思考中" else null
 
+    // t3code's exposed thought: the newest non-empty reasoning, flattened
+    // to one compacted line — while the turn is live, and afterwards while
+    // the row stays collapsed (live || !expanded).
+    val latestThought = items.lastOrNull {
+        it.kind == Kind.Thought && it.text.isNotBlank()
+    }?.text
+    val thought = remember(latestThought) {
+        latestThought
+            ?.let { compactWorkEntryText(liveThoughtLine(it)) }
+            ?.takeIf { it.isNotEmpty() }
+    }
+    // t3code ThreadThinkingRow: sent, running, no chunk/tool back yet.
+    val awaitingFirst = live && turn.body.isEmpty()
+
     val chevronRot by animateFloatAsState(
         targetValue = if (expanded) 90f else 0f,
         animationSpec = tween(200),
@@ -296,10 +362,55 @@ private fun WorkRow(
     Column(
         modifier
             .fillMaxWidth()
-            .clickable(onClick = onToggle)
+            .then(if (awaitingFirst) Modifier else Modifier.clickable(onClick = onToggle))
             .heightIn(min = 48.dp)
             .padding(vertical = 4.dp),
     ) {
+        if (awaitingFirst) {
+            Row(
+                Modifier
+                    .padding(vertical = 12.dp)
+                    .steppedShimmer(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    HugeIcons.Brain, null,
+                    modifier = Modifier.size(14.dp),
+                    tint = cs.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "正在思考…",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            return@Column
+        }
+        if (thought != null && (live || !expanded)) {
+            Row(
+                Modifier.padding(bottom = 2.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Icon(
+                    HugeIcons.Brain, null,
+                    modifier = Modifier
+                        .padding(top = 3.dp)
+                        .size(14.dp),
+                    tint = cs.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    thought,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
                 HugeIcons.ChevronRight, null,
@@ -323,7 +434,7 @@ private fun WorkRow(
                     color = cs.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false).shimmer(),
+                    modifier = Modifier.weight(1f, fill = false).steppedShimmer(),
                 )
             } else {
                 Text(

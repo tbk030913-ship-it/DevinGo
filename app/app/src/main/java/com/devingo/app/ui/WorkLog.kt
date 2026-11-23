@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -35,6 +36,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -49,6 +51,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -115,7 +118,7 @@ internal fun WorkLogColumn(
     }
 }
 
-/** Collapsed-by-default "思考" row; expands to the thought body. */
+/** Collapsed "思考 · <40 chars>" row; expands to a scrollable thought body. */
 @Composable
 private fun ThoughtLogRow(item: ChatItem) {
     val cs = MaterialTheme.colorScheme
@@ -125,6 +128,10 @@ private fun ThoughtLogRow(item: ChatItem) {
         animationSpec = tween(200),
         label = "thoughtChevron",
     )
+    val preview = remember(item.text) {
+        val p = item.text.replace(Regex("\\s+"), " ").trim()
+        if (p.length > 40) p.take(40) + "…" else p
+    }
     Column(Modifier.animateContentSize()) {
         Row(
             Modifier
@@ -134,7 +141,7 @@ private fun ThoughtLogRow(item: ChatItem) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "思考",
+                if (preview.isEmpty()) "思考" else "思考 · $preview",
                 style = MaterialTheme.typography.bodyMedium,
                 color = cs.onSurfaceVariant,
                 maxLines = 1,
@@ -154,12 +161,47 @@ private fun ThoughtLogRow(item: ChatItem) {
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
-            Text(
-                item.text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = cs.onSurfaceVariant,
-                modifier = Modifier.padding(bottom = 6.dp),
-            )
+            // t3code ThreadReasoningGroup: the body scrolls inside a capped
+            // box; the bottom edge fade tracks remaining scroll distance
+            // (opacity = remaining / fadeHeight).
+            val scroll = rememberScrollState()
+            val fadePx = with(LocalDensity.current) { 24.dp.toPx() }
+            val fadeAlpha by remember {
+                derivedStateOf {
+                    val max = scroll.maxValue
+                    if (max <= 0 || max == Int.MAX_VALUE) {
+                        0f
+                    } else {
+                        ((max - scroll.value) / fadePx).coerceIn(0f, 1f)
+                    }
+                }
+            }
+            Box {
+                Text(
+                    item.text,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 240.dp)
+                        .verticalScroll(scroll)
+                        .padding(bottom = 6.dp),
+                )
+                if (fadeAlpha > 0f) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(24.dp)
+                            .align(Alignment.BottomCenter)
+                            .graphicsLayer { alpha = fadeAlpha }
+                            .background(
+                                Brush.verticalGradient(
+                                    listOf(Color.Transparent, cs.surface),
+                                ),
+                            ),
+                    )
+                }
+            }
         }
     }
 }
