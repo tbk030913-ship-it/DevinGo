@@ -201,7 +201,7 @@ private fun ToolLogRow(item: ChatItem) {
                     strokeWidth = 2.dp,
                     color = cs.onSurfaceVariant,
                 )
-                item.failed -> Icon(
+                item.status == "failed" -> Icon(
                     Icons.Filled.Close, "失败",
                     modifier = Modifier.size(14.dp),
                     tint = cs.error,

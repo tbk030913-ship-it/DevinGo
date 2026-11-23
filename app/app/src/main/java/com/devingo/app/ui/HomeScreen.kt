@@ -314,7 +314,14 @@ fun HomeScreen(
                 duration = SnackbarDuration.Long,
             )
             if (result == SnackbarResult.ActionPerformed) {
-                if (isAuth) vm.authenticate() else startConnect()
+                if (isAuth) {
+                    vm.authenticate()
+                } else {
+                    // Replay the failed attempt's session/cwd — a bare
+                    // startConnect() would lose the resume target.
+                    val (resumeId, cwd) = vm.retryTarget()
+                    startConnect(resumeId, cwd)
+                }
             }
         }
     }

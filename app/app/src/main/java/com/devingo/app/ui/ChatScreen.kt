@@ -194,6 +194,7 @@ fun ChatScreen(
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         vm.loadRevertSteps()
                     },
+                    onResend = { vm.resend(it) },
                     listState = listState,
                     modifier = Modifier.fillMaxSize(),
                 )

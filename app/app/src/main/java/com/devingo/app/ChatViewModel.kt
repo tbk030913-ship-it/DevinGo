@@ -93,6 +93,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val planEntries: List<PlanEntry> = emptyList(),
         /** True when the prompt never reached the agent (send threw before any update). */
         val failed: Boolean = false,
+        /**
+         * The user prompt's image bytes — only a [failed] echo needs them
+         * (重发 source); launchPrompt clears them once the prompt is delivered.
+         */
+        val attachments: List<ImageAttachment> = emptyList(),
+        /** Images sent with this prompt — badge source once bytes are cleared. */
+        val attachmentCount: Int = 0,
     )
 
     /** One `diff` content item of a tool call: unified old/new file text. */
@@ -224,13 +231,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         pendingResumeId = resumeSessionId
         pendingApiKey = apiKey?.trim()?.ifBlank { null }
         // A new connection epoch supersedes the old resume/cwd anchors —
-        // they're re-established once a session is up (rememberSession,
-        // pendingCwd). Leaving them stale would let a mid-handshake drop
-        // auto-resume the previous session or attach a dead cwd.
+        // they're re-established once a session is up (rememberSession).
+        // Leaving them stale would let a mid-handshake drop auto-resume the
+        // previous session or attach a dead cwd. pendingCwd seeds from this
+        // attempt's arg so an early failure's retry replays the same cwd;
+        // it's overwritten with the resolved workingDir below.
         lastResumeSessionId = null
         lastResumeCwd = ""
         activeCwd = ""
-        pendingCwd = ""
+        pendingCwd = cwd
         bridgeHttpUrl = healthUrl(host)
         bridgeToken = token.ifBlank { null }
         viewModelScope.launch {
@@ -338,6 +347,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         lastResumeSessionId = sessionId
         lastResumeCwd = cwd
     }
+
+    /**
+     * The (resumeId, cwd) the last connect or reconnect attempt was aiming
+     * at — an error snackbar's 重试 replays exactly these instead of
+     * falling back to a fresh session at the default cwd. A null resumeId
+     * means the attempt targeted a new session.
+     */
+    fun retryTarget(): Pair<String?, String> =
+        (pendingResumeId ?: lastResumeSessionId) to pendingCwd
 
     // ---- auto reconnect --------------------------------------------------------
 
@@ -625,7 +643,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** A photo/screenshot picked on-device, sent as an ACP `image` block. */
     class ImageAttachment(val bytes: ByteArray, val mimeType: String)
 
-    data class QueuedPrompt(val text: String, val attachmentCount: Int = 0)
+    data class QueuedPrompt(
+        val text: String,
+        val attachments: List<ImageAttachment> = emptyList(),
+    )
 
     /**
      * Send while idle. When a turn is running the message joins the queue
@@ -645,13 +666,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
         if (_ui.value.running || promptJob?.isActive == true) {
-            // Queued prompts only carry the attachment count — queueing a
-            // send with images would silently drop the bytes, so refuse.
-            if (attachments.isNotEmpty()) {
-                append(Kind.Error, "运行中发送会丢失图片，请等本轮结束或移除图片")
-                return false
-            }
-            _queuedPrompts.update { it + QueuedPrompt(trimmed, attachments.size) }
+            // Queued prompts carry the attachments themselves — the bytes go
+            // out when the queue drains, nothing is dropped.
+            _queuedPrompts.update { it + QueuedPrompt(trimmed, attachments) }
             return true
         }
         launchPrompt(sid, trimmed, attachments)
@@ -680,11 +697,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _queuedPrompts.update { q -> q.filterIndexed { i, _ -> i != index } }
     }
 
+    /**
+     * Re-send a message whose echo was marked 未发送: drop the dead item and
+     * put the original text + image bytes through the normal send path again
+     * (it queues when a turn is running). A no-op when the send can't go out
+     * (e.g. session gone) — the failed bubble stays put then.
+     */
+    fun resend(item: ChatItem) {
+        if (item.kind != Kind.User || !item.failed) return
+        // Double-tap guard: the captured item still reads failed=true a
+        // frame after the removal below, so gate on the echo still being
+        // in the transcript instead.
+        if (_messages.value.none { it.id == item.id }) return
+        if (!send(item.text, item.attachments)) return
+        _messages.update { list -> list.filterNot { it.id == item.id } }
+    }
+
     private fun drainQueue() {
+        // sid first: a dead session must leave the head queued, not eat it.
+        val sid = _ui.value.sessionId ?: return
         val next = _queuedPrompts.value.firstOrNull() ?: return
         _queuedPrompts.update { it.drop(1) }
-        val sid = _ui.value.sessionId ?: return
-        launchPrompt(sid, next.text, emptyList())
+        launchPrompt(sid, next.text, next.attachments)
     }
 
     private fun launchPrompt(
@@ -693,14 +727,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         attachments: List<ImageAttachment>,
     ) {
         val blocks = buildBlocks(text, attachments)
-        val label = buildString {
-            append(text)
-            if (attachments.isNotEmpty()) {
-                if (isNotEmpty()) append(' ')
-                append("[${attachments.size} 张图片]")
-            }
-        }
-        val userItem = append(Kind.User, label)
+        // The echo keeps the raw text — UserBubble renders the "[N 张图片]"
+        // suffix — so UserChunk dedup matches and resend() replays verbatim.
+        val userItem = append(Kind.User, text, attachments = attachments)
         promptAcked = false
         promptJob = viewModelScope.launch {
             _ui.update { it.copy(running = true) }
@@ -727,6 +756,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 _ui.update { it.copy(running = false) }
+                // The echo's image bytes exist only to resend a 未发送
+                // message — once it isn't flagged failed they're dead
+                // weight (the badge reads attachmentCount instead).
+                if (attachments.isNotEmpty()) {
+                    _messages.update { list ->
+                        list.map {
+                            if (it.id == userItem.id && !it.failed) {
+                                it.copy(attachments = emptyList())
+                            } else {
+                                it
+                            }
+                        }
+                    }
+                }
                 drainQueue()
             }
         }
@@ -1018,6 +1061,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // A dead socket strands any queued permission prompts.
                 clearPermissions()
                 _ui.update { it.copy(running = false) }
+                // In-flight tool calls died with the socket — flip them to
+                // failed so the count is honest and no spinner hangs
+                // through the reconnect window.
+                _messages.update { list ->
+                    list.map {
+                        if (it.kind == Kind.Tool &&
+                            (it.status == "in_progress" || it.status == "pending")
+                        ) {
+                            it.copy(status = "failed")
+                        } else {
+                            it
+                        }
+                    }
+                }
                 scheduleReconnect(ev.reason)
             }
             else -> Unit // forward-compat with updates added alongside acp/ changes
@@ -1107,9 +1164,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         status: String? = null,
         toolCallId: String? = null,
         detail: String? = null,
+        attachments: List<ImageAttachment> = emptyList(),
     ): ChatItem {
         flushStreaming()
-        val item = ChatItem(nextItemId++, kind, text, status, toolCallId, detail = detail)
+        val item = ChatItem(
+            nextItemId++, kind, text, status, toolCallId,
+            detail = detail, attachments = attachments,
+            attachmentCount = attachments.size,
+        )
         streamingId = null
         _messages.update { capMessages(it + item) }
         return item

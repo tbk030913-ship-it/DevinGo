@@ -128,7 +128,7 @@ private fun workItemsOf(turn: Turn): List<ChatItem> =
     turn.body.filter { it.kind == Kind.Thought || it.kind == Kind.Tool }
 
 private fun failedCount(items: List<ChatItem>): Int =
-    items.count { it.kind == Kind.Tool && it.failed }
+    items.count { it.kind == Kind.Tool && it.status == "failed" }
 
 private fun workDurationLabel(sec: Long): String = when {
     sec < 60 -> "工作了 $sec 秒"
@@ -149,6 +149,7 @@ internal fun Transcript(
     expandedWork: Map<Long, Boolean>,
     onToggleWork: (Long) -> Unit,
     onUserLongPress: (ChatItem) -> Unit,
+    onResend: (ChatItem) -> Unit,
     listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
@@ -226,6 +227,7 @@ internal fun Transcript(
                             UserBubble(
                                 m,
                                 onLongPress = { onUserLongPress(m) },
+                                onResend = { onResend(m) },
                             )
                         }
                         is RowKind.Body -> {
@@ -657,12 +659,20 @@ private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
 private fun UserBubble(
     m: ChatItem,
     onLongPress: () -> Unit,
+    onResend: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
     val haptic = LocalHapticFeedback.current
     var expanded by remember(m.id) { mutableStateOf(false) }
     var truncated by remember(m.id) { mutableStateOf(false) }
+    // The item holds raw text; the "[N 张图片]" suffix is render-only and
+    // reads attachmentCount — the bytes themselves are cleared post-send.
+    val label = when {
+        m.attachmentCount == 0 -> m.text
+        m.text.isEmpty() -> "[${m.attachmentCount} 张图片]"
+        else -> "${m.text} [${m.attachmentCount} 张图片]"
+    }
     Row(
         modifier
             .fillMaxWidth()
@@ -686,7 +696,7 @@ private fun UserBubble(
                     color = if (m.failed) cs.errorContainer else cs.surfaceContainer,
                 ) {
                     Text(
-                        m.text,
+                        label,
                         style = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         maxLines = if (expanded) Int.MAX_VALUE else 12,
@@ -726,6 +736,14 @@ private fun UserBubble(
                             "未发送",
                             style = MaterialTheme.typography.labelSmall,
                             color = cs.error,
+                        )
+                        Text(
+                            "重发",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = DevinGoColors.link,
+                            modifier = Modifier
+                                .padding(start = 4.dp)
+                                .clickable { onResend() },
                         )
                     }
                 }

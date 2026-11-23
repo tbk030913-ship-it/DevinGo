@@ -52,7 +52,6 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -109,8 +108,8 @@ import me.rerere.hugeicons.stroke.Queue01
 /**
  * Devin mobile composer: one rounded #EDEDED pill holding "+" | text | the
  * black round send/stop button. All v1 behaviors kept — image attachments,
- * @mention styling + hint, slash-command strip, queue/steer menu with the
- * attachment-loss guard.
+ * @mention styling + hint, slash-command strip, queue/steer menu (queue
+ * keeps images; steer is text-only and disables when attachments exist).
  */
 @Composable
 internal fun Composer(
@@ -390,36 +389,18 @@ internal fun Composer(
                             expanded = sendMenu,
                             onDismissRequest = { sendMenu = false },
                         ) {
-                            if (attachments.isNotEmpty()) {
-                                Row(
-                                    Modifier.padding(
-                                        horizontal = 16.dp,
-                                        vertical = 8.dp,
-                                    ),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Icon(
-                                        Icons.Filled.Warning, null,
-                                        modifier = Modifier.size(14.dp),
-                                        tint = DevinGoColors.warning,
-                                    )
-                                    Text(
-                                        "运行中发送会丢失图片，请等本轮结束或移除图片",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = DevinGoColors.warning,
-                                    )
-                                }
-                            }
                             DevinMenuItem(
                                 "排队",
                                 subtitle = "本轮结束后自动发送",
-                                enabled = attachments.isEmpty(),
                                 onClick = { sendMenu = false; onSend() },
                             )
                             DevinMenuItem(
                                 "立即转向",
-                                subtitle = "打断当前步骤，马上把这条指令交给 Devin",
+                                subtitle = if (attachments.isEmpty()) {
+                                    "打断当前步骤，马上把这条指令交给 Devin"
+                                } else {
+                                    "转向不支持图片"
+                                },
                                 enabled = attachments.isEmpty(),
                                 danger = true,
                                 onClick = { sendMenu = false; onSteer() },
@@ -502,8 +483,12 @@ private fun QueueChip(
         DevinMenu(expanded = open, onDismissRequest = { open = false }) {
             queued.forEachIndexed { i, q ->
                 DevinMenuItem(
-                    text = q.text.take(40) +
-                        if (q.attachmentCount > 0) " [图×${q.attachmentCount}]" else "",
+                    text = if (q.text.isBlank()) {
+                        "[${q.attachments.size} 张图片]"
+                    } else {
+                        q.text.take(40) +
+                            if (q.attachments.isNotEmpty()) " [图×${q.attachments.size}]" else ""
+                    },
                     subtitle = "点击移除",
                     onClick = { open = false; onCancelQueued(i) },
                     trailing = {
