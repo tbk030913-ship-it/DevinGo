@@ -1450,17 +1450,6 @@ func (h *Hub) addClient(c *Client) {
 	h.mu.Unlock()
 }
 
-// sessionOverlay returns the live flags list endpoints overlay: a turn in
-// flight and/or an unanswered approval.
-func (h *Hub) sessionOverlay(sid string) (running, pendingPerm bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if s := h.sessions[sid]; s != nil {
-		return s.running > 0, len(s.pending) > 0
-	}
-	return false, false
-}
-
 // -------------------------------------------------------------- calls ----
 
 // callDevin issues a gateway-internal request and waits for the response
@@ -1514,8 +1503,7 @@ func (h *Hub) callDevin(p *devinProc, timeout time.Duration, method string, para
 	}
 }
 
-// callSessionList is the shared session/list used by _devingo/sessions and
-// the /sessions HTTP endpoint — always over the resident process.
+// callSessionList backs _devingo/sessions — always over the resident process.
 func (h *Hub) callSessionList(cwd string) (json.RawMessage, error) {
 	for attempts := 0; attempts < 2; attempts++ {
 		p := h.ensureProc()

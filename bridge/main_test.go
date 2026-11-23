@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -196,6 +197,39 @@ func TestCompareDevinVersion(t *testing.T) {
 	}
 	if _, ok := parseDevinVersion("latest"); ok {
 		t.Error("non-numeric dir name parsed as a version")
+	}
+}
+
+// slimModels lifts {id,name} leaves out of devin's nested/family-grouped
+// models JSON, dedupes by id, and emits [] (not null) on no matches.
+func TestSlimModels(t *testing.T) {
+	raw := `{"families":[{"name":"Cognition","models":[
+		{"modelId":"devin-1","name":"Devin","ctx":200000},
+		{"id":"gpt-x","title":"GPT X","extra":{"id":"nested","name":"skip"}},
+		{"modelId":"devin-1","name":"Devin dup"}
+	]}],"other":[{"slug":"solo","label":"Solo"}]}`
+	out, err := slimModels([]byte(raw))
+	if err != nil {
+		t.Fatalf("slimModels: %v", err)
+	}
+	var got []map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("slim output not JSON: %v", err)
+	}
+	want := []map[string]string{
+		{"id": "devin-1", "name": "Devin"},
+		{"id": "gpt-x", "name": "GPT X"},
+		{"id": "solo", "name": "Solo"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("slimModels = %v, want %v", got, want)
+	}
+	empty, err := slimModels([]byte(`{"x":1}`))
+	if err != nil || string(empty) != "[]" {
+		t.Fatalf("no-match input: out=%s err=%v, want []", empty, err)
+	}
+	if _, err := slimModels([]byte("not json")); err == nil {
+		t.Fatal("malformed input must error")
 	}
 }
 

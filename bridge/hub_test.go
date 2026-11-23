@@ -198,7 +198,6 @@ func setupHub(t *testing.T, bin string) string {
 func newTestServer(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/acp", acpHandler)
-	mux.HandleFunc("/sessions", sessionsHandler)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -614,37 +613,6 @@ func TestPermissionTimeout(t *testing.T) {
 	s := readStats(t, stats)
 	if !strings.Contains(s, `"id":910`) || !strings.Contains(s, "cancelled") {
 		t.Fatalf("devin never got the gateway's cancelled reply:\n%s", s)
-	}
-}
-
-// The HTTP /sessions endpoint is served through the resident process — no
-// `devin list` subprocess — and carries the legacy field names.
-func TestSessionsEndpointViaHub(t *testing.T) {
-	setupHub(t, fakeDevin(t))
-	srv := newTestServer(t)
-
-	resp, err := srv.Client().Get(srv.URL + "/sessions?cwd=C:/proj")
-	if err != nil {
-		t.Fatalf("GET /sessions: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("/sessions status = %d", resp.StatusCode)
-	}
-	var list []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		t.Fatalf("decode /sessions: %v", err)
-	}
-	if len(list) != 1 {
-		t.Fatalf("/sessions returned %d entries, want 1: %v", len(list), list)
-	}
-	entry := list[0]
-	if entry["id"] != "S001" || entry["working_directory"] != "C:/proj" ||
-		entry["last_activity_ago"] != "2026-01-02T03:04:05Z" {
-		t.Fatalf("legacy translation wrong: %v", entry)
-	}
-	if _, ok := entry["running"]; !ok {
-		t.Fatalf("running flag missing: %v", entry)
 	}
 }
 

@@ -124,11 +124,11 @@ func main() {
 	}
 
 	bridgePush = newPushNotifier(resolvePushURL())
+	go startModelsCache()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/acp", acpHandler)
-	mux.HandleFunc("/sessions", sessionsHandler)
 	mux.HandleFunc("/models", modelsHandler)
 	mux.HandleFunc("/pair", pairHandler)
 	mux.HandleFunc("/pair/qr.png", pairQRHandler)
@@ -136,8 +136,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "DevinGo bridge")
 		fmt.Fprintln(w, "  GET /healthz   - bridge + devin status")
-		fmt.Fprintln(w, "  GET /sessions  - session list (via resident devin acp)")
-		fmt.Fprintln(w, "  GET /models    - model list (`devin models list --format json`)")
+		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
 		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
 
@@ -403,7 +402,7 @@ func uninstallLogonTask() {
 	log.Printf("removed logon task %q", schedTaskName)
 }
 
-// authorized gates the protected endpoints (/acp, /sessions, /models). The
+// authorized gates the protected endpoints (/acp, /models). The
 // token only guards the LAN surface: loopback clients stay trusted so local
 // tooling keeps working without knowing the token.
 func authorized(r *http.Request) bool {
@@ -445,7 +444,7 @@ func isLocalHost(host string) bool {
 }
 
 // validOrigin rejects browser cross-site request forgery (CSWSH on /acp,
-// drive-by spam on /sessions and /models): a hostile page can otherwise
+// drive-by spam on /models): a hostile page can otherwise
 // reach the bridge via DNS rebinding even when it binds to localhost.
 // Native apps and curl send no Origin header and pass through.
 func validOrigin(r *http.Request) bool {
@@ -481,58 +480,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sessionsHandler serves the session list through the resident `devin acp`
-// process (ACP session/list) — no extra process is spawned just for listing.
-// Entries are translated back into the legacy `devin list` shape the app
-// decodes, with live running/pending flags overlaid from the hub.
-func sessionsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if !authorized(r) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":"unauthorized"}`))
-		return
-	}
-	if !validOrigin(r) {
-		rejectForbiddenOrigin(w)
-		return
-	}
-	cwd := r.URL.Query().Get("cwd")
-	if cwd == "" {
-		cwd = *defaultDir
-	}
-	result, err := bridgeHub.callSessionList(cwd)
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-		return
-	}
-	var parsed struct {
-		Sessions []map[string]any `json:"sessions"`
-	}
-	if json.Unmarshal(result, &parsed) != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]any{"error": "malformed session/list result"})
-		return
-	}
-	out := make([]map[string]any, 0, len(parsed.Sessions))
-	for _, sm := range parsed.Sessions {
-		sid, _ := sm["sessionId"].(string)
-		running, pendingPerm := bridgeHub.sessionOverlay(sid)
-		out = append(out, map[string]any{
-			"id":                 sid,
-			"working_directory":  sm["cwd"],
-			"title":              sm["title"],
-			"last_activity_ago":  sm["updatedAt"],
-			"running":            running,
-			"pending_permission": pendingPerm,
-		})
-	}
-	json.NewEncoder(w).Encode(out)
-}
-
-// modelsHandler proxies `devin models list --format json`. Unlike `devin
-// list`, this command needs CLI credentials (`devin auth login`); when the
-// CLI is not logged in it returns 502 and the app hides the model picker.
+// modelsHandler serves the cached model list (models.go — the gateway
+// refreshes it in the background instead of spawning `devin models list`
+// per request). Until the first fetch succeeds — e.g. the CLI isn't logged
+// in (`devin auth login`) — it 502s and the app hides the model picker.
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if !authorized(r) {
@@ -544,19 +495,13 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 		rejectForbiddenOrigin(w)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	out, err := runDevinOutput(ctx, *defaultDir, "models", "list", "--format", "json")
+	out, err := modelsOrFetch()
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 		return
 	}
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" {
-		trimmed = "[]"
-	}
-	w.Write([]byte(trimmed))
+	w.Write(out)
 }
 
 // runDevinOutput runs `devin <args...>` and returns its stdout. Output goes
