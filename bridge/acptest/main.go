@@ -77,6 +77,13 @@ func isAuthErr(e rpcMsg) bool {
 func main() {
 	wsURL, cwd, prompt := os.Args[1], os.Args[2], os.Args[3]
 
+	// multi mode — G1 probe: concurrent sessions inside ONE `devin acp`
+	// process, driven over stdio directly (no bridge). wsURL arg is ignored.
+	if prompt == "multi" {
+		runMultiSession(cwd)
+		return
+	}
+
 	ctx := context.Background()
 	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: http.DefaultClient})
 	if err != nil {
