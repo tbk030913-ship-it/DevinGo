@@ -75,6 +75,7 @@ POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容�
 - `GET /healthz` → bridge 状态 + devin 是否可用 + 默认 cwd（配对探测用，免鉴权）
 - `GET /models`  → 缓存的模型列表（启动后异步 + 每 6h 跑一次 `devin models list`，只留 id/name）
 - `GET /pair`    → 配对二维码网页（只有本机打开才带 token）
+- `POST /fs/write` → 在会话工作区内写文件（`{sessionId,path,content}`，≤1MiB，越界 403）
 - `WS  /acp`     → ACP 会话托管（标准 ACP + `_devingo/*` 私有扩展，见下）
 
 行为要点：单条 WS 消息上限 4MiB（默认 32KiB 会断大 payload）；最多 8 个并发 `/acp`
@@ -173,5 +174,5 @@ cd app
   `/models` 是兜底
 - `-install` 的计划任务是 Windows schtasks（登录时启动，非系统服务）——未登录的
   Windows 会话里 bridge 不跑
-- F 批功能（变更汇总 diff、语音输入、`/fs/list` 文件选择、git 快捷操作、多设备只读页）
-  未开始
+- `/fs/write` 只写会话 cwd 之内（相对路径 + 符号链接/硬链接不越界）；没有配套的
+  `/fs/list` 文件选择接口，引用芯片只作用于已回复的消息
