@@ -68,7 +68,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- bound-session flows -------------------------------------------------
 
-    val messages: StateFlow<List<ChatItem>> = bound({ messages }, emptyList())
+    /** Row model built off the main thread (U2) — replaces raw `messages`. */
+    val transcript: StateFlow<TranscriptModel> = bound({ transcript }, TranscriptModel.EMPTY)
+    val streamingTail: StateFlow<ChatItem?> = bound({ streamingTail }, null)
     val pendingPermission: StateFlow<PendingPermission?> = bound({ pendingPermission }, null)
     val queuedPrompts: StateFlow<List<QueuedPrompt>> = bound({ queuedPrompts }, emptyList())
     val revertSteps: StateFlow<List<com.devingo.app.acp.RevertStep>?> = bound({ revertSteps }, null)
@@ -84,6 +86,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val badges: StateFlow<Map<String, SessionBadge>> = cm.badges
     val openTarget: StateFlow<OpenTarget?> = cm.openTarget
     val alerts = cm.alerts
+
+    /** Home | Chat(sessionId) — decoupled from connection phase (U6). */
+    val page: StateFlow<Page> = cm.page
 
     /** Persist-last-session hook — MainActivity wires it to Prefs. */
     var onSessionReady: ((sessionId: String, cwd: String) -> Unit)? = null
@@ -121,6 +126,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Leave chat for Home — the session's store keeps running off-screen. */
     fun leaveSession() = cm.leaveSession()
+
+    /** Snapshot all live stores to the transcript cache (app backgrounding). */
+    fun persistCaches() = cm.persistCaches()
 
     /** Full socket teardown + drop all stores (chat menu's 清除会话状态). */
     fun disconnect() = cm.disconnect()

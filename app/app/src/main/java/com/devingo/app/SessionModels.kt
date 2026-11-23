@@ -116,6 +116,7 @@ data class QueuedPrompt(
 )
 
 /** Per-turn timing owned by a SessionStore (was UI-local in ChatScreen). */
+@Immutable
 data class TurnTiming(val start: Long?, val end: Long?) {
     val durationSec: Long?
         get() = if (start != null && end != null && end > start) {
@@ -155,6 +156,17 @@ data class SessionBadge(
     /** Output arrived while another session was bound. */
     val unread: Boolean = false,
 )
+
+/**
+ * Root navigation target — which top-level screen is up. Kept apart from
+ * the connection [Phase]: a dropped/reconnecting socket changes the banner
+ * on the chat page, never the page itself. Derived from
+ * [ConnectionManager.currentStore] (null = Home).
+ */
+sealed interface Page {
+    data object Home : Page
+    data class Chat(val sessionId: String) : Page
+}
 
 /** The session an open/switch attempt is aimed at (drawer spinner + retry). */
 data class OpenTarget(

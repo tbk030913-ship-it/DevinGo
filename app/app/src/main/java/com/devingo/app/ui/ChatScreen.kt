@@ -59,7 +59,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.AppVisibility
 import com.devingo.app.ChatViewModel
-import com.devingo.app.Kind
+import com.devingo.app.Phase
 import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
@@ -78,7 +78,10 @@ fun ChatScreen(
     onOpenDrawer: () -> Unit,
 ) {
     val ui by vm.ui.collectAsState()
-    val messages by vm.messages.collectAsState()
+    // Row model + streaming tail arrive prebuilt — no rebuild on the
+    // main thread when a chunk lands.
+    val model by vm.transcript.collectAsState()
+    val tail by vm.streamingTail.collectAsState()
     val queuedPrompts by vm.queuedPrompts.collectAsState()
     val revertSteps by vm.revertSteps.collectAsState()
     val pendingPermission by vm.pendingPermission.collectAsState()
@@ -124,10 +127,10 @@ fun ChatScreen(
     }
     // Auto-scroll only on a NEW user message (spec §P — no per-chunk scroll).
     var lastUserId by remember { mutableStateOf<Long?>(null) }
-    LaunchedEffect(messages) {
-        val lastUser = messages.lastOrNull { it.kind == Kind.User }
-        if (lastUser != null && lastUser.id != lastUserId) {
-            lastUserId = lastUser.id
+    LaunchedEffect(model.lastUserId) {
+        val id = model.lastUserId
+        if (id != null && id != lastUserId) {
+            lastUserId = id
             listState.animateScrollToItem(0)
         }
     }
@@ -152,12 +155,16 @@ fun ChatScreen(
             onRevert = vm::loadRevertSteps,
             onDisconnect = vm::disconnect,
         )
+        // The socket's condition rides its own slim banner — it never
+        // swaps the page back to a status screen (U6).
+        ConnBanner(ui)
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            if (messages.isEmpty()) {
+            if (model.itemById.isEmpty()) {
                 ChatEmptyState(hasCommands = ui.commands.isNotEmpty())
             } else {
                 Transcript(
-                    messages = messages,
+                    model = model,
+                    tail = tail,
                     ui = ui,
                     pendingPermission = pendingPermission,
                     timings = turnTimes,
@@ -175,7 +182,7 @@ fun ChatScreen(
                 )
             }
             ScrollToBottomButton(
-                visible = messages.isNotEmpty() && !atBottom,
+                visible = model.itemById.isNotEmpty() && !atBottom,
                 onClick = { scope.launch { listState.animateScrollToItem(0) } },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -398,6 +405,42 @@ private fun SignalBars(modifier: Modifier = Modifier) {
 }
 
 // ---- misc rows --------------------------------------------------------------------
+
+/**
+ * Slim connection banner pinned under the top bar (U6): only while the
+ * socket is down or coming back — connecting, reconnecting, dropped.
+ * `connected` stays true through the session attach/open handshake that
+ * follows, so the banner never covers it. Page state never depends on it.
+ */
+@Composable
+private fun ConnBanner(ui: UiState, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val content = when {
+        ui.connected -> null
+        ui.reconnecting -> (ui.statusText.ifBlank { "正在重连…" }) to cs.outline
+        ui.phase == Phase.Error ->
+            (ui.statusText.ifBlank { ui.error ?: "连接已断开" }) to cs.error
+        else -> (ui.statusText.ifBlank { "连接中…" }) to cs.outline
+    }
+    AnimatedVisibility(visible = content != null, modifier = modifier) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(cs.surfaceContainer)
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                content?.first.orEmpty(),
+                style = MaterialTheme.typography.labelSmall,
+                color = content?.second ?: cs.outline,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
 
 @Composable
 private fun ScrollToBottomButton(

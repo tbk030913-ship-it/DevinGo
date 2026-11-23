@@ -39,7 +39,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -58,7 +57,9 @@ import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatItem
 import com.devingo.app.Kind
 import com.devingo.app.PendingPermission
-import com.devingo.app.Phase
+import com.devingo.app.RowKind
+import com.devingo.app.TranscriptModel
+import com.devingo.app.Turn
 import com.devingo.app.TurnTiming
 import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
@@ -73,59 +74,6 @@ internal fun formatTokens(n: Long): String = when {
     else -> n.toString()
 }
 
-/**
- * One conversation turn: optional user bubble + ordered non-user body.
- * Work items + stats are baked in at [buildTurns] time so lazy rows never
- * re-derive them on every recomposition.
- */
-@Immutable
-internal data class Turn(
-    val key: Long,
-    val user: ChatItem?,
-    val body: List<ChatItem>,
-    /** Thought/Tool items collapsed under the WorkRow — never render inline. */
-    val work: List<ChatItem>,
-    /** Failed tool calls — the WorkRow's "· N 个失败" badge. */
-    val failed: Int,
-) {
-    /** Turn-level +A/−R over all work diffs; computed once on first render. */
-    val diffStats: Pair<Int, Int> by lazy { workDiffStats(work) }
-}
-
-/** Pure O(n) turn split at every Kind.User boundary. */
-internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
-    val turns = mutableListOf<Turn>()
-    var user: ChatItem? = null
-    var body = mutableListOf<ChatItem>()
-    fun flush() {
-        if (user != null || body.isNotEmpty()) {
-            val work =
-                body.filter { it.kind == Kind.Thought || it.kind == Kind.Tool }
-            turns += Turn(
-                user?.id ?: body.firstOrNull()?.id ?: 0L,
-                user,
-                body.toList(),
-                work,
-                failedCount(work),
-            )
-        }
-        body = mutableListOf()
-    }
-    for (m in messages) {
-        if (m.kind == Kind.User) {
-            flush()
-            user = m
-        } else {
-            body += m
-        }
-    }
-    flush()
-    return turns
-}
-
-private fun failedCount(items: List<ChatItem>): Int =
-    items.count { it.kind == Kind.Tool && it.status == "failed" }
-
 private fun workDurationLabel(sec: Long): String = when {
     sec < 60 -> "工作了 $sec 秒"
     else -> "工作了 ${sec / 60} 分 ${sec % 60} 秒"
@@ -138,7 +86,8 @@ private fun workDurationLabel(sec: Long): String = when {
  */
 @Composable
 internal fun Transcript(
-    messages: List<ChatItem>,
+    model: TranscriptModel,
+    tail: ChatItem?,
     ui: UiState,
     pendingPermission: PendingPermission?,
     timings: Map<Long, TurnTiming>,
@@ -149,30 +98,12 @@ internal fun Transcript(
     listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
-    val turns = remember(messages) { buildTurns(messages) }
-    // Flat reversed item model: index 0 is the visual bottom.
-    val rows = remember(turns, timings, ui.running) {
-        buildList {
-            if (messages.isNotEmpty()) add(RowKind.Status)
-            turns.asReversed().forEachIndexed { revIdx, turn ->
-                val isLast = revIdx == 0
-                if (turn.work.isNotEmpty() || (isLast && ui.running)) {
-                    add(RowKind.Work(turn.key, isLast && ui.running))
-                }
-                turn.body.asReversed().forEach { item ->
-                    // Thoughts and tools collapse into the turn's WorkRow —
-                    // they never render as inline body items.
-                    if (item.kind != Kind.Thought && item.kind != Kind.Tool) {
-                        add(RowKind.Body(item.id))
-                    }
-                }
-                turn.user?.let { add(RowKind.User(it.id)) }
-            }
-        }
-    }
-    val turnByKey = remember(turns) { turns.associateBy { it.key } }
-    val itemById = remember(messages) { messages.associateBy { it.id } }
-    val lastItemId = messages.lastOrNull()?.id
+    // The row model arrives prebuilt (SessionStore, off the main thread) —
+    // a tail item still streaming text overrides the model's copy below.
+    val rows = model.rows
+    val itemById = model.itemById
+    val turnByKey = model.turnByKey
+    val lastItemId = model.lastItemId
 
     LazyColumn(
         state = listState,
@@ -220,7 +151,9 @@ internal fun Transcript(
                     when (row) {
                         is RowKind.Status -> StatusLine(ui, pendingPermission)
                         is RowKind.User -> {
-                            val m = itemById[row.itemId] ?: return@items
+                            val m = itemById[row.itemId]
+                                ?.let { if (tail?.id == it.id) tail else it }
+                                ?: return@items
                             UserBubble(
                                 m,
                                 onLongPress = { onUserLongPress(m) },
@@ -228,7 +161,9 @@ internal fun Transcript(
                             )
                         }
                         is RowKind.Body -> {
-                            val m = itemById[row.itemId] ?: return@items
+                            val m = itemById[row.itemId]
+                                ?.let { if (tail?.id == it.id) tail else it }
+                                ?: return@items
                             BodyItem(
                                 m,
                                 streaming = ui.running && m.id == lastItemId &&
@@ -240,6 +175,7 @@ internal fun Transcript(
                             val timing = timings[turn.user?.id ?: turn.key]
                             WorkRow(
                                 turn = turn,
+                                tail = tail,
                                 live = row.live,
                                 timing = timing,
                                 expanded = expandedWork[turn.key] == true,
@@ -253,13 +189,6 @@ internal fun Transcript(
     }
 }
 
-private sealed interface RowKind {
-    data object Status : RowKind
-    data class Work(val turnKey: Long, val live: Boolean) : RowKind
-    data class Body(val itemId: Long) : RowKind
-    data class User(val itemId: Long) : RowKind
-}
-
 // ---- status line ---------------------------------------------------------------
 
 /** Always the last transcript item: hexagon + one-line state. */
@@ -270,17 +199,6 @@ private fun StatusLine(ui: UiState, pendingPermission: PendingPermission?) {
         pendingPermission != null -> Triple(
             "Devin 正在等你授权",
             DevinGoColors.statusOrange,
-            false,
-        )
-        // The wire close reason rides statusText ("连接已断开 (1011): …").
-        ui.reconnecting -> Triple(
-            ui.statusText.ifBlank { "正在重连…" },
-            cs.outline,
-            false,
-        )
-        ui.phase == Phase.Error && !ui.connected -> Triple(
-            ui.statusText.ifBlank { ui.error ?: "连接已断开" },
-            cs.error,
             false,
         )
         ui.running -> Triple(
@@ -331,6 +249,7 @@ private fun StatusLine(ui: UiState, pendingPermission: PendingPermission?) {
 @Composable
 private fun WorkRow(
     turn: Turn,
+    tail: ChatItem?,
     live: Boolean,
     timing: TurnTiming?,
     expanded: Boolean,
@@ -338,7 +257,11 @@ private fun WorkRow(
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
-    val items = turn.work
+    // A still-streaming tail item shows its newest text — the model's copy
+    // is only refreshed on structural changes.
+    val items = remember(turn.work, tail) {
+        turn.work.map { if (it.id == tail?.id) tail else it }
+    }
     val failed = turn.failed
     val (diffAdd, diffDel) = turn.diffStats
     val startedAt = timing?.start ?: 0L

@@ -30,11 +30,12 @@ data class LiveStatus(
 /**
  * Maps the live UI state onto a [LiveStatus]. Priority: a pending permission
  * beats everything (the user must act), then reconnect, then a running turn,
- * then idle.
+ * then idle. [runningDetail] comes precomputed with the transcript model so
+ * this never scans the message list.
  */
 fun deriveLiveStatus(
     ui: UiState,
-    messages: List<ChatItem>,
+    runningDetail: String?,
     pendingPermission: PendingPermission?,
     turnStartedAtMillis: Long,
     /** Set by the caller for a few minutes after a turn ends: Done or Failed. */
@@ -74,14 +75,10 @@ fun deriveLiveStatus(
     if (ui.running) {
         // Latest in-progress tool wins; otherwise a recent thought means the
         // model is "thinking"; with neither, generic processing.
-        val detail = messages.lastOrNull { it.kind == Kind.Tool && it.status == "in_progress" }
-            ?.text?.takeIf { it.isNotBlank() }
-            ?: if (messages.lastOrNull { it.kind == Kind.Thought } != null) "思考中"
-            else "处理中"
         return LiveStatus(
             state = LiveStatus.State.Working,
             title = title,
-            detail = detail,
+            detail = runningDetail ?: "处理中",
             startedAtMillis = turnStartedAtMillis,
         )
     }

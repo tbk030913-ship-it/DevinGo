@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import com.devingo.app.ChatItem
 import com.devingo.app.Kind
 import com.devingo.app.ToolDiff
+import com.devingo.app.diffStatsOf
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -265,31 +266,6 @@ private fun ToolLogRow(item: ChatItem) {
 }
 
 // ---- diff card --------------------------------------------------------------------
-
-/** Multiset line difference → (added, removed); spec §B stats rule. */
-internal fun diffStatsOf(diffs: List<ToolDiff>): Pair<Int, Int> {
-    var added = 0
-    var removed = 0
-    diffs.forEach { d ->
-        val oldLines = d.oldText?.lineSequence()?.toList().orEmpty()
-        val newLines = d.newText.lineSequence().toList()
-        val oldLeft = oldLines.groupingBy { it }.eachCount().toMutableMap()
-        newLines.forEach { line ->
-            val c = oldLeft[line] ?: 0
-            if (c > 0) oldLeft[line] = c - 1 else added++
-        }
-        val newLeft = newLines.groupingBy { it }.eachCount().toMutableMap()
-        oldLines.forEach { line ->
-            val c = newLeft[line] ?: 0
-            if (c > 0) newLeft[line] = c - 1 else removed++
-        }
-    }
-    return added to removed
-}
-
-/** Turn-level +A/−R shown on the WorkRow header. */
-internal fun workDiffStats(items: List<ChatItem>): Pair<Int, Int> =
-    diffStatsOf(items.flatMap { it.diffs })
 
 private enum class DiffKind { CONTEXT, ADD, DEL }
 

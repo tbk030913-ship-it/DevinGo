@@ -21,10 +21,14 @@ import com.devingo.app.acp.ToolCallInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -65,8 +69,14 @@ class SessionStore(
         const val KEEP_HEAD = 10
         /** Streaming chunks flush to the list at most every this many ms… */
         const val FLUSH_INTERVAL_MS = 60L
+        /** …relaxed to this once the target item passes [STREAM_RELAX_CHARS]. */
+        const val FLUSH_INTERVAL_SLOW_MS = 120L
+        /** ~4KB — the message size that switches to the relaxed flush cadence. */
+        const val STREAM_RELAX_CHARS = 4_096
         /** …or immediately once the buffer holds this many chars. */
         const val FLUSH_CHARS = 200
+        /** Attach-backlog staging ends on cursor coverage, else this watchdog. */
+        const val STAGED_WATCHDOG_MS = 20_000L
         /** If session/cancel doesn't end the prompt job within this, kill it. */
         const val CANCEL_WATCHDOG_MS = 10_000L
         /**
@@ -106,6 +116,19 @@ class SessionStore(
     private val _messages = MutableStateFlow<List<ChatItem>>(emptyList())
     val messages = _messages.asStateFlow()
 
+    /**
+     * Row model (rows/lookups) rebuilt off the main thread — see
+     * [rebuildModel]. Emits only on structural change; the still-growing
+     * tail item's text rides [streamingTail].
+     */
+    private val _transcript = MutableStateFlow(TranscriptModel.EMPTY)
+    val transcript = _transcript.asStateFlow()
+
+    /** The tail item while its text grows — the UI overrides the model's
+     *  (possibly stale) copy of that one item with it. */
+    private val _streamingTail = MutableStateFlow<ChatItem?>(null)
+    val streamingTail = _streamingTail.asStateFlow()
+
     private val _pendingPermission = MutableStateFlow<PendingPermission?>(null)
     val pendingPermission = _pendingPermission.asStateFlow()
 
@@ -141,6 +164,25 @@ class SessionStore(
     private val streamBuf = StringBuilder()
     private var flushJob: Job? = null
 
+    // Replay staging (U7): while an attach/load replay runs, transcript
+    // mutations land in [staged] — a copy for attach (backlog appends onto
+    // history) or a fresh list for session/load — and swap into [_messages]
+    // atomically when the replay finishes. `currentMessages` is what
+    // transcript logic should read/write. beginReplay runs on the attach
+    // coroutine while events mutate on the socket thread — @Volatile so the
+    // routing read sees the staged copy the moment it's installed.
+    @Volatile private var staged: MutableList<ChatItem>? = null
+    private val currentMessages: List<ChatItem> get() = staged ?: _messages.value
+    /** Seq the attach backlog must reach before the staged copy commits. */
+    @Volatile private var stagedUntilSeq: Long = 0
+    @Volatile private var stagedJob: Job? = null
+    /** User-item ids of the pre-load transcript — the finishLoad timing remap. */
+    private var preLoadUserIds: List<Long> = emptyList()
+
+    // Row-model builder state — only ever touched on the Default dispatcher.
+    private var modelMsgs: List<ChatItem> = emptyList()
+    private var modelRunning = false
+
     private var nextItemId = 0L
     private var planItemId: Long? = null
     private var promptJob: Job? = null
@@ -169,12 +211,100 @@ class SessionStore(
         var resolvedByPeer: Boolean = false,
     )
 
+    init {
+        // U2: the transcript row model lives off the main thread. A rebuild
+        // runs per messages/running change; [rebuildModel] skips emission
+        // entirely when only the tail item's text grew.
+        scope.launch(Dispatchers.Default) {
+            combine(
+                _messages,
+                _ui.map { it.running }.distinctUntilChanged(),
+            ) { msgs, running -> msgs to running }.collect { (msgs, running) ->
+                rebuildModel(msgs, running)
+            }
+        }
+    }
+
+    /**
+     * Maintain [_transcript]/[_streamingTail]. The high-frequency update
+     * during streaming is a flush that only appended text to the last item —
+     * detected as: same size, identical prefix items, last item differing
+     * only in `text`. That path emits the item on [_streamingTail] and
+     * leaves the model (and every other row) untouched; all other shapes
+     * rebuild the full model.
+     */
+    private fun rebuildModel(msgs: List<ChatItem>, running: Boolean) {
+        val old = modelMsgs
+        if (running == modelRunning && msgs.size == old.size && msgs.isNotEmpty()) {
+            val nl = msgs.last()
+            val ol = old.last()
+            if (nl.id == ol.id && nl !== ol && nl.copy(text = ol.text) == ol) {
+                var structural = false
+                for (i in 0 until msgs.size - 1) {
+                    if (msgs[i] !== old[i]) {
+                        structural = true
+                        break
+                    }
+                }
+                if (!structural) {
+                    modelMsgs = msgs
+                    _streamingTail.value = nl
+                    return
+                }
+            }
+        }
+        modelMsgs = msgs
+        modelRunning = running
+        _transcript.value = buildTranscriptModel(msgs, running)
+        _streamingTail.value = msgs.lastOrNull()
+    }
+
     // ---- journal cursor / attach bookkeeping -----------------------------------
 
     /** Record a journaled `_seq`; the skip-ahead check lives in [liveGap]. */
     fun noteSeq(seq: Long) {
         if (seq <= 0) return
         seqCursor.updateAndGet { maxOf(it, seq) }
+        commitIfCaughtUp(seq)
+    }
+
+    /**
+     * The staged copy commits once a frame at/past the backlog end lands.
+     * The commit hops onto [scope]: agent requests arrive on AcpClient's
+     * Default scope, and [commitStaged]'s read-clear-write on `staged` is
+     * not atomic — off-scope it can interleave with [mutateMessages] and
+     * resurrect a ghost staged copy. The posted commit re-checks
+     * [stagedUntilSeq] so one queued across a new replay can't commit the
+     * fresh staged copy early.
+     */
+    private fun commitIfCaughtUp(seq: Long) {
+        val until = stagedUntilSeq
+        if (until > 0 && seq >= until) {
+            scope.launch { if (stagedUntilSeq == until) commitStaged() }
+        }
+    }
+
+    /** Swap the staged transcript in atomically; no-op outside staging. */
+    private fun commitStaged() {
+        val s = staged ?: return
+        staged = null
+        stagedUntilSeq = 0
+        stagedJob?.cancel()
+        stagedJob = null
+        _messages.value = s
+    }
+
+    /**
+     * Backlog coverage should end within a handful of seconds; a straggler
+     * that never lands must not freeze the transcript on the pre-replay
+     * copy — commit whatever staged by then.
+     */
+    private fun armStagedWatchdog() {
+        stagedJob?.cancel()
+        stagedJob = scope.launch {
+            delay(STAGED_WATCHDOG_MS)
+            commitStaged()
+        }
     }
 
     /**
@@ -195,10 +325,17 @@ class SessionStore(
     fun markAttached(result: AttachResult) {
         attached = true
         liveSeqFloor = maxOf(liveSeqFloor, result.lastSeq)
+        // noteSeq BEFORE stagedUntilSeq is set — a result at the cursor
+        // must not trip the coverage check early.
         noteSeq(result.lastSeq)
         result.session?.let { applySessionConfig(it) }
         remoteTurn = result.running
         refreshRunning()
+        // The hub answers attach BEFORE streaming the backlog: keep the
+        // staged copy until the cursor's frames have all landed (or the
+        // watchdog commits what arrived). No backlog → commit right away.
+        stagedUntilSeq = result.lastSeq
+        if (replayBaseSeq >= result.lastSeq) commitStaged() else armStagedWatchdog()
     }
 
     /** Auto-subscribed by the hub: no attach call needed (session/new). */
@@ -231,14 +368,27 @@ class SessionStore(
         attachDefer = true
         attached = false
         replayBaseSeq = lastSeq
+        // Replay appends into a staged copy of the visible transcript; the
+        // UI swaps to it atomically when the backlog finishes instead of
+        // scrolling item by item.
+        stagedJob?.cancel()
+        stagedUntilSeq = 0
+        staged = currentMessages.toMutableList()
     }
 
     fun endReplay() {
         replaying = false
         attachDefer = false
-        // markAttached/finishLoad flipped attached on success; a still-false
-        // flag means the attach aborted mid-stream — rewind the cursor.
-        if (!attached) seqCursor.set(replayBaseSeq)
+        // markAttached/finishLoad flipped attached on success — the staged
+        // copy then stays live until the backlog commits it. A still-false
+        // flag means the attach aborted mid-stream: discard the partial
+        // copy and rewind the cursor so a retry re-covers it.
+        if (!attached) {
+            staged = null
+            stagedUntilSeq = 0
+            stagedJob?.cancel()
+            seqCursor.set(replayBaseSeq)
+        }
     }
 
     /**
@@ -268,21 +418,57 @@ class SessionStore(
         return out
     }
 
-    /** History is about to be replayed by `session/load`: start clean. */
+    /**
+     * `session/load` replays the WHOLE history into a fresh staged list —
+     * the visible (possibly cache-restored) transcript stays put until
+     * [finishLoad] swaps it atomically. Pre-load user ids are captured for
+     * the turn-timing remap.
+     */
     fun beginLoad() {
         replaying = true
         attachDefer = false
-        resetTranscript()
+        flushJob?.cancel()
+        flushJob = null
+        streamBuf.setLength(0)
+        streamKind = null
+        streamingId = null
+        planItemId = null
+        preLoadUserIds = currentMessages.filter { it.kind == Kind.User }.map { it.id }
+        staged = mutableListOf()
     }
 
-    /** `session/load` finished: config applied, replay window closed. */
+    /** `session/load` finished: timings remapped, staged copy committed. */
     fun finishLoad(result: SessionNewResult) {
+        remapLoadTimings()
+        commitStaged()
         replaying = false
         attached = true
         // Replay frames still landing past the response are history — pin the
         // live floor at the cursor so they can't masquerade as a live turn.
         liveSeqFloor = maxOf(liveSeqFloor, lastSeq)
         applySessionConfig(result)
+    }
+
+    /**
+     * Carry pre-load turn timings onto the fresh replay's new item ids (U9).
+     * User messages replay in the same order, so a positional pair is safe
+     * when the histories agree in count; timings recorded live during the
+     * load window (a mid-load send) always keep their own ids.
+     */
+    private fun remapLoadTimings() {
+        val newUsers = staged.orEmpty().filter { it.kind == Kind.User }
+        val old = _turnTimes.value
+        val remapped = HashMap<Long, TurnTiming>(newUsers.size)
+        newUsers.forEach { n -> old[n.id]?.let { remapped[n.id] = it } }
+        if (preLoadUserIds.size == newUsers.size) {
+            newUsers.forEachIndexed { i, n ->
+                if (n.id !in remapped) {
+                    old[preLoadUserIds[i]]?.let { remapped[n.id] = it }
+                }
+            }
+        }
+        _turnTimes.value = remapped
+        preLoadUserIds = emptyList()
     }
 
     /** Tear down: queued prompts, pending perms and jobs all die with the store. */
@@ -333,7 +519,7 @@ class SessionStore(
                 flushStreaming()
                 // session/load replays the user's own messages; skip the chunk
                 // if it merely echoes the prompt we just appended locally.
-                val lastUser = _messages.value.lastOrNull { it.kind == Kind.User }
+                val lastUser = currentMessages.lastOrNull { it.kind == Kind.User }
                 if (lastUser == null || lastUser.text != ev.text) {
                     appendStreaming(Kind.User, ev.text, isLive(seq))
                 }
@@ -428,20 +614,25 @@ class SessionStore(
         attachDefer = false
         deferredLive.clear()
         clearPermissions()
-        failInflightTools()
         remoteTurn = false
-        // A mid-replay drop leaves the cursor past frames that never landed —
-        // rewind so the reconnect attach re-covers them.
-        if (replaying) {
+        // A mid-replay drop — or a drop while a committed attach's backlog
+        // is still staged — leaves the cursor past frames that only ever
+        // reached the staged copy: rewind so the reconnect attach re-covers
+        // them, and discard the staged copy (the same rewind re-covers it).
+        if (replaying || staged != null) {
             seqCursor.set(replayBaseSeq)
             replaying = false
         }
+        staged = null
+        stagedUntilSeq = 0
+        stagedJob?.cancel()
+        failInflightTools()
         refreshRunning()
         append(Kind.System, "$reason，重连后自动补齐")
     }
 
     private fun failInflightTools() {
-        _messages.update { list ->
+        mutateMessages { list ->
             list.map {
                 if (it.kind == Kind.Tool &&
                     (it.status == "in_progress" || it.status == "pending")
@@ -583,9 +774,15 @@ class SessionStore(
         // Double-tap guard: the captured item still reads failed=true a
         // frame after the removal below, so gate on the echo still being
         // in the transcript instead.
-        if (_messages.value.none { it.id == item.id }) return
+        if (currentMessages.none { it.id == item.id }) return
+        if (item.attachmentCount > 0 && item.attachments.isEmpty()) {
+            // Cache-restored echoes keep the image COUNT but not the bytes —
+            // sending the text alone would silently drop the pictures.
+            append(Kind.Error, "图片未被缓存，无法随消息重发")
+            return
+        }
         if (!send(item.text, item.attachments)) return
-        _messages.update { list -> list.filterNot { it.id == item.id } }
+        mutateMessages { list -> list.filterNot { it.id == item.id } }
     }
 
     private fun drainQueue() {
@@ -610,7 +807,7 @@ class SessionStore(
                 val result = client.promptBlocks(sessionId, blocks)
                 onSessionReady?.invoke(sessionId, cwd)
                 reportStopReason(result.stopReason)
-                if (_messages.value.isNotEmpty()) {
+                if (currentMessages.isNotEmpty()) {
                     notifier.notifyTurnDone(
                         _ui.value.sessionTitle?.takeIf { it.isNotBlank() } ?: "DevinGo",
                         sessionId,
@@ -635,7 +832,7 @@ class SessionStore(
                 // message — once it isn't flagged failed they're dead
                 // weight (the badge reads attachmentCount instead).
                 if (attachments.isNotEmpty()) {
-                    _messages.update { list ->
+                    mutateMessages { list ->
                         list.map {
                             if (it.id == userItem.id && !it.failed) {
                                 it.copy(attachments = emptyList())
@@ -799,6 +996,9 @@ class SessionStore(
     // ---- agent -> client requests -----------------------------------------------
 
     suspend fun handleAgentRequest(req: IncomingRequest) {
+        // Journaled requests never pass noteSeq — they still count toward
+        // attach-backlog coverage.
+        commitIfCaughtUp(req.seq)
         when (req.method) {
             AcpMethods.SESSION_REQUEST_PERMISSION -> handlePermission(req)
             else -> req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
@@ -889,6 +1089,19 @@ class SessionStore(
 
     // ---- transcript assembly ---------------------------------------------------
 
+    /**
+     * Route a transcript mutation to the staged copy while a replay is in
+     * flight, else to [_messages]. Reads use [currentMessages].
+     */
+    private inline fun mutateMessages(transform: (List<ChatItem>) -> List<ChatItem>) {
+        val s = staged
+        if (s != null) {
+            staged = transform(s).toMutableList()
+        } else {
+            _messages.update(transform)
+        }
+    }
+
     private fun refreshRunning() {
         val running = remoteTurn || promptJob?.isActive == true
         val was = _ui.value.running
@@ -896,7 +1109,7 @@ class SessionStore(
         if (!running) {
             // Falling edge: stamp the end time on the latest user's turn.
             val now = System.currentTimeMillis()
-            val lastUserId = _messages.value.lastOrNull { it.kind == Kind.User }?.id
+            val lastUserId = currentMessages.lastOrNull { it.kind == Kind.User }?.id
             if (lastUserId != null) {
                 _turnTimes.update { map ->
                     map[lastUserId]?.takeIf { it.end == null }
@@ -938,8 +1151,18 @@ class SessionStore(
 
     private fun scheduleStreamFlush() {
         if (flushJob?.isActive == true) return
+        // A long message re-parses more markdown per flush — relax the
+        // cadence once the target item passes ~4KB (U3; parsing itself
+        // stays incremental inside the renderer).
+        val committed = currentMessages.lastOrNull()
+            ?.takeIf { it.id == streamingId }?.text?.length ?: 0
+        val interval = if (committed + streamBuf.length >= STREAM_RELAX_CHARS) {
+            FLUSH_INTERVAL_SLOW_MS
+        } else {
+            FLUSH_INTERVAL_MS
+        }
         flushJob = scope.launch {
-            delay(FLUSH_INTERVAL_MS)
+            delay(interval)
             flushStreaming()
         }
     }
@@ -956,7 +1179,7 @@ class SessionStore(
         if (streamBuf.isEmpty()) return
         val chunk = streamBuf.toString()
         streamBuf.setLength(0)
-        _messages.update { list ->
+        mutateMessages { list ->
             val last = list.lastOrNull()
             if (last != null && last.id == streamingId && last.kind == kind) {
                 list.dropLast(1) + last.copy(text = last.text + chunk)
@@ -967,21 +1190,6 @@ class SessionStore(
                 capMessages(list + item)
             }
         }
-    }
-
-    /**
-     * Drop the transcript buffer and every item — used before `session/load`
-     * replays history and when the store is reset by a needLoad attach.
-     */
-    fun resetTranscript() {
-        flushJob?.cancel()
-        flushJob = null
-        streamBuf.setLength(0)
-        streamKind = null
-        streamingId = null
-        planItemId = null
-        _messages.value = emptyList()
-        _turnTimes.value = emptyMap()
     }
 
     /** Cap the transcript at [MAX_MESSAGES], keeping the first [KEEP_HEAD] items. */
@@ -1013,18 +1221,18 @@ class SessionStore(
         // A Kind.User here is always a live local echo (replayed user text
         // arrives through the streaming path, gated by streamLive).
         if (kind == Kind.User) noteTurnStart(item.id)
-        _messages.update { capMessages(it + item) }
+        mutateMessages { capMessages(it + item) }
         return item
     }
 
     private fun markFailed(itemId: Long) {
-        _messages.update { list ->
+        mutateMessages { list ->
             list.map { if (it.id == itemId) it.copy(failed = true) else it }
         }
     }
 
     private fun updateTool(call: ToolCallInfo) {
-        _messages.update { list ->
+        mutateMessages { list ->
             val idx = list.indexOfLast { it.toolCallId == call.toolCallId }
             if (idx < 0) {
                 capMessages(
@@ -1093,9 +1301,88 @@ class SessionStore(
         (this as? JsonPrimitive)
             ?.let { if (it.isString) it.content else null }
 
+    // ---- local transcript cache (U7) -----------------------------------------
+
+    /**
+     * Snapshot for the local transcript cache: transcript tail + turn
+     * timings + the journal cursor. A mid-replay snapshot takes the
+     * COMMITTED list with the replay's base seq — never the partial staged
+     * copy with an already-advanced cursor, which would record coverage for
+     * frames still in flight and lose them on the next attach.
+     */
+    fun cacheSnapshot(host: String): TranscriptCache.CachedTranscript {
+        val items = _messages.value.takeLast(TranscriptCache.MAX_ITEMS)
+        val kept = items.mapTo(HashSet()) { it.id }
+        return TranscriptCache.CachedTranscript(
+            sessionId = sessionId,
+            host = host,
+            savedAt = System.currentTimeMillis(),
+            lastSeq = if (staged != null) replayBaseSeq else lastSeq,
+            nextItemId = nextItemId,
+            title = _ui.value.sessionTitle,
+            items = items.map(::cacheItemOf),
+            turnTimes = _turnTimes.value
+                .filterKeys { it in kept }
+                .mapValues { TranscriptCache.CachedTiming(it.value.start, it.value.end) },
+        )
+    }
+
+    /**
+     * Render a cached snapshot: transcript, timings, journal cursor and
+     * title — the attach replay then appends only what the cache missed.
+     */
+    fun restoreFromCache(c: TranscriptCache.CachedTranscript) {
+        val items = c.items.mapNotNull(::restoreItem)
+        nextItemId = maxOf(c.nextItemId, (items.maxOfOrNull { it.id } ?: -1L) + 1)
+        planItemId = items.lastOrNull { it.kind == Kind.Plan }?.id
+        _messages.value = items
+        _turnTimes.value =
+            c.turnTimes.mapValues { TurnTiming(it.value.start, it.value.end) }
+        seqCursor.set(c.lastSeq)
+        c.title?.takeIf { it.isNotBlank() }?.let { t ->
+            _ui.update { it.copy(sessionTitle = t) }
+        }
+    }
+
+    private fun cacheItemOf(m: ChatItem) = TranscriptCache.CachedItem(
+        id = m.id,
+        kind = m.kind.name,
+        text = m.text.take(TranscriptCache.TEXT_CAP),
+        status = m.status,
+        toolCallId = m.toolCallId,
+        toolKind = m.toolKind,
+        detail = m.detail?.take(TranscriptCache.DETAIL_CAP),
+        diffs = m.diffs.map {
+            TranscriptCache.CachedDiff(
+                it.path,
+                it.oldText?.take(TranscriptCache.DIFF_TEXT_CAP),
+                it.newText.take(TranscriptCache.DIFF_TEXT_CAP),
+            )
+        },
+        planEntries = m.planEntries.map {
+            TranscriptCache.CachedPlanEntry(it.content, it.status, it.priority)
+        },
+        failed = m.failed,
+        attachmentCount = m.attachmentCount,
+    )
+
+    private fun restoreItem(c: TranscriptCache.CachedItem): ChatItem? {
+        val kind = runCatching { Kind.valueOf(c.kind) }.getOrNull() ?: return null
+        return ChatItem(
+            id = c.id, kind = kind, text = c.text, status = c.status,
+            toolCallId = c.toolCallId, toolKind = c.toolKind, detail = c.detail,
+            diffs = c.diffs.map { ToolDiff(it.path, it.oldText, it.newText) },
+            planEntries = c.planEntries.map {
+                PlanEntry(it.content, it.status, it.priority)
+            },
+            failed = c.failed,
+            attachmentCount = c.attachmentCount,
+        )
+    }
+
     private fun upsertPlan(entries: List<PlanEntry>) {
         streamingId = null
-        _messages.update { list ->
+        mutateMessages { list ->
             val existing = list.indexOfLast { it.id == planItemId }
             if (existing >= 0) {
                 list.toMutableList().apply {

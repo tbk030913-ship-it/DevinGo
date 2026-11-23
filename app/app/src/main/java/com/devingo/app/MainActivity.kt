@@ -16,11 +16,13 @@ import com.devingo.app.ui.AppShell
 import com.devingo.app.ui.theme.DevinGoTheme
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.Toaster
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 
 @OptIn(kotlinx.coroutines.FlowPreview::class)
@@ -75,7 +77,6 @@ class MainActivity : ComponentActivity() {
                         prefs.lastSessionCwd = cwd
                     }
                     val ui by vm.ui.collectAsState()
-                    val messages by vm.messages.collectAsState()
                     val pendingPermission by vm.pendingPermission.collectAsState()
 
                     val settingsVersion by prefs.settingsVersion.collectAsState()
@@ -105,7 +106,7 @@ class MainActivity : ComponentActivity() {
                         var finishedAt = 0L
                         combine(
                             vm.ui,
-                            vm.messages,
+                            vm.transcript,
                             vm.pendingPermission,
                             prefs.settingsVersion,
                         ) { u, m, p, _ -> Triple(u, m, p) }
@@ -132,7 +133,9 @@ class MainActivity : ComponentActivity() {
                                 ) {
                                     finished = null
                                 }
-                                var status = deriveLiveStatus(u, m, p, turnStart, finished)
+                                var status = deriveLiveStatus(
+                                    u, m.runningDetail, p, turnStart, finished,
+                                )
                                 // The user is looking at the chat: the finished
                                 // card collapses back to plain idle text.
                                 if ((status.state == LiveStatus.State.Done ||
@@ -155,6 +158,7 @@ class MainActivity : ComponentActivity() {
                                     null
                                 }
                             }
+                            .flowOn(Dispatchers.Default)
                             .filterNotNull()
                             .distinctUntilChanged()
                             .debounce(300)
@@ -249,6 +253,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         AppVisibility.isForeground = false
+        // Transcript caches flush here so a killed process still reopens
+        // sessions on the last good snapshot.
+        ConnectionManager.get(application).persistCaches()
         super.onStop()
     }
 

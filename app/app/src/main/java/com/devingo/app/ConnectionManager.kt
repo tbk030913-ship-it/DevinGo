@@ -23,9 +23,13 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -70,6 +74,8 @@ class ConnectionManager private constructor(private val app: Application) {
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         /** `session/close` gets this long to answer before teardown proceeds. */
         private const val CLOSE_TIMEOUT_MS = 2_000L
+        /** Transcript cache writes ride a debounce — one save per quiet stretch. */
+        private const val CACHE_SAVE_DEBOUNCE_MS = 5_000L
         private const val TAG = "ConnectionManager"
         /** Identifier this client reports in `_devingo/hello`. */
         private const val clientId = "devingo-android"
@@ -91,6 +97,7 @@ class ConnectionManager private constructor(private val app: Application) {
     }
     private val client = AcpClient(json)
     private val notifier = Notifier(app)
+    private val cache = TranscriptCache(app, json)
 
     /** All session/connection work serializes here (the demux included). */
     internal val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -118,6 +125,15 @@ class ConnectionManager private constructor(private val app: Application) {
     /** The store currently bound to the chat UI; null = Home. */
     private val _currentStore = MutableStateFlow<SessionStore?>(null)
     val currentStore = _currentStore.asStateFlow()
+
+    /**
+     * Which top-level screen is up — U6. Decoupled from [ConnState.phase]:
+     * the socket dropping while a session is open changes the chat page's
+     * connection banner, never the page.
+     */
+    val page = _currentStore
+        .map { it?.let { s -> Page.Chat(s.sessionId) } ?: Page.Home }
+        .stateIn(scope, SharingStarted.Eagerly, Page.Home)
 
     /** `/models` fallback list when the session reports no model picker. */
     private val _bridgeModels = MutableStateFlow<List<SessionModel>>(emptyList())
@@ -466,7 +482,7 @@ class ConnectionManager private constructor(private val app: Application) {
         store.finishLoad(r)
     }
 
-    private fun createStore(sessionId: String, cwd: String): SessionStore {
+    private suspend fun createStore(sessionId: String, cwd: String): SessionStore {
         val store = SessionStore(
             sessionId = sessionId,
             cwd = cwd,
@@ -478,6 +494,11 @@ class ConnectionManager private constructor(private val app: Application) {
             ),
             onSessionReady = { sid, c -> onSessionReady?.invoke(sid, c) },
         )
+        // U7: show the last cached transcript right away — the attach replay
+        // aligns it with the hub behind the staged commit.
+        cache.load(sessionId)
+            ?.takeIf { it.host == lastHost }
+            ?.let { store.restoreFromCache(it) }
         seqStash.remove(sessionId)?.let { store.seedSeq(it) }
         stores[sessionId] = store
         watchStore(store)
@@ -485,6 +506,11 @@ class ConnectionManager private constructor(private val app: Application) {
     }
 
     private fun bindStore(store: SessionStore) {
+        // The session going off-screen gets its transcript cached — the
+        // next open renders it before the attach replay lands.
+        _currentStore.value?.takeIf { it !== store }?.let { prev ->
+            scope.launch { cache.save(prev.cacheSnapshot(lastHost)) }
+        }
         _currentStore.value = store
         store.unread.value = false
         _conn.update { it.copy(phase = Phase.Ready, statusText = "", error = null) }
@@ -499,6 +525,11 @@ class ConnectionManager private constructor(private val app: Application) {
         val store = stores.remove(sessionId) ?: return
         storeWatchJobs.remove(sessionId)?.cancel()
         reattachJobs.remove(sessionId)?.cancel()
+        if (gone) {
+            scope.launch { cache.remove(sessionId) }
+        } else {
+            scope.launch { cache.save(store.cacheSnapshot(lastHost)) }
+        }
         store.drop()
         seqStash.remove(sessionId)
         // Non-delete drops leave the hub hosting (and fanning out to) the
@@ -510,7 +541,6 @@ class ConnectionManager private constructor(private val app: Application) {
         if (gone) _sessions.update { list -> list?.filterNot { it.sessionId == sessionId } }
         if (_currentStore.value === store) {
             _currentStore.value = null
-            _conn.update { it.copy(phase = Phase.Idle) }
         }
     }
 
@@ -519,8 +549,9 @@ class ConnectionManager private constructor(private val app: Application) {
 
     /** Unbind without unsubscribing — the session keeps running off-screen. */
     fun leaveSession() {
+        val leaving = _currentStore.value ?: return
         _currentStore.value = null
-        _conn.update { it.copy(phase = Phase.Idle, statusText = "") }
+        scope.launch { cache.save(leaving.cacheSnapshot(lastHost)) }
     }
 
     /** Re-attach to repair a journal gap or a session_resync hint. */
@@ -605,18 +636,38 @@ class ConnectionManager private constructor(private val app: Application) {
         }
     }
 
-    /** Track a store's live flags into the badge map for the drawer. */
+    /** Track a store's live flags into the badge map for the drawer, and
+     *  debounce-save its transcript so a later open renders instantly. */
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
     private fun watchStore(store: SessionStore) {
         storeWatchJobs[store.sessionId] = scope.launch {
-            combine(store.pendingPermission, store.ui, store.unread) { p, u, unread ->
-                SessionBadge(
-                    pendingPermission = p != null,
-                    running = u.running,
-                    unread = unread,
-                )
-            }.collect { b ->
-                _badges.update { it + (store.sessionId to b) }
+            launch {
+                combine(
+                    store.pendingPermission,
+                    store.ui,
+                    store.unread,
+                ) { p, u, unread ->
+                    SessionBadge(
+                        pendingPermission = p != null,
+                        running = u.running,
+                        unread = unread,
+                    )
+                }.collect { b ->
+                    _badges.update { it + (store.sessionId to b) }
+                }
             }
+            launch {
+                store.messages.debounce(CACHE_SAVE_DEBOUNCE_MS).collect {
+                    runCatching { cache.save(store.cacheSnapshot(lastHost)) }
+                }
+            }
+        }
+    }
+
+    /** Snapshot every live store — called when the app goes to background. */
+    fun persistCaches() {
+        stores.values.forEach { s ->
+            scope.launch { runCatching { cache.save(s.cacheSnapshot(lastHost)) } }
         }
     }
 
@@ -894,7 +945,10 @@ class ConnectionManager private constructor(private val app: Application) {
             is AcpEvent.PermissionResolved -> store.resolvePeerPermission(e.requestId)
             else -> {
                 store.onEvent(e, ev.seq)
-                if (store !== _currentStore.value && e.marksUnread()) {
+                // Replay backlog is history — only live frames light unread.
+                if (store !== _currentStore.value && store.isLive(ev.seq) &&
+                    e.marksUnread()
+                ) {
                     store.unread.value = true
                 }
             }

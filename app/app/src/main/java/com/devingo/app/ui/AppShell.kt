@@ -34,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatViewModel
+import com.devingo.app.Page
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
 import com.devingo.app.tailnet.TailnetManager
@@ -48,9 +49,10 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppShell(vm: ChatViewModel, prefs: Prefs) {
-    val ui by vm.ui.collectAsState()
     val openTarget by vm.openTarget.collectAsState()
-    val sessionOpen = ui.sessionId != null
+    // U6: which screen is up is its own state — a dropped socket shows a
+    // banner on the chat page instead of snapping back to Home.
+    val page by vm.page.collectAsState()
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     // Shared with both Home surfaces so the drawer lists the same project
@@ -95,16 +97,18 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
         }
     }
 
+    // Keyed on the boolean, not the page — a Chat(A)→Chat(B) session switch
+    // must rebind the store WITHOUT a transition recreating the chat tree.
     AnimatedContent(
-        targetState = sessionOpen,
+        targetState = page is Page.Chat,
         transitionSpec = {
             (fadeIn(tween(220)) + scaleIn(initialScale = 0.98f)) togetherWith
                 (fadeOut(tween(150)) + scaleOut(targetScale = 0.98f))
         },
-        label = "phase",
+        label = "page",
         modifier = Modifier.fillMaxSize(),
-    ) { open ->
-        if (open) {
+    ) { chatOpen ->
+        if (chatOpen) {
             ModalNavigationDrawer(
                 drawerState = drawerState,
                 gesturesEnabled = drawerState.isOpen,
