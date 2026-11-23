@@ -1,8 +1,10 @@
 package com.devingo.app.ui
 
+import android.content.ClipData
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
@@ -44,12 +46,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -63,10 +69,16 @@ import com.devingo.app.Turn
 import com.devingo.app.TurnTiming
 import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.Brain
 import me.rerere.hugeicons.stroke.ChevronRight
+import me.rerere.hugeicons.stroke.Copy01
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
 internal fun formatTokens(n: Long): String = when {
@@ -134,7 +146,8 @@ private fun truncate(text: String, maxLength: Int): String {
 /**
  * The Devin transcript: reverseLayout LazyColumn fed bottom-to-top —
  * status line first, then each turn's WorkRow, body items (reversed) and
- * user bubble. All rows share animateItem motion.
+ * user bubble. Rows never displace each other (placementSpec = null); the
+ * only entry motion is the 220ms fade/rise on <2s-fresh messages (U5.2).
  */
 @Composable
 internal fun Transcript(
@@ -145,6 +158,7 @@ internal fun Transcript(
     timings: Map<Long, TurnTiming>,
     expandedWork: Map<Long, Boolean>,
     onToggleWork: (Long) -> Unit,
+    onExpandWork: (Long) -> Unit,
     onUserLongPress: (ChatItem) -> Unit,
     onResend: (ChatItem) -> Unit,
     listState: LazyListState,
@@ -156,6 +170,7 @@ internal fun Transcript(
     val itemById = model.itemById
     val turnByKey = model.turnByKey
     val lastItemId = model.lastItemId
+    val terminalAgentItemIds = model.terminalAgentItemIds
 
     LazyColumn(
         state = listState,
@@ -190,9 +205,10 @@ internal fun Transcript(
             Box(
                 Modifier
                     .animateItem(
-                        fadeInSpec = tween(180),
-                        // No spring repositioning: during streaming a new row
-                        // would bounce the whole transcript every flush.
+                        // No fade-in at this level — fresh-only entry lives
+                        // in FreshEntry below; replays and streaming growth
+                        // appear instantly. Placement stays off (B5).
+                        fadeInSpec = null,
                         placementSpec = null,
                         fadeOutSpec = tween(120),
                     )
@@ -206,21 +222,56 @@ internal fun Transcript(
                             val m = itemById[row.itemId]
                                 ?.let { if (tail?.id == it.id) tail else it }
                                 ?: return@items
-                            UserBubble(
-                                m,
-                                onLongPress = { onUserLongPress(m) },
-                                onResend = { onResend(m) },
-                            )
+                            FreshEntry(m, rise = true) {
+                                UserBubble(
+                                    m,
+                                    onLongPress = { onUserLongPress(m) },
+                                    onResend = { onResend(m) },
+                                )
+                            }
                         }
                         is RowKind.Body -> {
                             val m = itemById[row.itemId]
                                 ?.let { if (tail?.id == it.id) tail else it }
                                 ?: return@items
-                            BodyItem(
-                                m,
-                                streaming = ui.running && m.id == lastItemId &&
-                                    m.kind == Kind.Agent,
-                            )
+                            val streaming = ui.running && m.id == lastItemId &&
+                                m.kind == Kind.Agent
+                            if (m.kind == Kind.Agent) {
+                                val turn = turnByKey[row.turnKey]
+                                // Only the settled turn's last agent text
+                                // carries the meta bar (t3code's
+                                // showAssistantMeta); streaming stays bare.
+                                val showMeta = !streaming &&
+                                    m.id in terminalAgentItemIds && turn != null
+                                FreshEntry(m, rise = false) {
+                                    BodyItem(
+                                        m,
+                                        streaming = streaming,
+                                        meta = if (showMeta) {
+                                            {
+                                                AssistantMetaBar(
+                                                    turn = turn,
+                                                    timing = timings[
+                                                        turn.user?.id ?: turn.key,
+                                                    ],
+                                                    canFork = ui.revertSupported &&
+                                                        turn.user != null,
+                                                    onFork = {
+                                                        turn.user?.let(onUserLongPress)
+                                                    },
+                                                    onShowDiff = {
+                                                        onExpandWork(turn.key)
+                                                    },
+                                                )
+                                            }
+                                        } else {
+                                            null
+                                        },
+                                    )
+                                }
+                            } else {
+                                BodyItem(m)
+                            }
                         }
                         is RowKind.Work -> {
                             val turn = turnByKey[row.turnKey] ?: return@items
@@ -504,16 +555,57 @@ private fun WorkRow(
     }
 }
 
+// ---- fresh-only entry motion -----------------------------------------------------
+
+private const val FRESH_ENTRY_WINDOW_MS = 2_000L
+private const val ENTRY_ANIM_MS = 220
+private val ENTRY_RISE = 25.dp
+
+/**
+ * t3code's isFreshTimestamp + entering animation (ThreadFeed): items under
+ * 2s old — and never replayed history — get a 220ms fade; the user bubble
+ * also rises ENTRY_RISE like RN's FadeInDown. Replays, streaming growth
+ * and remounts past the window compose already at rest: zero animation.
+ */
+@Composable
+private fun FreshEntry(
+    item: ChatItem,
+    rise: Boolean,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    val animate = !item.isReplay && !isReducedMotion() &&
+        System.currentTimeMillis() - item.createdAtMs < FRESH_ENTRY_WINDOW_MS
+    val progress = remember { Animatable(if (animate) 0f else 1f) }
+    LaunchedEffect(animate) {
+        if (animate) {
+            progress.animateTo(1f, tween(ENTRY_ANIM_MS))
+        } else {
+            // The 2s window can lapse mid-fade — never park partially faded.
+            progress.snapTo(1f)
+        }
+    }
+    Box(
+        modifier.graphicsLayer {
+            alpha = progress.value
+            if (rise) translationY = (1f - progress.value) * ENTRY_RISE.toPx()
+        },
+    ) {
+        content()
+    }
+}
+
 // ---- inline body items -----------------------------------------------------------
 
 @Composable
 private fun BodyItem(
     m: ChatItem,
     streaming: Boolean = false,
+    meta: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     when (m.kind) {
-        Kind.Agent -> AgentText(m, streaming, modifier)
+        Kind.Agent -> AgentText(m, streaming, meta, modifier)
         Kind.Error -> ErrorLine(m.text, modifier)
         Kind.System -> SystemLine(m.text, modifier)
         Kind.Plan -> PlanCard(m, modifier)
@@ -522,19 +614,169 @@ private fun BodyItem(
 }
 
 @Composable
-private fun AgentText(m: ChatItem, streaming: Boolean, modifier: Modifier = Modifier) {
+private fun AgentText(
+    m: ChatItem,
+    streaming: Boolean,
+    meta: (@Composable () -> Unit)? = null,
+    modifier: Modifier = Modifier,
+) {
     val cs = MaterialTheme.colorScheme
-    MarkdownBlock(
-        content = m.text,
-        // MarkdownBlock pads its content 4dp horizontally internally; pull
-        // the block back so agent text shares the transcript's left edge.
-        modifier = modifier
+    Column(modifier.fillMaxWidth()) {
+        MarkdownBlock(
+            content = m.text,
+            // MarkdownBlock pads its content 4dp horizontally internally; pull
+            // the block back so agent text shares the transcript's left edge.
+            modifier = Modifier
+                .fillMaxWidth()
+                .offset(x = (-4).dp)
+                .padding(vertical = 4.dp),
+            style = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
+            streaming = streaming,
+        )
+        // The settled-turn bar fades in when the run ends; a row composed
+        // already-settled renders it instantly (no replayed animation).
+        AnimatedVisibility(
+            visible = meta != null,
+            enter = fadeIn(tween(180)),
+        ) {
+            meta?.invoke()
+        }
+    }
+}
+
+/**
+ * t3code's settled-turn bottom bar (ThreadFeed showAssistantMeta row):
+ * copy the turn's whole reply, fork from its user prompt, the +A/−R diff
+ * pill and the HH:mm completion time — bottom-left under the last agent
+ * message of the turn.
+ */
+@Composable
+private fun AssistantMetaBar(
+    turn: Turn,
+    timing: TurnTiming?,
+    canFork: Boolean,
+    onFork: () -> Unit,
+    onShowDiff: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var copied by remember(turn.key) { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1_200) // t3code COPY_FEEDBACK_DURATION_MS
+            copied = false
+        }
+    }
+    val reply = remember(turn.body) {
+        turn.body.filter { it.kind == Kind.Agent }
+            .joinToString("\n\n") { it.text }
+            .trim()
+    }
+    val (diffAdd, diffDel) = turn.diffStats
+    val timeLabel = timing?.end?.let { end ->
+        remember(end) {
+            SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(end))
+        }
+    }
+    Row(
+        Modifier
             .fillMaxWidth()
-            .offset(x = (-4).dp)
-            .padding(vertical = 4.dp),
-        style = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
-        streaming = streaming,
-    )
+            .padding(bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        MetaAction(
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                scope.launch {
+                    clipboard.setClipEntry(
+                        ClipEntry(ClipData.newPlainText("reply", reply)),
+                    )
+                }
+                copied = true
+            },
+        ) {
+            Icon(
+                if (copied) Icons.Filled.Check else HugeIcons.Copy01,
+                contentDescription = if (copied) "已复制" else "复制回复",
+                modifier = Modifier.size(14.dp),
+                tint = if (copied) DevinGoColors.diffAdd else cs.onSurfaceVariant,
+            )
+        }
+        if (canFork) {
+            MetaAction(onClick = onFork) {
+                Icon(
+                    HugeIcons.ArrowTurnForward,
+                    contentDescription = "从此处分叉",
+                    modifier = Modifier.size(14.dp),
+                    tint = cs.onSurfaceVariant,
+                )
+            }
+        }
+        if (diffAdd > 0 || diffDel > 0) {
+            // U5.2 wires the pill to the turn's inline WorkRow expansion
+            // (the DiffCards); the dedicated diff sheet lands with N6.1.
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onShowDiff)
+                    .padding(horizontal = 6.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (diffAdd > 0) {
+                    Text(
+                        "+$diffAdd",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFeatureSettings = "tnum",
+                        ),
+                        color = DevinGoColors.diffAdd,
+                        maxLines = 1,
+                    )
+                }
+                if (diffDel > 0) {
+                    Text(
+                        " −$diffDel",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFeatureSettings = "tnum",
+                        ),
+                        color = DevinGoColors.diffRemove,
+                        maxLines = 1,
+                    )
+                }
+                Icon(
+                    HugeIcons.ChevronRight,
+                    contentDescription = "查看本轮改动",
+                    modifier = Modifier.size(12.dp),
+                    tint = cs.onSurfaceVariant,
+                )
+            }
+        }
+        timeLabel?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFeatureSettings = "tnum",
+                ),
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        }
+    }
+}
+
+/** 36dp-square meta-bar touch target (t3code's replyActionSize hitbox). */
+@Composable
+private fun MetaAction(onClick: () -> Unit, icon: @Composable () -> Unit) {
+    Box(
+        Modifier
+            .size(36.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        icon()
+    }
 }
 
 @Composable

@@ -1305,7 +1305,9 @@ class SessionStore(
             if (last != null && last.id == streamingId && last.kind == kind) {
                 list.dropLast(1) + last.copy(text = last.text + chunk)
             } else {
-                val item = ChatItem(nextItemId++, kind, chunk)
+                // Non-live chunks are attach/load replay — the item must
+                // never run the fresh-entry animation (U5.2).
+                val item = ChatItem(nextItemId++, kind, chunk, isReplay = !streamLive)
                 streamingId = item.id
                 if (kind == Kind.User && streamLive) noteTurnStart(item.id)
                 capMessages(list + item)
@@ -1503,6 +1505,7 @@ class SessionStore(
             },
             failed = c.failed,
             attachmentCount = c.attachmentCount,
+            isReplay = true,
         )
     }
 

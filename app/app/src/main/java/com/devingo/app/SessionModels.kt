@@ -97,6 +97,10 @@ data class ChatItem(
     val attachments: List<ImageAttachment> = emptyList(),
     /** Images sent with this prompt — badge source once bytes are cleared. */
     val attachmentCount: Int = 0,
+    /** Local wall-clock at creation — the fresh-entry animation window. */
+    val createdAtMs: Long = System.currentTimeMillis(),
+    /** Replayed history (session/load, attach backlog, cache) — never animates entry. */
+    val isReplay: Boolean = false,
 )
 
 /** One `diff` content item of a tool call: unified old/new file text. */

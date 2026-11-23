@@ -63,7 +63,7 @@ private fun failedCount(items: List<ChatItem>): Int =
 sealed interface RowKind {
     data object Status : RowKind
     data class Work(val turnKey: Long, val live: Boolean) : RowKind
-    data class Body(val itemId: Long) : RowKind
+    data class Body(val itemId: Long, val turnKey: Long) : RowKind
     data class User(val itemId: Long) : RowKind
 }
 
@@ -81,6 +81,12 @@ data class TranscriptModel(
     val lastUserId: Long? = null,
     /** LiveStatus detail while running (tool title / "思考中"); null = generic. */
     val runningDetail: String? = null,
+    /**
+     * Each settled turn's last agent-text item — the only rows that show
+     * the bottom meta bar (copy/fork/diff/timestamp). The live turn is
+     * excluded so streaming stays bare markdown (U5.2).
+     */
+    val terminalAgentItemIds: Set<Long> = emptySet(),
 ) {
     companion object {
         val EMPTY = TranscriptModel()
@@ -108,10 +114,19 @@ internal fun buildTranscriptModel(
                 // Thoughts and tools collapse into the turn's WorkRow —
                 // they never render as inline body items.
                 if (item.kind != Kind.Thought && item.kind != Kind.Tool) {
-                    add(RowKind.Body(item.id))
+                    add(RowKind.Body(item.id, turn.key))
                 }
             }
             turn.user?.let { add(RowKind.User(it.id)) }
+        }
+    }
+    // t3code's terminalAssistantMessageIds: the last agent message of each
+    // settled turn carries the meta bar; the live turn's rows stay bare.
+    val terminalAgentIds = turns.mapIndexedNotNullTo(HashSet()) { i, turn ->
+        if (running && i == turns.lastIndex) {
+            null
+        } else {
+            turn.body.lastOrNull { it.kind == Kind.Agent }?.id
         }
     }
     return TranscriptModel(
@@ -128,6 +143,7 @@ internal fun buildTranscriptModel(
             } else {
                 null
             },
+        terminalAgentItemIds = terminalAgentIds,
     )
 }
 

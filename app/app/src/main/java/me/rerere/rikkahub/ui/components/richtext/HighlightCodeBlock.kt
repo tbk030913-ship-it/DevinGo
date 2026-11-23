@@ -1,7 +1,9 @@
 package me.rerere.rikkahub.ui.components.richtext
 
 import android.content.ClipData
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.fadeIn
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -112,6 +114,19 @@ fun HighlightCodeBlock(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+                !completeCodeBlock -> {
+                    // Unclosed fence mid-stream: plain mono text — the
+                    // expensive syntax-highlight pass and the action pill
+                    // wait for the closing ``` (U5.2).
+                    Text(
+                        text = code,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(scrollState),
+                        style = codeTextStyle(LocalTextStyle.current.merge(style)),
+                        softWrap = false,
+                    )
+                }
                 else -> {
                     val textStyle = LocalTextStyle.current.merge(style)
                     val codeLines = remember(code) { code.lines() }
@@ -181,19 +196,25 @@ fun HighlightCodeBlock(
                 }
             }
         }
-        CodeBlockActionPill(
-            autoWrap = autoWrap,
-            onToggleWrap = { autoWrap = !autoWrap },
-            onCopy = {
-                scope.launch {
-                    clipboardManager.setClipEntry(ClipEntry(ClipData.newPlainText("code", code)))
-                }
-                toaster.show(context.getString(R.string.code_block_copied))
-            },
+        // Hidden while the fence streams open — fades in once it closes.
+        AnimatedVisibility(
+            visible = completeCodeBlock,
+            enter = fadeIn(),
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .padding(8.dp),
-        )
+        ) {
+            CodeBlockActionPill(
+                autoWrap = autoWrap,
+                onToggleWrap = { autoWrap = !autoWrap },
+                onCopy = {
+                    scope.launch {
+                        clipboardManager.setClipEntry(ClipEntry(ClipData.newPlainText("code", code)))
+                    }
+                    toaster.show(context.getString(R.string.code_block_copied))
+                },
+            )
+        }
     }
 }
 

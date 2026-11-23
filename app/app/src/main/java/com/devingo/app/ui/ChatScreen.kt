@@ -181,6 +181,9 @@ fun ChatScreen(
                     onToggleWork = { key ->
                         expandedWork[key] = expandedWork[key] != true
                     },
+                    // The meta-bar diff pill only opens — never collapses —
+                    // the turn's WorkRow (U5.2).
+                    onExpandWork = { key -> expandedWork[key] = true },
                     onUserLongPress = {
                         if (ui.revertSupported) {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
