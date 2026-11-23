@@ -249,6 +249,9 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         AppVisibility.isForeground = true
+        // Foreground = a good moment to retry a dead socket immediately
+        // rather than waiting out the reconnect backoff.
+        ConnectionManager.get(application).onAppForeground()
     }
 
     override fun onStop() {

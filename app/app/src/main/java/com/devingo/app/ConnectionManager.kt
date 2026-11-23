@@ -1,6 +1,9 @@
 package com.devingo.app
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.util.Log
 import com.devingo.app.acp.ACP_ERROR_AUTH_REQUIRED
 import com.devingo.app.acp.AcpClient
@@ -16,11 +19,11 @@ import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
 import com.devingo.app.tailnet.TailnetManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -36,6 +39,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlin.random.Random
 
 /**
  * Application-level owner of the single ACP WebSocket. One instance per
@@ -68,7 +72,7 @@ class ConnectionManager private constructor(private val app: Application) {
     )
 
     companion object {
-        private const val RECONNECT_MAX_ATTEMPTS = 3
+        /** Reconnect backoff: 2s → 4s → … capped at 30s, jittered per wait. */
         private const val RECONNECT_BASE_DELAY_MS = 2_000L
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         /** `session/close` gets this long to answer before teardown proceeds. */
@@ -159,10 +163,15 @@ class ConnectionManager private constructor(private val app: Application) {
     private var openJob: Job? = null
     private var reconnectJob: Job? = null
     private var listJob: Job? = null
+    /** Completed to cut short the reconnect loop's current backoff wait. */
+    private var reconnectKick: CompletableDeferred<Unit>? = null
+    /** Close reason of the last drop — reused when a kick restarts the loop. */
+    private var dropDetail = "连接已断开"
     /** Serializes ensureSocket so a list refresh can't race a session open. */
     private val socketMutex = Mutex()
     @Volatile private var socketLive = false
     @Volatile private var intentionalDisconnect = false
+    private val connectivity = app.getSystemService(ConnectivityManager::class.java)
 
     private var lastHost = ""
     private var lastToken: String? = null
@@ -179,6 +188,31 @@ class ConnectionManager private constructor(private val app: Application) {
             if (store != null) store.seedSeq(seq) else seqStash[sid] = seq
         }
         scope.launch { client.events.collect { route(it) } }
+        // Network recovery/foregrounding cuts the reconnect wait short — a
+        // process-lifetime registration, never unregistered (same lifetime
+        // as this singleton). The callback thread differs; the handlers only
+        // launch work onto `scope`.
+        connectivity?.registerDefaultNetworkCallback(
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = kickReconnect()
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    caps: NetworkCapabilities,
+                ) {
+                    // A LAN bridge answers before internet validation, but a
+                    // captive portal only opens at VALIDATED — kick on both.
+                    if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                        kickReconnect()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    // Default network lost AND nothing else up = truly offline.
+                    if (connectivity?.activeNetwork == null) onNetworkDown()
+                }
+            },
+        )
     }
 
     // ---- connection -------------------------------------------------------
@@ -713,6 +747,7 @@ class ConnectionManager private constructor(private val app: Application) {
         // e.g. "连接已断开 (1011): devin acp exited" — the wire close detail
         // is why the socket dropped, so it belongs on screen (B3).
         val detail = reason.ifBlank { "连接已断开" }
+        dropDetail = detail
         stores.values.forEach { it.onDisconnected(detail) }
         if (lastHost.isBlank()) {
             _conn.update {
@@ -726,6 +761,21 @@ class ConnectionManager private constructor(private val app: Application) {
             }
             return
         }
+        startReconnectLoop(detail, immediate = false)
+    }
+
+    /**
+     * Reconnect cycle after the socket went down: unlimited attempts —
+     * the foreground service keeps the process alive in the background, so
+     * the loop only stops on success, a manual retry (ensureSocket cancels
+     * it) or an intentional disconnect/epoch drop. Backoff is exponential
+     * (2s → 30s cap) with equal jitter, and each wait can be cut short by a
+     * recovery kick (network regained, app foregrounded). [immediate]
+     * skips the wait before the first attempt — used by kicks that start
+     * the loop for a socket that died outside the drop path (e.g. a failed
+     * ensureSocket while the network was down).
+     */
+    private fun startReconnectLoop(detail: String, immediate: Boolean) {
         if (reconnectJob?.isActive == true) return
         _conn.update {
             it.copy(
@@ -735,16 +785,26 @@ class ConnectionManager private constructor(private val app: Application) {
             )
         }
         reconnectJob = scope.launch {
-            var lastError = ""
-            for (attempt in 1..RECONNECT_MAX_ATTEMPTS) {
-                val backoff = (RECONNECT_BASE_DELAY_MS shl (attempt - 1))
-                    .coerceAtMost(RECONNECT_MAX_DELAY_MS)
+            var backoff = RECONNECT_BASE_DELAY_MS
+            var attempt = 0
+            while (true) {
+                attempt++
                 _conn.update {
-                    it.copy(
-                        statusText = "$detail · 重连中（第 $attempt/$RECONNECT_MAX_ATTEMPTS 次）…",
-                    )
+                    it.copy(statusText = "$detail · 重连中（第 $attempt 次）…")
                 }
-                delay(backoff)
+                if (attempt > 1 || !immediate) {
+                    // Equal jitter on half the backoff; a kick completes
+                    // `reconnectKick` and short-circuits the wait — no
+                    // cancel/relaunch race with an in-flight connect.
+                    val kick = CompletableDeferred<Unit>()
+                    reconnectKick = kick
+                    try {
+                        val waitMs = backoff / 2 + Random.nextLong(backoff / 2 + 1)
+                        withTimeoutOrNull(waitMs) { kick.await() }
+                    } finally {
+                        reconnectKick = null
+                    }
+                }
                 try {
                     client.connect(wsUrl(lastHost), lastToken)
                     client.initialize()
@@ -775,17 +835,39 @@ class ConnectionManager private constructor(private val app: Application) {
                     // close it or the next attempt orphans it bridge-side.
                     client.disconnect()
                     socketLive = false
-                    lastError = e.display()
                 }
+                backoff = (backoff * 2).coerceAtMost(RECONNECT_MAX_DELAY_MS)
             }
-            _conn.update {
-                it.copy(
-                    phase = Phase.Error,
-                    reconnecting = false,
-                    statusText = detail,
-                    error = "自动重连失败: $lastError",
-                )
+        }
+    }
+
+    /**
+     * Recovery hint — the network regained a usable route or the app came
+     * back to the foreground: if the socket is down and shouldn't stay that
+     * way, retry NOW instead of waiting out the backoff. A connect already
+     * in flight (socketMutex held by ensureSocket) is left alone rather
+     * than raced.
+     */
+    private fun kickReconnect() {
+        scope.launch {
+            if (socketLive || intentionalDisconnect || lastHost.isBlank()) return@launch
+            if (socketMutex.isLocked) return@launch
+            if (reconnectJob?.isActive == true) {
+                reconnectKick?.complete(Unit) // parked in a backoff wait — cut it
+            } else {
+                startReconnectLoop(dropDetail, immediate = true)
             }
+        }
+    }
+
+    /** App returned to the foreground — same recovery hint as network regain. */
+    fun onAppForeground() = kickReconnect()
+
+    /** The last network went away: say so while the reconnect banner is up. */
+    private fun onNetworkDown() {
+        scope.launch {
+            if (socketLive || intentionalDisconnect || !_conn.value.reconnecting) return@launch
+            _conn.update { it.copy(statusText = "无网络，等待网络恢复…") }
         }
     }
 
