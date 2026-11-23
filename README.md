@@ -76,6 +76,8 @@ POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容�
 - `GET /models`  → 缓存的模型列表（启动后异步 + 每 6h 跑一次 `devin models list`，只留 id/name）
 - `GET /pair`    → 配对二维码网页（只有本机打开才带 token）
 - `POST /fs/write` → 在会话工作区内写文件（`{sessionId,path,content}`，≤1MiB，越界 403）
+- `POST /git/diff` → 会话工作区未提交变更 patch（`--relative`+`-- .` 限定子树、
+  含未跟踪文件合成段，15s/4MiB 上限，`truncated` 标记截断）
 - `WS  /acp`     → ACP 会话托管（标准 ACP + `_devingo/*` 私有扩展，见下）
 
 行为要点：单条 WS 消息上限 4MiB（默认 32KiB 会断大 payload）；最多 8 个并发 `/acp`
