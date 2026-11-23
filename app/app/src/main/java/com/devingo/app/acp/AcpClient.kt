@@ -1014,6 +1014,46 @@ suspend fun postBridgeGitDiff(
     }
 }
 
+/**
+ * The bridge's `/fs/list`: the session workspace's file paths, cwd-relative
+ * (tracked + non-ignored untracked, ≤2000 — N6.2's @file picker feed).
+ * Throws [AcpException] on any non-2xx so the picker can surface the error.
+ */
+suspend fun postBridgeFsList(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+): List<String> = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+    val payload = buildJsonObject {
+        put("sessionId", sessionId)
+    }
+    val req = Request.Builder()
+        .url("$baseHttpUrl/fs/list")
+        .post(payload.toString().toRequestBody("application/json".toMediaType()))
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "fs/list HTTP ${resp.code}")
+        }
+        val body = resp.body?.string().orEmpty()
+        val arr = healthJson.parseToJsonElement(body).jsonObject["files"]
+        (arr as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }
+            ?: emptyList()
+    }
+}
+
 private fun extractModels(el: JsonElement, out: MutableList<SessionModel> = mutableListOf()): List<SessionModel> {
     when (el) {
         is JsonObject -> {

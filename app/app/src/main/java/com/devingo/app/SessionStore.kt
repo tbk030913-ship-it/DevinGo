@@ -79,6 +79,11 @@ class SessionStore(
      * uncommitted patch. Null when the bridge URL isn't known (N6.1).
      */
     private val gitDiffFetcher: (suspend () -> GitDiffResult)? = null,
+    /**
+     * Bridge `/fs/list` bound to this session — the workspace's file paths
+     * for the composer's @file picker. Null without a bridge URL (N6.2).
+     */
+    private val workspaceFileLister: (suspend () -> List<String>)? = null,
 ) {
 
     private companion object {
@@ -880,6 +885,13 @@ class SessionStore(
         val fetcher = gitDiffFetcher
             ?: throw IllegalStateException("git diff unavailable without a bridge")
         return fetcher()
+    }
+
+    /** The workspace's file paths for the composer's @file picker (N6.2). */
+    suspend fun fetchWorkspaceFiles(): List<String> {
+        val lister = workspaceFileLister
+            ?: throw IllegalStateException("file list unavailable without a bridge")
+        return lister()
     }
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {

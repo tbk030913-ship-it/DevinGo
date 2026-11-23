@@ -19,6 +19,7 @@ import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
 import com.devingo.app.acp.postBridgeFile
+import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitDiff
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
@@ -614,6 +615,9 @@ class ConnectionManager private constructor(private val app: Application) {
             },
             gitDiffFetcher = {
                 postBridgeGitDiff(healthUrl(dialHost), lastToken, sessionId)
+            },
+            workspaceFileLister = {
+                postBridgeFsList(healthUrl(dialHost), lastToken, sessionId)
             },
         )
         // U7: show the last cached transcript right away — the attach replay

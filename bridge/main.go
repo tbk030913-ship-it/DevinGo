@@ -131,6 +131,7 @@ func main() {
 	mux.HandleFunc("/acp", acpHandler)
 	mux.HandleFunc("/models", modelsHandler)
 	mux.HandleFunc("/fs/write", fsWriteHandler)
+	mux.HandleFunc("/fs/list", fsListHandler)
 	mux.HandleFunc("/git/diff", gitDiffHandler)
 	mux.HandleFunc("/pair", pairHandler)
 	mux.HandleFunc("/pair/qr.png", pairQRHandler)
@@ -140,6 +141,7 @@ func main() {
 		fmt.Fprintln(w, "  GET /healthz   - bridge + devin status")
 		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
 		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
+		fmt.Fprintln(w, "  POST /fs/list  - list files inside a session workspace")
 		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
 		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
@@ -611,6 +613,60 @@ func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"patch":     patch,
+		"truncated": truncated,
+	})
+}
+
+// fsListMaxBody bounds the JSON request payload — it only carries a session id.
+const fsListMaxBody = 16 << 10
+
+// fsListHandler serves the session workspace's file list for the composer's
+// @file picker ({sessionId} → {files, truncated}). Same auth/origin gates as
+// /fs/write and /git/diff; the hub resolves the recorded cwd and `git
+// ls-files` prints cwd-relative paths confined to the workspace subtree
+// (N6.2).
+func fsListHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, fsListMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if req.SessionID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId is required"}`))
+		return
+	}
+	files, truncated, err := bridgeHub.sessionFsList(req.SessionID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSessionNotHosted) {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"files":     files,
 		"truncated": truncated,
 	})
 }

@@ -44,14 +44,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -60,8 +59,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -76,28 +73,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextRange
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.OffsetMapping
-import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.text.input.TransformedText
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.isUnspecified
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.exifinterface.media.ExifInterface
 import coil3.compose.AsyncImage
 import com.devingo.app.CitationAttachment
@@ -116,6 +105,7 @@ import me.rerere.hugeicons.stroke.AtSign
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.CommandLine
+import me.rerere.hugeicons.stroke.File01
 import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.hugeicons.stroke.Quotes
 import me.rerere.hugeicons.stroke.Shield01
@@ -130,7 +120,12 @@ import me.rerere.hugeicons.stroke.Shield01
  * (+, @, / triggers, model·effort and permission-mode pills, send at the
  * right end) — t3code's compact/expanded composer surfaces.
  *
- * All v1 behaviors kept — image attachments, @mention styling + hint,
+ * N6.2: both layers share one native [ComposerEditText] — `@{kind}:{ref}`
+ * inline chips, tap-on-chip sheet, atomic chip deletion, clipboard image
+ * paste. The view never leaves the tree between layers, so focus/IME survive
+ * the pill↔expanded swap.
+ *
+ * All v1 behaviors kept — image attachments, @ file picker + hint,
  * slash-command strip, queue/steer menu (queue keeps images; steer is
  * text-only and disables when attachments exist). U5.4: while a queued
  * prompt is being edited, the top slot shows the 取消/保存 banner and the
@@ -156,6 +151,8 @@ internal fun Composer(
     onSelectMode: (String) -> Unit,
     onCancelQueuedEdit: () -> Unit,
     onStop: () -> Unit,
+    /** Bridge /fs/list for the @file picker — throws when the bridge is gone. */
+    onFetchFiles: suspend () -> List<String>,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -184,25 +181,67 @@ internal fun Composer(
     val canSend = queueEditing || input.isNotBlank() || attachments.isNotEmpty() ||
         citation?.quotedText?.isNotBlank() == true
 
-    var fieldValue by remember { mutableStateOf(TextFieldValue(input)) }
-    LaunchedEffect(input) {
-        if (fieldValue.text != input) {
-            fieldValue = TextFieldValue(input, selection = TextRange(input.length))
-        }
-    }
-    val caretToken = remember(fieldValue.text, fieldValue.selection) {
-        val before = fieldValue.text.substring(
-            0,
-            fieldValue.selection.end.coerceIn(0, fieldValue.text.length),
-        )
+    // The one native editor both layers share — text/selection/chips live on
+    // the view; `input` and `selectionEnd` are its Compose mirrors.
+    val editor = remember { ComposerEditText(context) }
+    var selectionEnd by remember { mutableIntStateOf(0) }
+    var chipSheet by remember { mutableStateOf<ChipToken?>(null) }
+
+    val caretToken = remember(input, selectionEnd) {
+        val before = input.substring(0, selectionEnd.coerceIn(0, input.length))
         caretMentionRegex.find(before)?.groups?.get(2)?.value
     }
     val insertAtCaret: (String) -> Unit = { token ->
-        val tv = fieldValue
-        val pos = tv.selection.end.coerceIn(0, tv.text.length)
-        val newText = tv.text.substring(0, pos) + token + tv.text.substring(pos)
-        fieldValue = TextFieldValue(newText, selection = TextRange(pos + token.length))
-        onInputChange(newText)
+        val e = editor.text
+        if (e != null) {
+            val pos = editor.selectionEnd.coerceIn(0, e.length)
+            e.insert(pos, token)
+        }
+    }
+    // @file picker: the partial `@query` before the caret opens it; a `kind:`
+    // prefix means the user is typing a full token, not filtering files.
+    val mentionQuery = caretToken?.removePrefix("@")?.takeUnless { it.contains(':') }
+    var workspaceFiles by remember(ui.sessionId) {
+        mutableStateOf<List<String>?>(null)
+    }
+    var filesFailed by remember(ui.sessionId) { mutableStateOf(false) }
+    val needFiles = mentionQuery != null || input.contains("@file:")
+    LaunchedEffect(needFiles, ui.sessionId) {
+        if (needFiles && workspaceFiles == null && !filesFailed) {
+            try {
+                workspaceFiles = onFetchFiles()
+            } catch (_: Exception) {
+                filesFailed = true
+            }
+        }
+    }
+    val chipTokens = remember(input, workspaceFiles) {
+        scanContextTokens(input, workspaceFiles.orEmpty())
+    }
+    val pasteImages: (List<Uri>) -> Unit = { uris ->
+        // Same compress→attach path as the "+" image picker.
+        scope.launch {
+            uris.forEach { uri ->
+                val attachment = compressImage(context.contentResolver, uri)
+                if (attachment != null) {
+                    onAttach(attachment)
+                } else {
+                    Toast.makeText(
+                        context, "无法读取该图片", Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+    val insertFileToken: (String) -> Unit = { path ->
+        val e = editor.text
+        if (e != null) {
+            val caret = editor.selectionEnd.coerceIn(0, e.length)
+            val before = e.substring(0, caret)
+            val m = caretMentionRegex.find(before)
+            val start = if (m != null) caret - m.groupValues[2].length else caret
+            e.replace(start, caret, "@file:$path ")
+        }
     }
 
     val cs = MaterialTheme.colorScheme
@@ -222,23 +261,31 @@ internal fun Composer(
     val textMeasurer = rememberTextMeasurer()
     val fieldStyle = MaterialTheme.typography.bodyLarge
     val fieldPadPx = with(LocalDensity.current) { 44.dp.roundToPx() }
-    val singleLineOverflow = remember(input, compactFieldWidth, fieldStyle) {
-        input.isNotEmpty() && compactFieldWidth > 0 &&
+    // ~1.9em per chip for its icon slot + padding — chips draw their label,
+    // not the raw token, so measure the rendered approximation or a long
+    // @file: path would over-expand the pill.
+    val chipChromePx = with(LocalDensity.current) { fieldStyle.fontSize.toPx() * 1.9f }
+    val singleLineOverflow = remember(input, chipTokens, compactFieldWidth, fieldStyle) {
+        input.isNotEmpty() && compactFieldWidth > 0 && run {
+            val approx = buildString {
+                var cursor = 0
+                for (t in chipTokens) {
+                    append(input, cursor, t.start)
+                    append(t.label)
+                    cursor = t.end
+                }
+                append(input, cursor, input.length)
+            }
             textMeasurer.measure(
-                AnnotatedString(input),
+                AnnotatedString(approx),
                 style = fieldStyle,
                 maxLines = 1,
                 constraints = Constraints(maxWidth = Constraints.Infinity),
-            ).size.width > compactFieldWidth - fieldPadPx
+            ).size.width + chipTokens.size * chipChromePx > compactFieldWidth - fieldPadPx
+        }
     }
     val expanded = focused || attachments.isNotEmpty() || citation != null ||
         input.contains('\n') || singleLineOverflow
-    // The field element moves between slots on the swap; focus must be
-    // re-requested or the IME hides (caret survives — fieldValue is shared).
-    val expandedFocus = remember { FocusRequester() }
-    LaunchedEffect(expanded) {
-        if (expanded && focused) expandedFocus.requestFocus()
-    }
 
     val onImeSend = {
         when {
@@ -267,8 +314,8 @@ internal fun Composer(
             .imePadding(),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // Popup slot above the pill: queue-edit banner, then the mention
-        // hint. (Slash-command suggestions render above the whole composer —
+        // Popup slot above the pill: queue-edit banner, then the @file
+        // picker. (Slash-command suggestions render above the whole composer —
         // ChatScreen owns that slot; the queue itself moved to U5.4's
         // floating capsule + ThreadQueueSheet.)
         AnimatedVisibility(
@@ -285,14 +332,17 @@ internal fun Composer(
             }
         }
         AnimatedVisibility(
-            visible = caretToken != null && !permissionPending,
+            visible = mentionQuery != null && !permissionPending,
             enter = fadeIn(tween(150)) + slideInVertically { it / 2 },
             exit = fadeOut(tween(100)) + shrinkVertically(),
         ) {
-            caretToken?.let { token ->
-                ComposerPopup(Modifier.padding(horizontal = 16.dp)) {
-                    MentionHint(token)
-                }
+            ComposerPopup(Modifier.padding(horizontal = 16.dp)) {
+                FileMentionList(
+                    query = mentionQuery.orEmpty(),
+                    files = workspaceFiles,
+                    failed = filesFailed,
+                    onPick = insertFileToken,
+                )
             }
         }
         Surface(
@@ -332,27 +382,66 @@ internal fun Composer(
                         ),
                     )
                 }
-                if (expanded) {
-                    // Expanded layer: full-width editor over the toolbar row.
+                // One Row always hosts the field: compact adds "+" | send
+                // around it, expanded lets it take the full width above the
+                // toolbar. The AndroidView keeps its slot across the swap, so
+                // the EditText — and its IME connection — never moves.
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp),
+                    verticalAlignment = Alignment.Bottom,
+                ) {
+                    if (!expanded) {
+                        ComposerPlusButton(
+                            onPickImages = pickImages,
+                            onInsert = insertAtCaret,
+                        )
+                    }
                     ComposerField(
-                        value = fieldValue,
-                        onValueChange = {
-                            fieldValue = it
-                            onInputChange(it.text)
-                        },
+                        editor = editor,
+                        input = input,
+                        tokens = chipTokens,
                         placeholder = when {
                             permissionPending -> "等你授权…"
                             queueEditing -> "编辑排队消息…"
                             ui.running -> "补充指令…（排队或转向）"
                             else -> "给 Devin 发消息"
                         },
-                        singleLine = false,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(expandedFocus)
-                            .onFocusChanged { focused = it.isFocused },
+                        singleLine = !expanded,
+                        onTextChanged = onInputChange,
+                        onSelectionChanged = { _, end -> selectionEnd = end },
+                        onFocusChanged = { focused = it },
+                        onChipClick = { chipSheet = it },
+                        onPasteImages = pasteImages,
                         onImeSend = onImeSend,
+                        modifier = Modifier
+                            .weight(1f)
+                            // The pill's floor: singleLine's CENTER_VERTICAL
+                            // gravity needs the view at 52dp, not wrap-height.
+                            .heightIn(min = 52.dp)
+                            // Only the compact width feeds singleLineOverflow —
+                            // the shared field's expanded width would
+                            // self-cancel the overflow flag and oscillate.
+                            .onSizeChanged {
+                                if (!expanded) compactFieldWidth = it.width
+                            },
                     )
+                    if (!expanded) {
+                        ComposerSendArea(
+                            sendState = sendState,
+                            running = ui.running,
+                            queueEditing = queueEditing,
+                            steerable = attachments.isEmpty(),
+                            sendMenu = sendMenu,
+                            onSendMenuChange = { sendMenu = it },
+                            onSend = onSend,
+                            onSteer = onSteer,
+                            onStop = onStop,
+                        )
+                    }
+                }
+                if (expanded) {
                     // Spec: the toolbar row fades in over 160ms as the layer
                     // expands — the transition state starts hidden so the
                     // enter animation actually plays on layer entry.
@@ -429,51 +518,23 @@ internal fun Composer(
                         },
                     )
                     }
-                } else {
-                    // Compact layer: + | horizontally-scrolling text | send.
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 52.dp),
-                        verticalAlignment = Alignment.Bottom,
-                    ) {
-                        ComposerPlusButton(
-                            onPickImages = pickImages,
-                            onInsert = insertAtCaret,
-                        )
-                        ComposerField(
-                            value = fieldValue,
-                            onValueChange = {
-                                fieldValue = it
-                                onInputChange(it.text)
-                            },
-                            placeholder = when {
-                                permissionPending -> "等你授权…"
-                                queueEditing -> "编辑排队消息…"
-                                ui.running -> "补充指令…（排队或转向）"
-                                else -> "给 Devin 发消息"
-                            },
-                            singleLine = true,
-                            modifier = Modifier
-                                .weight(1f)
-                                .onSizeChanged { compactFieldWidth = it.width }
-                                .onFocusChanged { focused = it.isFocused },
-                            onImeSend = onImeSend,
-                        )
-                        ComposerSendArea(
-                            sendState = sendState,
-                            running = ui.running,
-                            queueEditing = queueEditing,
-                            steerable = attachments.isEmpty(),
-                            sendMenu = sendMenu,
-                            onSendMenuChange = { sendMenu = it },
-                            onSend = onSend,
-                            onSteer = onSteer,
-                            onStop = onStop,
-                        )
-                    }
                 }
             }
+        }
+        chipSheet?.let { token ->
+            ComposerContextSheet(
+                token = token,
+                onRemove = {
+                    val e = editor.text
+                    if (e != null && token.end <= e.length &&
+                        e.substring(token.start, token.end) == token.source
+                    ) {
+                        e.delete(token.start, token.end)
+                    }
+                    chipSheet = null
+                },
+                onDismiss = { chipSheet = null },
+            )
         }
     }
 }
@@ -483,77 +544,58 @@ private enum class SendState { Disabled, Send, Stop }
 // ---- shared pieces (compact and expanded layers) --------------------------------
 
 /**
- * The composer's text field — one impl, single-line or editor-shaped.
- * The compact line is a BasicTextField: M3's TextField floor is 56.dp, so
- * it could never give the pill its spec'd 52.dp.
+ * The composer's text field — the one [ComposerEditText] (N6.2's t3code
+ * port) reconfigured per layer: 52dp single-line pill or 3–6-line editor.
+ * Text/selection/chips live on the view; Compose mirrors them through the
+ * listeners so the draft store stays the source of truth.
  */
 @Composable
 private fun ComposerField(
-    value: TextFieldValue,
-    onValueChange: (TextFieldValue) -> Unit,
+    editor: ComposerEditText,
+    input: String,
+    tokens: List<ChipToken>,
     placeholder: String,
     singleLine: Boolean,
-    modifier: Modifier = Modifier,
+    onTextChanged: (String) -> Unit,
+    onSelectionChanged: (Int, Int) -> Unit,
+    onFocusChanged: (Boolean) -> Unit,
+    onChipClick: (ChipToken) -> Unit,
+    onPasteImages: (List<Uri>) -> Unit,
     onImeSend: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
-    if (singleLine) {
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            modifier = modifier.heightIn(min = 52.dp),
-            textStyle = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
-            singleLine = true,
-            visualTransformation = mentionVisualTransformation(),
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-            keyboardActions = KeyboardActions(onSend = { onImeSend() }),
-            cursorBrush = SolidColor(cs.primary),
-            decorationBox = { inner ->
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 4.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    if (value.text.isEmpty()) {
-                        Text(
-                            placeholder,
-                            color = cs.outline,
-                            style = MaterialTheme.typography.bodyLarge,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    inner()
-                }
-            },
-        )
-        return
-    }
-    TextField(
-        value = value,
-        onValueChange = onValueChange,
+    val textStyle = MaterialTheme.typography.bodyLarge
+    val density = LocalDensity.current
+    AndroidView(
+        factory = { editor },
         modifier = modifier,
-        placeholder = {
-            Text(
-                placeholder,
-                color = cs.outline,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+        update = { view ->
+            view.singleLineMode = singleLine
+            view.placeholderText = placeholder
+            if (!textStyle.fontSize.isUnspecified) {
+                view.setTextSizeSp(textStyle.fontSize.value)
+            }
+            view.applyThemeColors(
+                textColor = cs.onSurface.toArgb(),
+                hintColor = cs.outline.toArgb(),
+                accent = cs.primary.toArgb(),
             )
+            with(density) {
+                view.applyContentPadding(
+                    horizontalPx = (if (singleLine) 4.dp else 14.dp).roundToPx(),
+                    verticalPx = (if (singleLine) 0.dp else 10.dp).roundToPx(),
+                )
+            }
+            view.textListener = onTextChanged
+            view.selectionListener = onSelectionChanged
+            view.focusListener = onFocusChanged
+            view.submitListener = onImeSend
+            view.chipClickListener = onChipClick
+            view.pasteImagesListener = onPasteImages
+            view.setControlledText(input)
+            view.setChipTokens(tokens)
         },
-        textStyle = MaterialTheme.typography.bodyLarge,
-        colors = TextFieldDefaults.colors(
-            focusedContainerColor = Color.Transparent,
-            unfocusedContainerColor = Color.Transparent,
-            focusedIndicatorColor = Color.Transparent,
-            unfocusedIndicatorColor = Color.Transparent,
-        ),
-        minLines = 3,
-        maxLines = 6,
-        visualTransformation = mentionVisualTransformation(),
-        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-        keyboardActions = KeyboardActions(onSend = { onImeSend() }),
     )
 }
 
@@ -1046,41 +1088,70 @@ private fun AttachmentStrip(
     }
 }
 
-// ---- @mention ------------------------------------------------------------------
+// ---- @file picker --------------------------------------------------------------
 
-/** @token candidates: start-of-text or post-whitespace, non-space tail. */
-private val mentionTokenRegex = Regex("(^|\\s)(@\\S+)")
+/** The partial `@token` before the caret (start-of-text or post-whitespace). */
 private val caretMentionRegex = Regex("(^|\\s)(@\\S*)$")
 
-/** Styles qualifying @path tokens (path-ish tail) link-blue + mono. */
+/** Rows the picker can show at once — type-ahead stays snappy over it. */
+private const val FILE_PICKER_MAX_ROWS = 60
+
+/**
+ * N6.2's @file picker — the old MentionHint upgraded to a real list: the
+ * workspace files from /fs/list filtered by the typed query; a pick rewrites
+ * the partial token as `@file:{path} `.
+ */
 @Composable
-private fun mentionVisualTransformation(): VisualTransformation {
-    val link = DevinGoColors.link
-    return remember(link) {
-        VisualTransformation { text ->
-            val builder = AnnotatedString.Builder(text.text)
-            mentionTokenRegex.findAll(text.text).forEach { m ->
-                val token = m.groups[2] ?: return@forEach
-                val rest = token.value.removePrefix("@")
-                if (rest.any { it == '/' || it == '\\' || it == '.' }) {
-                    builder.addStyle(
-                        SpanStyle(color = link, fontFamily = MonoFamily),
-                        token.range.first,
-                        token.range.last + 1,
+private fun FileMentionList(
+    query: String,
+    files: List<String>?,
+    failed: Boolean,
+    onPick: (String) -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    val matches = remember(files, query) {
+        files.orEmpty()
+            .filter { query.isEmpty() || it.contains(query, ignoreCase = true) }
+            .take(FILE_PICKER_MAX_ROWS)
+    }
+    when {
+        failed -> FileMentionHintRow("无法获取工作区文件列表")
+        files == null -> FileMentionHintRow("正在加载工作区文件…")
+        matches.isEmpty() -> FileMentionHintRow("没有匹配的文件")
+        else -> LazyColumn(Modifier.heightIn(max = 288.dp)) {
+            items(matches) { path ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 44.dp)
+                        .clickable { onPick(path) }
+                        .padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        HugeIcons.File01, null,
+                        modifier = Modifier.size(14.dp),
+                        tint = cs.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        path,
+                        style = monoText(MaterialTheme.typography.labelSmall),
+                        color = cs.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
                     )
                 }
             }
-            TransformedText(builder.toAnnotatedString(), OffsetMapping.Identity)
         }
     }
 }
 
-/** One-line hint describing the @token at the caret. */
+/** The picker's single hint row (loading / failed / empty states). */
 @Composable
-private fun MentionHint(token: String) {
+private fun FileMentionHintRow(text: String) {
     val cs = MaterialTheme.colorScheme
-    val rest = token.removePrefix("@")
-    val qualifies = rest.any { it == '/' || it == '\\' || it == '.' }
     Row(
         Modifier
             .fillMaxWidth()
@@ -1094,32 +1165,14 @@ private fun MentionHint(token: String) {
             tint = cs.onSurfaceVariant,
         )
         Spacer(Modifier.width(8.dp))
-        if (qualifies) {
-            Text(
-                "作为文件引用发送：",
-                style = MaterialTheme.typography.labelSmall,
-                color = cs.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                rest,
-                style = monoText(MaterialTheme.typography.labelSmall),
-                color = DevinGoColors.link,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-        } else {
-            Text(
-                "路径需包含 / 或扩展名，如 @src/main.kt",
-                style = MaterialTheme.typography.labelSmall,
-                color = cs.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-        }
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = cs.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 

@@ -322,4 +322,8 @@ class ChatViewModel(
     /** The workspace's uncommitted `git diff` patch via the bridge. */
     suspend fun fetchGitDiff(): GitDiffResult =
         store?.fetchGitDiff() ?: throw IllegalStateException("no bound session")
+
+    /** The workspace's file paths for the composer's @file picker (N6.2). */
+    suspend fun fetchWorkspaceFiles(): List<String> =
+        store?.fetchWorkspaceFiles() ?: emptyList()
 }

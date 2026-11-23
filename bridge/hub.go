@@ -1798,6 +1798,41 @@ func (h *Hub) writeSessionFile(sid, path, content string) error {
 	return nil
 }
 
+// -------------------------------------------------------------- fs/list ---
+
+// fsListMaxFiles caps the paths /fs/list returns — the composer's @file
+// picker only needs enough entries for type-ahead.
+const fsListMaxFiles = 2000
+
+// sessionFsList returns the session workspace's file paths (cwd-relative):
+// `git ls-files --cached --others --exclude-standard` — tracked files plus
+// non-ignored untracked files, the same tree view the agent works against.
+// `-- .` confines a workspace rooted inside a larger repo to its subtree
+// (N6.2).
+func (h *Hub) sessionFsList(sid string) ([]string, bool, error) {
+	cwd, err := h.sessionCwd(sid)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
+	defer cancel()
+	names, err := gitLines(ctx, "-C", cwd, "ls-files", "-z",
+		"--cached", "--others", "--exclude-standard", "--", ".")
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := false
+	if len(names) > fsListMaxFiles {
+		names = names[:fsListMaxFiles]
+		truncated = true
+	}
+	// A nil slice encodes as `files: null` — the client expects an array.
+	if names == nil {
+		names = []string{}
+	}
+	return names, truncated, nil
+}
+
 // ---------------------------------------------------------------- git -----
 
 const (

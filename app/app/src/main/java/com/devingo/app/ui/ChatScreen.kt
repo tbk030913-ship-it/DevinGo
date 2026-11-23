@@ -354,6 +354,7 @@ fun ChatScreen(
             onSelectMode = vm::setMode,
             onCancelQueuedEdit = vm::cancelQueuedEdit,
             onStop = vm::cancelTurn,
+            onFetchFiles = vm::fetchWorkspaceFiles,
         )
     }
     if (modelSheet) {

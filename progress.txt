@@ -49,3 +49,4 @@
 2026-11-24 06:00 | 第5批验收：go build/vet/test全绿、assembleDebug+assembleProfile绿；U5.1-U5.5共8个提交全部双审闭环；README补/fs/write端点与限制
 2026-11-23 22:12 | N6.1 原生Canvas审查diff+行评论（t3code移植）：ReviewDiffView/画布/布局移植、审查sheet多scope+文件跳转+已读折叠、行评论进草稿引用、bridge /git/diff端点+测试
 2026-11-24 07:05 | N6.1双审修复闭环：纯增/删与无内容diff崩溃、binary/mode-only文件消失、子目录越界/git stderr路径泄漏、untracked+unborn-HEAD覆盖、truncated透传、第二条评论追加草稿
+2026-11-24 07:32 | N6.2 内联@上下文chips+剪贴板图片粘贴（t3code移植）：ComposerEditText原生编辑器/原子删chip/chip点按sheet、@file选择器+bridge /fs/list端点与测试、展开/紧凑共用同一view
