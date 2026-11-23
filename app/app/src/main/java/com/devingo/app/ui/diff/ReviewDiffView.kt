@@ -3,6 +3,11 @@
 // replaced with plain Kotlin types: `setData` takes parsed rows + tokens
 // directly, JSON prop setters became typed setters, and `EventDispatcher`
 // props became Kotlin callbacks.
+//
+// The per-line syntax-token pipeline is ported intact (setData's `tokens`
+// map → span cache → token-aware wrap/draw) but currently fed an empty map:
+// DevinGo has no syntax highlighter yet, so lines render monochrome. Wire a
+// tokenizer into ReviewDiffBuilder.buildNativeReviewData when one lands.
 
 package com.devingo.app.ui.diff
 

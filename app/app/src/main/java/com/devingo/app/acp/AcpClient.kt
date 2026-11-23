@@ -21,6 +21,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.doubleOrNull
@@ -967,6 +968,9 @@ suspend fun postBridgeFile(
     }
 }
 
+/** The bridge's `/git/diff` payload — `truncated` means the 4 MiB cap cut the patch. */
+data class GitDiffResult(val patch: String, val truncated: Boolean)
+
 /**
  * The bridge's `/git/diff`: the session workspace's uncommitted `git diff`
  * patch (token-authed; server caps it ~4 MiB). Throws [AcpException] on any
@@ -976,7 +980,7 @@ suspend fun postBridgeGitDiff(
     baseHttpUrl: String,
     token: String?,
     sessionId: String,
-): String = withContext(Dispatchers.IO) {
+): GitDiffResult = withContext(Dispatchers.IO) {
     val client = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -1001,7 +1005,12 @@ suspend fun postBridgeGitDiff(
             throw AcpException(detail ?: "git/diff HTTP ${resp.code}")
         }
         val body = resp.body?.string().orEmpty()
-        healthJson.parseToJsonElement(body).jsonObject["patch"]?.jsonPrimitive?.content.orEmpty()
+        val obj = healthJson.parseToJsonElement(body).jsonObject
+        GitDiffResult(
+            patch = obj["patch"]?.jsonPrimitive?.content.orEmpty(),
+            truncated = (obj["truncated"] as? JsonPrimitive)
+                ?.booleanOrNull == true,
+        )
     }
 }
 

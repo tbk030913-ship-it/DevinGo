@@ -292,7 +292,7 @@ internal fun buildNativeReviewData(files: List<ReviewDiffFile>): NativeReviewDat
                 rows[addIdx] = addedRow.copy(wordDiffRanges = additionRanges)
             }
         }
-        check(rows.size > fileRowStart) { "file without header row" }
+        // A merged no-op diff (old == new) is header-only — legal to show.
     }
 
     return NativeReviewData(
@@ -605,8 +605,12 @@ private fun hunksFromOps(
         val start = maxOf(rangeStart - CONTEXT_LINES, prevEnd)
         val end = minOf(rangeEnd + CONTEXT_LINES, nextStart, ops.size)
 
-        val oldStart = ops.subList(start, end).firstNotNullOf { it.oldIndex } + 1
-        val newStart = ops.subList(start, end).firstNotNullOf { it.newIndex } + 1
+        // A pure-add hunk has no oldIndex ops (pure-delete: no newIndex) —
+        // the missing side is 0 per git's `@@ -0,0 +1,N @@` convention.
+        val oldStart = (ops.subList(start, end)
+            .firstNotNullOfOrNull { it.oldIndex } ?: -1) + 1
+        val newStart = (ops.subList(start, end)
+            .firstNotNullOfOrNull { it.newIndex } ?: -1) + 1
         var oldCount = 0
         var newCount = 0
         for (k in start until end) {
@@ -669,6 +673,11 @@ private fun hunksFromOps(
 
 private val HUNK_HEADER = Regex("@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@( (.*))?$")
 
+// `diff --git a/x b/y` (each side possibly C-quoted) — binary files carry
+// their paths here only.
+private val GIT_HEADER =
+    Regex("""diff --git ("(?:[^"\\]|\\.)*"|a/\S+) ("(?:[^"\\]|\\.)*"|b/\S+)""")
+
 /** Parse `git diff` output into renderable files. */
 internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
     val files = ArrayList<ReviewDiffFile>()
@@ -682,6 +691,9 @@ internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
             continue
         }
         fileIndex++
+        // Binary entries carry no ---/+++ lines — the diff --git header is
+        // their only path record, so capture it up front.
+        val hdr = GIT_HEADER.find(line)
         i++
         var newPath = ""
         var prevPath: String? = null
@@ -831,7 +843,13 @@ internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
             }
             i++
         }
-        if (!seenPlusPlusPlus && prevPath == null && minusPath == null) continue
+        if (!seenPlusPlusPlus && prevPath == null && minusPath == null) {
+            // Only a binary/unsupported entry reaches here with a notice —
+            // surface it under the header's paths instead of dropping it.
+            if (notice == null || hdr == null) continue
+            minusPath = stripPatchPrefix(hdr.groupValues[1])
+            newPath = stripPatchPrefix(hdr.groupValues[2])
+        }
         if (prevPath != null && changeType == "rename-pure" && rows.isNotEmpty()) {
             changeType = "rename-changed"
         }
@@ -839,7 +857,9 @@ internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
         val path = newPath.ifEmpty { prevPath ?: minusPath.orEmpty() }
         if (path.isEmpty()) continue
         files += ReviewDiffFile(
-            id = "f${fileIndex}",
+            // Path-keyed ids: viewed/collapse state survives rebuilds and
+            // scope switches instead of aliasing a positional index.
+            id = "f:$path",
             path = path,
             previousPath = prevPath,
             changeType = changeType,
@@ -856,9 +876,58 @@ internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
 
 private fun stripPatchPrefix(path: String): String {
     var p = path
-    if (p.startsWith("b/")) p = p.substring(2)
-    if (p.startsWith("\"") && p.endsWith("\"")) p = p.substring(1, p.length - 1)
+    // Unquote first — a quoted path starts with `"` so a `b/` check on the
+    // raw string never fires for `"b/x y"`. Git C-quotes odd filenames.
+    if (p.startsWith("\"") && p.endsWith("\"") && p.length >= 2) {
+        p = unquotePatchPath(p)
+    }
+    if (p.startsWith("a/") || p.startsWith("b/")) p = p.substring(2)
     return p
+}
+
+/**
+ * Git C-quoted path → raw string: `\\`/`\"`/`\\n`/`\\t` and `\\NNN` octal
+ * bytes (the UTF-8 of non-ASCII names) decoded through a byte stream.
+ */
+private fun unquotePatchPath(p: String): String {
+    val s = p.substring(1, p.length - 1)
+    if ('\\' !in s) return s
+    val out = java.io.ByteArrayOutputStream(s.length)
+    var i = 0
+    while (i < s.length) {
+        var c = s[i]
+        if (c == '\\' && i + 1 < s.length) {
+            c = s[++i]
+            when (c) {
+                'n' -> c = '\n'
+                't' -> c = '\t'
+                'r' -> c = '\r'
+                'a' -> c = ''
+                'b' -> c = ''
+                'f' -> c = ''
+                'v' -> c = ''
+                in '0'..'7' -> {
+                    var v = c - '0'
+                    var n = 1
+                    while (n < 3 && i + 1 < s.length && s[i + 1] in '0'..'7') {
+                        v = v * 8 + (s[++i] - '0')
+                        n++
+                    }
+                    out.write(v)
+                    i++
+                    continue
+                }
+                // '\\', '"' and anything unrecognized → the char itself.
+            }
+        }
+        if (c.code < 0x80) {
+            out.write(c.code)
+        } else {
+            out.write(c.toString().toByteArray(Charsets.UTF_8))
+        }
+        i++
+    }
+    return String(out.toByteArray(), Charsets.UTF_8)
 }
 
 /** Tool diffs merged by path → renderable files (order preserved). */
@@ -868,8 +937,8 @@ internal fun buildReviewFilesFromToolDiffs(diffs: List<ToolDiff>): List<ReviewDi
         val prev = merged[d.path]
         merged[d.path] = (prev?.first ?: d.oldText) to d.newText
     }
-    return merged.entries.mapIndexed { index, (path, texts) ->
-        buildReviewFileFromTexts("f${index + 1}", path, texts.first, texts.second)
+    return merged.entries.map { (path, texts) ->
+        buildReviewFileFromTexts("f:$path", path, texts.first, texts.second)
     }
 }
 

@@ -1,5 +1,6 @@
 // /git/diff tests: the endpoint returns a session workspace's uncommitted
-// `git diff HEAD` — token-gated, workspace resolved through the hub's
+// changes — `git diff HEAD -- .` plus synthesized all-add sections for
+// untracked files — token-gated, workspace resolved through the hub's
 // recorded cwd, same auth/origin gates as /fs/write (N6.1).
 package main
 
@@ -124,4 +125,103 @@ func TestGitDiffEndpoint(t *testing.T) {
 
 	// authorized() short-circuits for loopback peers, so the token gate
 	// can't be exercised through httptest — covered by /fs/write's tests.
+}
+
+// Untracked files never appear in `git diff` — the endpoint synthesizes
+// all-add sections for them — and a session rooted in a subdirectory is
+// confined to that subtree (paths print cwd-relative).
+func TestGitDiffUntrackedAndSubdir(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init")
+	gitRun(t, repo, "config", "user.email", "t@t")
+	gitRun(t, repo, "config", "user.name", "t")
+	// A root-level edit OUTSIDE the session's subtree must not leak in.
+	if err := os.WriteFile(filepath.Join(repo, "root.txt"),
+		[]byte("r1\n"), 0o644); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	gitRun(t, repo, "add", "root.txt")
+	gitRun(t, repo, "commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(repo, "root.txt"),
+		[]byte("r1\nr2\n"), 0o644); err != nil {
+		t.Fatalf("edit root: %v", err)
+	}
+	// Session workspace = repo/sub: one tracked edit + one brand-new file.
+	sub := filepath.Join(repo, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "in.txt"),
+		[]byte("a\n"), 0o644); err != nil {
+		t.Fatalf("seed sub: %v", err)
+	}
+	gitRun(t, repo, "add", "sub/in.txt")
+	gitRun(t, repo, "commit", "-m", "add sub")
+	if err := os.WriteFile(filepath.Join(sub, "in.txt"),
+		[]byte("a\nb\n"), 0o644); err != nil {
+		t.Fatalf("edit sub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "new.txt"),
+		[]byte("fresh\nfile\n"), 0o644); err != nil {
+		t.Fatalf("untracked: %v", err)
+	}
+
+	oldToken, oldHub := *token, bridgeHub
+	defer func() { *token, bridgeHub = oldToken, oldHub }()
+	*token = ""
+	bridgeHub = newHub()
+	plantSessionCwd(t, bridgeHub, "SID", sub)
+
+	srv := httptest.NewServer(http.HandlerFunc(gitDiffHandler))
+	defer srv.Close()
+
+	st, m := gitDiffPost(t, srv, "", `{"sessionId":"SID"}`)
+	if st != http.StatusOK {
+		t.Fatalf("status = %d, body %v", st, m)
+	}
+	patch, _ := m["patch"].(string)
+	// Inside: the tracked edit with a cwd-relative (not repo-root) path.
+	if !strings.Contains(patch, "+++ b/in.txt") || !strings.Contains(patch, "+b") {
+		t.Fatalf("missing tracked subdir edit:\n%s", patch)
+	}
+	// Inside: the untracked file as a synthesized all-add section.
+	if !strings.Contains(patch, "diff --git a/new.txt b/new.txt") ||
+		!strings.Contains(patch, "+fresh") {
+		t.Fatalf("missing untracked file section:\n%s", patch)
+	}
+	// Outside: the repo-root edit stays out entirely.
+	if strings.Contains(patch, "root.txt") {
+		t.Fatalf("patch escaped the session subtree:\n%s", patch)
+	}
+}
+
+// An unborn HEAD still reports the staged tree via `git diff --cached`.
+func TestGitDiffUnbornHead(t *testing.T) {
+	repo := t.TempDir()
+	gitRun(t, repo, "init")
+	gitRun(t, repo, "config", "user.email", "t@t")
+	gitRun(t, repo, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(repo, "x.txt"),
+		[]byte("x1\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	gitRun(t, repo, "add", "x.txt") // staged, never committed
+
+	oldToken, oldHub := *token, bridgeHub
+	defer func() { *token, bridgeHub = oldToken, oldHub }()
+	*token = ""
+	bridgeHub = newHub()
+	plantSessionCwd(t, bridgeHub, "SID", repo)
+
+	srv := httptest.NewServer(http.HandlerFunc(gitDiffHandler))
+	defer srv.Close()
+
+	st, m := gitDiffPost(t, srv, "", `{"sessionId":"SID"}`)
+	if st != http.StatusOK {
+		t.Fatalf("status = %d, body %v", st, m)
+	}
+	patch, _ := m["patch"].(string)
+	if !strings.Contains(patch, "+++ b/x.txt") || !strings.Contains(patch, "+x1") {
+		t.Fatalf("staged file on unborn HEAD missing:\n%s", patch)
+	}
 }

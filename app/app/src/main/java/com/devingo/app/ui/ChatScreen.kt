@@ -1,5 +1,6 @@
 package com.devingo.app.ui
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
@@ -35,6 +36,7 @@ import androidx.compose.material3.IconButton
 import android.content.ClipData
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -388,21 +390,24 @@ fun ChatScreen(
             onRemove = vm::cancelQueued,
         )
     }
+    val context = LocalContext.current
     reviewRequest?.let { req ->
         ReviewSheet(
             diffs = model.diffs,
             request = req,
             fetchGitDiff = vm::fetchGitDiff,
             onSubmitComment = { sel, comment ->
-                // Row comments ride the existing draft-citation slot —
-                // mergedWithCitation emits the markdown quote at send.
-                vm.setDraftCitation(
+                // The first comment pins the citation slot; later ones fold
+                // into the draft text — mergedWithCitation emits the
+                // markdown quote at send either way.
+                vm.addReviewCitation(
                     CitationAttachment(
                         messageId = -1L,
                         quotedText = formatReviewCitation(sel),
                         comment = comment,
                     ),
                 )
+                Toast.makeText(context, "已加入草稿", Toast.LENGTH_SHORT).show()
             },
             onDismiss = { reviewRequest = null },
         )

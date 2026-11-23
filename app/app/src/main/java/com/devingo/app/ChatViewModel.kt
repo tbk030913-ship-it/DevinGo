@@ -2,6 +2,7 @@ package com.devingo.app
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import com.devingo.app.acp.GitDiffResult
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -308,12 +309,17 @@ class ChatViewModel(
         store?.setDraftCitation(citation)
     }
 
+    /** Add a review comment — pins the citation slot, then appends to text. */
+    fun addReviewCitation(citation: CitationAttachment) {
+        store?.addReviewCitation(citation)
+    }
+
     /** Write the plan card's markdown as plan.md in the session workspace. */
     fun savePlanToWorkspace(markdown: String) {
         store?.savePlanToWorkspace(markdown)
     }
 
     /** The workspace's uncommitted `git diff` patch via the bridge. */
-    suspend fun fetchGitDiff(): String =
+    suspend fun fetchGitDiff(): GitDiffResult =
         store?.fetchGitDiff() ?: throw IllegalStateException("no bound session")
 }

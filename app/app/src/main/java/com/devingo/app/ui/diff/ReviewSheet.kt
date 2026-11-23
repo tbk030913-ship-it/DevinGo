@@ -43,6 +43,7 @@ import com.devingo.app.ToolDiff
 import com.devingo.app.ui.DevinMenu
 import com.devingo.app.ui.DevinMenuCheckItem
 import com.devingo.app.ui.DevinMenuItem
+import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.ui.DevinSheet
 import com.devingo.app.ui.isReducedMotion
 import com.devingo.app.ui.monoText
@@ -71,7 +72,7 @@ private sealed interface ReviewScope {
 
 private sealed interface ReviewContent {
     data object Loading : ReviewContent
-    data class Ready(val data: NativeReviewData) : ReviewContent
+    data class Ready(val data: NativeReviewData, val truncated: Boolean = false) : ReviewContent
     data class Failed(val error: String) : ReviewContent
 }
 
@@ -109,7 +110,7 @@ private fun toggle(set: Set<String>, id: String): Set<String> =
 fun ReviewSheet(
     diffs: SessionDiffs,
     request: ReviewRequest,
-    fetchGitDiff: suspend () -> String,
+    fetchGitDiff: suspend () -> GitDiffResult,
     onSubmitComment: (ReviewSelection, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -138,6 +139,8 @@ fun ReviewSheet(
     var pendingAnchor by remember { mutableStateOf<Pair<String, Int>?>(null) }
     var commentSelection by remember { mutableStateOf<ReviewSelection?>(null) }
     var scopeMenuOpen by remember { mutableStateOf(false) }
+    // Git scope only: the bridge capped the patch at 4 MiB.
+    var gitTruncated by remember { mutableStateOf(false) }
     var fileMenuOpen by remember { mutableStateOf(false) }
     // A file the canvas should bring into view once rows land (menu jump /
     // DiffCard entry). Consumed in the AndroidView update block.
@@ -153,6 +156,7 @@ fun ReviewSheet(
         if (reviewScope == next) return
         reviewScope = next
         collapsedFileIds = emptySet()
+        viewedFileIds = emptySet()
         selectedRowIds = emptySet()
         pendingAnchor = null
     }
@@ -171,11 +175,15 @@ fun ReviewSheet(
                         diffs.byTurn[s.turnKey].orEmpty()
                             .map { ToolDiff(it.path, it.oldText, it.newText) },
                     )
-                    ReviewScope.Git -> parseGitPatch(fetchGitDiff())
+                    ReviewScope.Git -> {
+                        val res = fetchGitDiff()
+                        gitTruncated = res.truncated
+                        parseGitPatch(res.patch)
+                    }
                 }
                 val filtered =
                     if (hideTests) files.filter { !isTestChangedFile(it.path) } else files
-                ReviewContent.Ready(buildNativeReviewData(filtered))
+                ReviewContent.Ready(buildNativeReviewData(filtered), gitTruncated)
             } catch (e: Exception) {
                 ReviewContent.Failed(e.message ?: "无法读取变更")
             }
@@ -362,6 +370,22 @@ fun ReviewSheet(
                     TextButton(onClick = { clearSelection() }) {
                         Text("取消", style = MaterialTheme.typography.labelMedium)
                     }
+                }
+            }
+            // ---- truncation notice --------------------------------------------
+            if ((content as? ReviewContent.Ready)?.truncated == true) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(cs.surfaceContainerHigh)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "变更过大，diff 已截断显示",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = cs.onSurfaceVariant,
+                    )
                 }
             }
             // ---- canvas --------------------------------------------------------

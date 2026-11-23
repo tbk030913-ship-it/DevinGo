@@ -1806,13 +1806,21 @@ const (
 	gitDiffTimeout = 15 * time.Second
 	// gitDiffMaxOutput caps the patch returned to the app (~4 MiB).
 	gitDiffMaxOutput = 4 << 20
+	// Synthesized untracked-file sections stay bounded so a stray
+	// unignored pile can't eat the whole patch budget.
+	gitUntrackedMaxFiles = 100
+	gitUntrackedMaxFile  = 256 << 10
 )
 
-// sessionGitDiff returns the session workspace's uncommitted diff —
-// `git diff HEAD` (staged + unstaged), falling back to `git diff` when the
-// repo has no commits yet. Output past gitDiffMaxOutput is cut and flagged
-// truncated; the git process is killed rather than left blocked on a full
-// pipe.
+// sessionGitDiff returns the session workspace's uncommitted changes.
+// Tracked edits come from `git diff HEAD -- .` (`--cached` on an unborn
+// HEAD, where the index is the only base); `--relative` + the `.` pathspec
+// keep a workspace rooted inside a larger repo confined to its own subtree
+// and print paths cwd-relative. `git diff` never reports untracked files —
+// exactly the files an agent just wrote — so `git ls-files --others` names
+// them and their contents are appended as synthesized all-add sections.
+// Output past gitDiffMaxOutput is cut and flagged truncated; raw git
+// stderr (absolute paths) stays server-side in the log.
 func (h *Hub) sessionGitDiff(sid string) (string, bool, error) {
 	cwd, err := h.sessionCwd(sid)
 	if err != nil {
@@ -1821,37 +1829,172 @@ func (h *Hub) sessionGitDiff(sid string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
 	defer cancel()
 
-	args := []string{"-C", cwd, "diff", "--no-color"}
+	args := []string{"-C", cwd, "diff", "--no-color", "--relative"}
 	if err := exec.CommandContext(ctx, "git", "-C", cwd,
 		"rev-parse", "--verify", "-q", "HEAD").Run(); err == nil {
 		args = append(args, "HEAD")
+	} else {
+		// Unborn HEAD: no commit to diff against — the staged tree is it.
+		args = append(args, "--cached")
 	}
+	args = append(args, "--", ".")
+
+	var buf bytes.Buffer
+	patch, truncated, err := gitStdout(ctx, gitDiffMaxOutput, args...)
+	if err != nil {
+		return "", false, err
+	}
+	buf.Write(patch)
+
+	// `-z` keeps odd filenames unescaped; ls-files paths are cwd-relative.
+	names, err := gitLines(ctx, "-C", cwd, "ls-files", "-z",
+		"--others", "--exclude-standard", "--", ".")
+	if err == nil {
+		for i, rel := range names {
+			if buf.Len() >= gitDiffMaxOutput || i >= gitUntrackedMaxFiles {
+				truncated = true
+				break
+			}
+			buf.WriteString(untrackedSection(cwd, rel))
+		}
+	}
+	return buf.String(), truncated, nil
+}
+
+// gitStdout runs git with a hard cap on captured stdout. On cap overflow
+// the process is killed rather than left parked on a full pipe. Raw stderr
+// is logged but never returned — it can carry absolute server paths.
+func gitStdout(ctx context.Context, cap int64, args ...string) ([]byte, bool, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return "", false, err
+		return nil, false, err
 	}
-	lr := &io.LimitedReader{R: stdout, N: gitDiffMaxOutput + 1}
+	lr := &io.LimitedReader{R: stdout, N: cap + 1}
 	out, _ := io.ReadAll(lr)
 	if lr.N <= 0 {
-		// Cap hit — git is parked on a full pipe; kill it and report the
-		// patch as truncated instead of draining unbounded output.
-		cancel()
+		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return string(out[:gitDiffMaxOutput]), true, nil
+		return out[:cap], true, nil
 	}
 	if err := cmd.Wait(); err != nil {
 		if se := strings.TrimSpace(stderr.String()); se != "" {
-			return "", false, errors.New(se)
+			log.Printf("git %v failed: %s", args[:2], se)
+			return nil, false, errors.New("git command failed")
 		}
-		return "", false, err
+		return nil, false, err
 	}
-	return string(out), false, nil
+	return out, false, nil
+}
+
+// gitLines returns git's NUL-terminated (-z) stdout split into entries.
+func gitLines(ctx context.Context, args ...string) ([]string, error) {
+	out, _, err := gitStdout(ctx, 1<<20, args...)
+	if err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, l := range strings.Split(string(out), "\x00") {
+		if l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines, nil
+}
+
+// untrackedSection renders one untracked file as a unified all-add section
+// so it parses like a real diff entry. Binary or oversized files degrade
+// to git's "Binary files … differ" marker; a symlink gets its 120000
+// one-liner rather than being followed outside the workspace.
+func untrackedSection(cwd, rel string) string {
+	var b strings.Builder
+	qa, qb := gitQuotePath("a/"+rel), gitQuotePath("b/"+rel)
+	fmt.Fprintf(&b, "diff --git %s %s\n", qa, qb)
+	p := filepath.Join(cwd, rel)
+	if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if tgt, err := os.Readlink(p); err == nil {
+			fmt.Fprintf(&b, "new file mode 120000\n--- /dev/null\n+++ %s\n"+
+				"@@ -0,0 +1,1 @@\n+%s\n", qb, tgt)
+			return b.String()
+		}
+	}
+	b.WriteString("new file mode 100644\n")
+	data, err := os.ReadFile(p)
+	if err != nil || len(data) > gitUntrackedMaxFile || isBinaryContent(data) {
+		fmt.Fprintf(&b, "Binary files /dev/null and %s differ\n", qb)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "--- /dev/null\n+++ %s\n", qb)
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return b.String() // empty file: headers only, same as real git
+	}
+	fmt.Fprintf(&b, "@@ -0,0 +1,%d @@\n", len(lines))
+	for _, l := range lines {
+		b.WriteByte('+')
+		b.WriteString(l)
+		b.WriteByte('\n')
+	}
+	if !strings.HasSuffix(text, "\n") {
+		b.WriteString("\\ No newline at end of file\n")
+	}
+	return b.String()
+}
+
+// gitQuotePath quotes a header path the way git does — bare when safe,
+// C-quoted "…" with escapes and \NNN octal bytes otherwise.
+func gitQuotePath(p string) string {
+	safe := !strings.ContainsAny(p, " \"\\")
+	for i := 0; safe && i < len(p); i++ {
+		if p[i] < 0x20 || p[i] > 0x7e {
+			safe = false
+		}
+	}
+	if safe {
+		return p
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if c < 0x20 || c > 0x7e {
+				fmt.Fprintf(&b, `\%03o`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// isBinaryContent is git's own heuristic: a NUL byte in the first 8 KiB.
+func isBinaryContent(b []byte) bool {
+	n := len(b)
+	if n > 8192 {
+		n = 8192
+	}
+	return bytes.IndexByte(b[:n], 0) >= 0
 }
 
 // ---------------------------------------------------------------- rpc ----

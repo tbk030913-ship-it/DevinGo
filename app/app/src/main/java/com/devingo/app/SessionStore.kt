@@ -8,6 +8,7 @@ import com.devingo.app.acp.AcpMethods
 import com.devingo.app.acp.AttachResult
 import com.devingo.app.acp.ConfigOption
 import com.devingo.app.acp.ContentBlock
+import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.InboundEvent
 import com.devingo.app.acp.IncomingRequest
 import com.devingo.app.acp.JSONRPC_METHOD_NOT_FOUND
@@ -77,7 +78,7 @@ class SessionStore(
      * Bridge `/git/diff` bound to this session — returns the workspace's
      * uncommitted patch. Null when the bridge URL isn't known (N6.1).
      */
-    private val gitDiffFetcher: (suspend () -> String)? = null,
+    private val gitDiffFetcher: (suspend () -> GitDiffResult)? = null,
 ) {
 
     private companion object {
@@ -858,8 +859,24 @@ class SessionStore(
         _draftCitation.value = citation
     }
 
-    /** The workspace's uncommitted `git diff` patch (Git 未提交变更 scope). */
-    suspend fun fetchGitDiff(): String {
+    /**
+     * Add a review comment to the composer. The first pins the citation
+     * slot; later ones fold their quote block into the draft text rather
+     * than silently overwriting the pinned citation.
+     */
+    fun addReviewCitation(citation: CitationAttachment) {
+        if (_draftCitation.value == null) {
+            _draftCitation.value = citation
+            return
+        }
+        val block = mergedWithCitation("", citation).trimEnd()
+        val cur = _draft.value
+        _draft.value = (if (cur.isBlank() || cur.endsWith("\n")) cur else "$cur\n\n")
+            .plus(block).take(MAX_DRAFT_CHARS)
+    }
+
+    /** The workspace's uncommitted `git diff` result (Git 未提交变更 scope). */
+    suspend fun fetchGitDiff(): GitDiffResult {
         val fetcher = gitDiffFetcher
             ?: throw IllegalStateException("git diff unavailable without a bridge")
         return fetcher()
