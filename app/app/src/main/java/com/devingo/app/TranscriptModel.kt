@@ -125,8 +125,12 @@ sealed interface RowKind {
     data class Body(val itemId: Long, val turnKey: Long) : RowKind
     data class User(val itemId: Long) : RowKind
 
-    /** A not-yet-sent queued prompt's dashed preview bubble (U5.4). */
-    data class Queue(val index: Int) : RowKind
+    /**
+     * A not-yet-sent queued prompt's dashed preview bubble (U5.4).
+     * [index] resolves the prompt in the live `queued` list; [queuedId]
+     * is the stable LazyColumn key.
+     */
+    data class Queue(val index: Int, val queuedId: Long) : RowKind
 }
 
 /**
@@ -170,7 +174,7 @@ internal fun buildTranscriptModel(
         if (messages.isNotEmpty() || queued.isNotEmpty()) add(RowKind.Status)
         // U5.4: parked prompts preview directly above the status line —
         // exactly where the bubbles land as they drain, earliest first.
-        queued.forEachIndexed { i, _ -> add(RowKind.Queue(i)) }
+        queued.forEachIndexed { i, p -> add(RowKind.Queue(i, p.id)) }
         turns.asReversed().forEachIndexed { revIdx, turn ->
             val isLast = revIdx == 0
             if (turn.work.isNotEmpty() || (isLast && running)) {

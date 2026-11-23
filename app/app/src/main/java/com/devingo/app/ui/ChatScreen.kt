@@ -3,6 +3,7 @@ package com.devingo.app.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -171,15 +172,18 @@ fun ChatScreen(
         // swaps the page back to a status screen (U6).
         ConnBanner(ui)
         Box(Modifier.weight(1f).fillMaxWidth()) {
+            // A7.3 stub — when the real subagent count lands it feeds both
+            // the capsule and this inset mirror through the same value.
+            val subagentCount = 0
             // Mirrors FloatingWorkingControl's `hasCapsule || showScrollToEnd`
             // — the running/scroll segments only appear while !atBottom, so a
             // single `!atBottom` term covers them both.
             val capsuleShown =
                 ui.reconnecting || ui.phase == Phase.Error ||
-                    queuedPrompts.isNotEmpty() || !atBottom
+                    queuedPrompts.isNotEmpty() || subagentCount > 0 || !atBottom
             val capsuleInset by animateDpAsState(
                 targetValue = if (capsuleShown) 48.dp else 0.dp,
-                animationSpec = tween(240),
+                animationSpec = if (isReducedMotion()) snap() else tween(240),
                 label = "capsuleInset",
             )
             if (model.itemById.isEmpty() && queuedPrompts.isEmpty()) {
@@ -232,7 +236,7 @@ fun ChatScreen(
                 queuedCount = queuedPrompts.size,
                 // A7.3 lands the real subagent flow; the segment exists and
                 // wakes up the moment a count arrives.
-                subagentCount = 0,
+                subagentCount = subagentCount,
                 showScrollToEnd = !atBottom && model.itemById.isNotEmpty(),
                 onReconnect = vm::reconnectNow,
                 onStop = vm::cancelTurn,

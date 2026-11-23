@@ -303,13 +303,13 @@ private fun ConnectionLabel(
             delay(500)
         }
     }
-    // "点击重试" only when a retry can actually fire — a parked backoff or
-    // a dead socket; a live-socket error (attach/open failure) ignores the
-    // tap, so it doesn't get the affordance.
+    // "点击重试" only when a retry can actually fire — a parked backoff
+    // (kick shortens the wait) or a dead socket. A live-socket error and
+    // an in-flight dial both ignore the tap, so neither advertises it.
     val text = when {
         retryAtMs != null ->
             "重连中 (${remaining.coerceAtLeast(0)}s) · 点击立即重试"
-        reconnecting -> "重连中 · 点击立即重试"
+        reconnecting -> "重连中…"
         retryEnabled -> statusText.ifBlank { "连接失败" } + " · 点击重试"
         else -> statusText.ifBlank { "连接失败" }
     }
@@ -317,7 +317,13 @@ private fun ConnectionLabel(
         Modifier
             .height(CONTROL_HEIGHT)
             .clip(CircleShape)
-            .let { if (retryEnabled || reconnecting || retryAtMs != null) it.clickable(onClick = onClick) else it }
+            .let {
+                if (retryAtMs != null || (retryEnabled && !reconnecting)) {
+                    it.clickable(onClick = onClick)
+                } else {
+                    it
+                }
+            }
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),

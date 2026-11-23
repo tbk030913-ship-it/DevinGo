@@ -204,7 +204,7 @@ internal fun Transcript(
                     is RowKind.Work -> "w${row.turnKey}"
                     is RowKind.Body -> "b${row.itemId}"
                     is RowKind.User -> "u${row.itemId}"
-                    is RowKind.Queue -> "qp${row.index}"
+                    is RowKind.Queue -> "qp${row.queuedId}"
                 }
             },
             contentType = { row ->

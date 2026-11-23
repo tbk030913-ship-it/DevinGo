@@ -84,8 +84,10 @@ internal fun ThreadQueueSheet(
     // Serializes row actions — t3's busyRunId: a fired row action removes
     // the row, so a fast second tap must not land on the next item.
     var busy by remember { mutableStateOf(false) }
-    fun act(action: () -> Unit) {
-        if (busy) return
+    // Returns false when the busy window dropped the action — callers that
+    // already committed a visual change (swipe dismiss) must roll it back.
+    fun act(action: () -> Unit): Boolean {
+        if (busy) return false
         busy = true
         haptic.performHapticFeedback(HapticFeedbackType.Confirm)
         action()
@@ -93,6 +95,7 @@ internal fun ThreadQueueSheet(
             delay(350)
             busy = false
         }
+        return true
     }
     // t3 auto-pop: the sheet only makes sense while the queue has items.
     val hadQueued = remember { queued.isNotEmpty() }
@@ -150,15 +153,13 @@ private fun QueueRow(
     enabled: Boolean,
     onSteer: () -> Unit,
     onEdit: () -> Unit,
-    onRemove: () -> Unit,
+    onRemove: () -> Boolean,
 ) {
     val cs = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
-    // t3's right-side swipe action — full swipe commits the removal. A
-    // commit landing inside the busy window gets dropped by act{} — snap
-    // the row back instead of leaving it visually dismissed.
+    // t3's right-side swipe action — full swipe commits the removal.
     val dismissState = rememberSwipeToDismissBoxState(
-        confirmValueChange = { enabled && it == SwipeToDismissBoxValue.EndToStart },
+        confirmValueChange = { it == SwipeToDismissBoxValue.EndToStart },
     )
     SwipeToDismissBox(
         state = dismissState,
@@ -190,7 +191,9 @@ private fun QueueRow(
         enableDismissFromStartToEnd = false,
         gesturesEnabled = enabled,
         onDismiss = {
-            if (enabled) onRemove() else scope.launch { dismissState.reset() }
+            // act{} reads the live busy flag — a commit landing inside the
+            // window gets dropped, so roll the visual dismiss back.
+            if (!onRemove()) scope.launch { dismissState.reset() }
         },
     ) {
         Row(
@@ -262,7 +265,7 @@ private fun QueueRow(
                 modifier = Modifier
                     .size(36.dp)
                     .clip(CircleShape)
-                    .clickable(enabled = enabled, onClick = onRemove)
+                    .clickable(enabled = enabled) { onRemove() }
                     .padding(9.dp),
                 tint = cs.onSurfaceVariant,
             )

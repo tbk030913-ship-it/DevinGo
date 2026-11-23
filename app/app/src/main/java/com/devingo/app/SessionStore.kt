@@ -896,6 +896,9 @@ class SessionStore(
      * send — the interrupted turn ends, the prompt starts fresh.
      */
     fun steerQueued(id: Long) {
+        // A tap landing after the turn ended must not call cancel/steer on
+        // it — leave the item queued; it drains normally.
+        if (!_ui.value.running) return
         val q = _queuedPrompts.value.firstOrNull { it.id == id } ?: return
         if (q.text.isBlank() && q.attachments.isEmpty()) return
         _queuedPrompts.update { q2 -> q2.filterNot { it.id == id } }
@@ -939,6 +942,12 @@ class SessionStore(
      */
     fun beginQueuedEdit(id: Long) {
         val q = _queuedPrompts.value.firstOrNull { it.id == id } ?: return
+        // Re-tapping the item already being edited must keep the typed
+        // text — re-seeding would silently discard it.
+        if (_editingQueuedId.value == id) return
+        // Switching items commits the in-flight edit to its own item first;
+        // the restored draft then becomes this edit's stash.
+        if (_editingQueuedId.value != null) saveQueuedEdit()
         if (_editingQueuedId.value == null) {
             queuedEditStash = _draft.value to _draftAttachments.value
         }
