@@ -12,4 +12,11 @@ object AppVisibility {
     /** True while the chat screen is composed; alert suppression reads it. */
     @Volatile
     var chatVisible: Boolean = false
+
+    /**
+     * The session currently on screen — a permission alert for a DIFFERENT
+     * session must still notify (the user isn't looking at it).
+     */
+    @Volatile
+    var chatSessionId: String? = null
 }

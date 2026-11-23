@@ -55,11 +55,12 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.devingo.app.ChatViewModel
-import com.devingo.app.ChatViewModel.ChatItem
-import com.devingo.app.ChatViewModel.Kind
-import com.devingo.app.ChatViewModel.PendingPermission
-import com.devingo.app.ChatViewModel.UiState
+import com.devingo.app.ChatItem
+import com.devingo.app.Kind
+import com.devingo.app.PendingPermission
+import com.devingo.app.Phase
+import com.devingo.app.TurnTiming
+import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import me.rerere.hugeicons.HugeIcons
@@ -120,15 +121,6 @@ internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
     }
     flush()
     return turns
-}
-
-/** Per-turn timing captured in ChatScreen (UI-local, no VM change). */
-@Immutable
-internal data class TurnTiming(val start: Long?, val end: Long?) {
-    val durationSec: Long?
-        get() = if (start != null && end != null && end > start) {
-            (end - start) / 1000
-        } else null
 }
 
 private fun failedCount(items: List<ChatItem>): Int =
@@ -280,9 +272,15 @@ private fun StatusLine(ui: UiState, pendingPermission: PendingPermission?) {
             DevinGoColors.statusOrange,
             false,
         )
+        // The wire close reason rides statusText ("连接已断开 (1011): …").
         ui.reconnecting -> Triple(
-            "正在重连…",
+            ui.statusText.ifBlank { "正在重连…" },
             cs.outline,
+            false,
+        )
+        ui.phase == Phase.Error && !ui.connected -> Triple(
+            ui.statusText.ifBlank { ui.error ?: "连接已断开" },
+            cs.error,
             false,
         )
         ui.running -> Triple(

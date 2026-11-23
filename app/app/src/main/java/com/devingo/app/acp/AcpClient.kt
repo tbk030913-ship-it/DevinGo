@@ -78,7 +78,43 @@ interface AcpEvent {
     data class Failure(val message: String) : AcpEvent
     /** Socket dropped; [reason] is the close/failure detail shown to the user. */
     data class Disconnected(val reason: String) : AcpEvent
+    /**
+     * Gateway marker `_devingo/session_resync`: another client's `session/load`
+     * withheld live events from this subscriber — re-attach with lastSeq.
+     */
+    data object SessionResync : AcpEvent
+    /** Gateway marker `_devingo/session_deleted` — the session is gone. */
+    data object SessionDeleted : AcpEvent
+    /**
+     * Gateway marker `_devingo/agent_dead`: the resident devin process died;
+     * the session's running state and pending requests were reset.
+     */
+    data class AgentDead(val reason: String) : AcpEvent
+    /**
+     * Gateway `_devingo/permission_resolved`: another client (or the TTL)
+     * answered agent request [requestId] — drop the matching local card.
+     */
+    data class PermissionResolved(val requestId: Long, val outcome: String) : AcpEvent
+    /**
+     * `_devingo/event` carrying a journaled response owned by another client.
+     * Only turn-ending frames are surfaced: a `session/prompt` result means a
+     * remote client's turn finished.
+     */
+    data class RemoteTurnEnd(val stopReason: String?) : AcpEvent
 }
+
+/**
+ * One inbound frame distilled into an event plus its routing metadata:
+ * [sessionId] is `params.sessionId` when the frame is session-scoped
+ * (null for connection-level events), [seq] is the `_seq` the gateway
+ * splices into journaled frames (0 on unjournaled frames such as pending
+ * request re-deliveries and gateway request results).
+ */
+data class InboundEvent(
+    val sessionId: String?,
+    val seq: Long,
+    val event: AcpEvent,
+)
 
 data class PlanEntry(
     val content: String,
@@ -91,8 +127,15 @@ class IncomingRequest(
     val rpcId: JsonElement,
     val method: String,
     val params: JsonObject?,
+    /** `params.sessionId` — the session this request belongs to, when scoped. */
+    val sessionId: String? = null,
+    /** The journaled `_seq`; 0 on post-attach re-deliveries (id-keyed). */
+    val seq: Long = 0,
 ) {
     internal var responder: ((JsonElement?, JsonObject?) -> Unit)? = null
+
+    /** The request id as an integer — matches `_devingo/permission_resolved`'s requestId. */
+    val requestKey: Long? get() = (rpcId as? JsonPrimitive)?.textOrNull?.toLongOrNull()
 
     fun respond(result: JsonElement) = responder?.invoke(result, null)
     fun respondError(code: Int, message: String) = responder?.invoke(
@@ -124,21 +167,36 @@ class AcpClient(
 
     @Volatile private var ws: WebSocket? = null
     private val nextId = AtomicInteger(1)
-    private val pending = ConcurrentHashMap<Int, CompletableDeferred<JsonObject>>()
+    private val pending = ConcurrentHashMap<Int, PendingCall>()
+
+    /** A client->agent request awaiting its response, plus its session key. */
+    private class PendingCall(
+        val deferred: CompletableDeferred<JsonObject>,
+        /** `params.sessionId`, when the request is session-scoped. */
+        val sessionId: String?,
+    )
 
     /**
      * UNLIMITED so a `session/load` replay (thousands of updates) can never
      * overflow the buffer and silently drop events the way a bounded
      * MutableSharedFlow + tryEmit did.
      */
-    private val _events = Channel<AcpEvent>(Channel.UNLIMITED)
-    val events: Flow<AcpEvent> = _events.receiveAsFlow()
+    private val _events = Channel<InboundEvent>(Channel.UNLIMITED)
+    val events: Flow<InboundEvent> = _events.receiveAsFlow()
+
+    private fun emit(sessionId: String?, seq: Long, event: AcpEvent) {
+        _events.trySend(InboundEvent(sessionId, seq, event))
+    }
 
     /** Called for every agent->client request; must call req.respond/respondError. */
     var requestHandler: (suspend (IncomingRequest) -> Unit)? = null
 
-    @Volatile var sessionId: String? = null
-        private set
+    /**
+     * Called with (sessionId, seq) for every journaled response frame we
+     * receive — the gateway splices `_seq` into session-scoped results so
+     * callers can keep a per-session journal cursor.
+     */
+    var seqTracker: ((sessionId: String, seq: Long) -> Unit)? = null
 
     suspend fun connect(url: String, token: String?) {
         val reqBuilder = Request.Builder().url(url)
@@ -204,11 +262,15 @@ class AcpClient(
         }
     }
 
+    /**
+     * Intentional teardown: pending calls fail, but no Disconnected event is
+     * emitted — that event exists for *unexpected* drops (onFailure/onClosed),
+     * and a stale one racing a fresh socket would clear the new liveness.
+     */
     fun disconnect() {
         ws?.close(1000, "bye")
         ws = null
-        sessionId = null
-        failAll("已断开")
+        failAll("已断开", emitEvent = false)
     }
 
     /** Tear down everything: socket, request-handler scope and OkHttp threads. */
@@ -249,12 +311,15 @@ class AcpClient(
     }
 
     suspend fun newSession(cwd: String): SessionNewResult {
-        val result = request(
+        val frame = request(
             AcpMethods.SESSION_NEW,
             json.encodeToJsonElement(SessionNewParams(cwd = cwd)),
             timeoutMs = 120_000,
-        ).let { json.decodeFromJsonElement<SessionNewResult>(it["result"] ?: it) }
-        sessionId = result.sessionId
+        )
+        val result = json.decodeFromJsonElement<SessionNewResult>(frame["result"] ?: frame)
+        // The result is journaled as the new session's first entry: seed the
+        // caller's cursor so a later attach doesn't replay what we saw live.
+        frame.seq()?.let { seq -> seqTracker?.invoke(result.sessionId, seq) }
         return result
     }
 
@@ -268,7 +333,6 @@ class AcpClient(
             json.encodeToJsonElement(SessionLoadParams(sessionId = id, cwd = cwd)),
             timeoutMs = 120_000,
         ).let { json.decodeFromJsonElement<SessionNewResult>(it["result"] ?: it) }
-        sessionId = id
         return result.copy(sessionId = result.sessionId.ifEmpty { id })
     }
 
@@ -325,8 +389,10 @@ class AcpClient(
     ).let { (it["result"] as? JsonObject) ?: it }
 
     /** `session/list` decoded — lock/plan flags ride flat on each entry. */
-    suspend fun listSessions(cwd: String? = null): List<AcpSession> {
-        val result = sessionList(cwd)
+    suspend fun listSessions(cwd: String? = null): List<AcpSession> =
+        decodeSessions(sessionList(cwd))
+
+    private fun decodeSessions(result: JsonObject): List<AcpSession> {
         val arr = result["sessions"] as? JsonArray ?: return emptyList()
         return arr.mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
@@ -349,9 +415,52 @@ class AcpClient(
                     "lastActivity", "lastActivityAgo", "last_activity_ago",
                     "updatedAt", "updated_at",
                 ),
+                running = o.boolField("running") ?: false,
+                pendingPermission = o.boolField("pendingPermission") ?: false,
             )
         }
     }
+
+    // ---- gateway-private `_devingo/*` surface --------------------------------
+    // These are answered by the session-hosting hub itself, never forwarded to
+    // devin. The app ships against them — no fallback to plain ACP.
+
+    /**
+     * `_devingo/hello` — introduces this client to the gateway and returns its
+     * capability set (attach/sessions/journal/permissionResolved/…).
+     */
+    suspend fun hello(clientId: String): JsonObject = request(
+        "_devingo/hello",
+        buildJsonObject { put("clientId", clientId) },
+    ).let { (it["result"] as? JsonObject) ?: it }
+
+    /**
+     * `_devingo/sessions` — devin's `session/list` merged with live hub state
+     * (`running`, `pendingPermission`), served by the resident process.
+     */
+    suspend fun devingoSessions(cwd: String? = null): List<AcpSession> = request(
+        "_devingo/sessions",
+        buildJsonObject { if (!cwd.isNullOrBlank()) put("cwd", cwd) },
+    ).let { decodeSessions((it["result"] as? JsonObject) ?: it) }
+
+    /**
+     * `_devingo/attach` — subscribe to [sessionId] and replay journaled
+     * events past [afterSeq]. When the journal no longer reaches that far
+     * the result's `needLoad` tells the caller to fall back to session/load.
+     */
+    suspend fun attach(sessionId: String, afterSeq: Long): AttachResult = request(
+        "_devingo/attach",
+        buildJsonObject {
+            put("sessionId", sessionId)
+            put("afterSeq", afterSeq)
+        },
+    ).let { json.decodeFromJsonElement((it["result"] as? JsonObject) ?: it) }
+
+    /** `_devingo/detach` — unsubscribe; the hub keeps hosting the session. */
+    suspend fun detach(sessionId: String) = request(
+        "_devingo/detach",
+        buildJsonObject { put("sessionId", sessionId) },
+    )
 
     /** `session/close` — idempotent release of the session lock agent-side. */
     suspend fun closeSession(sessionId: String) = request(
@@ -427,7 +536,11 @@ class AcpClient(
     ): JsonObject {
         val id = nextId.getAndIncrement()
         val deferred = CompletableDeferred<JsonObject>()
-        pending[id] = deferred
+        // Session-scoped requests carry params.sessionId; the journaled
+        // response frame's _seq is tracked back to it in handleResponse.
+        val sid = (params as? JsonObject)?.get("sessionId")
+            ?.let { (it as? JsonPrimitive)?.textOrNull }
+        pending[id] = PendingCall(deferred, sid)
         try {
             send(
                 buildJsonObject {
@@ -455,6 +568,10 @@ class AcpClient(
         }
     }
 
+    /** The `_seq` the gateway splices into journaled frames, else null. */
+    private fun JsonObject.seq(): Long? =
+        (this["_seq"] as? JsonPrimitive)?.longOrNull
+
     private fun send(obj: JsonObject) {
         val socket = ws ?: throw AcpException("未连接")
         if (!socket.send(obj.toString())) {
@@ -466,7 +583,7 @@ class AcpClient(
         val obj = try {
             json.parseToJsonElement(text).jsonObject
         } catch (e: Exception) {
-            _events.trySend(AcpEvent.Failure("无法解析的消息: ${e.message}"))
+            emit(null, 0, AcpEvent.Failure("无法解析的消息: ${e.message}"))
             return
         }
 
@@ -475,29 +592,37 @@ class AcpClient(
         // so it must be filtered out or a notification carrying a null id would
         // be misrouted to handleIncomingRequest.
         val id = obj["id"]?.takeIf { it !is JsonNull }
+        val seq = obj.seq() ?: 0
 
         when {
             method == null && id != null -> handleResponse(id, obj)      // our response
-            method != null && id == null -> handleNotification(method, obj["params"])
-            method != null && id != null -> handleIncomingRequest(method, id, obj["params"])
+            method != null && id == null -> handleNotification(method, obj["params"], seq)
+            method != null && id != null -> handleIncomingRequest(method, id, obj["params"], seq)
         }
     }
 
     private fun handleResponse(id: JsonElement, obj: JsonObject) {
         val intId = (id as? JsonPrimitive)?.textOrNull?.toIntOrNull() ?: return
-        val deferred = pending.remove(intId) ?: return
+        val call = pending.remove(intId) ?: return
+        // Journaled responses carry _seq; keep the session's cursor current.
+        val seq = obj.seq()
+        if (call.sessionId != null && seq != null) {
+            seqTracker?.invoke(call.sessionId, seq)
+        }
         val error = obj["error"] as? JsonObject
         if (error != null) {
             val code = error["code"]?.jsonPrimitive?.textOrNull?.toIntOrNull() ?: -1
             val message = error["message"]?.jsonPrimitive?.textOrNull ?: "未知错误"
-            deferred.completeExceptionally(AcpException(message, code))
+            call.deferred.completeExceptionally(AcpException(message, code))
         } else {
-            deferred.complete(obj)
+            call.deferred.complete(obj)
         }
     }
 
-    private fun handleIncomingRequest(method: String, id: JsonElement, params: JsonElement?) {
-        val req = IncomingRequest(id, method, params as? JsonObject)
+    private fun handleIncomingRequest(method: String, id: JsonElement, params: JsonElement?, seq: Long) {
+        val p = params as? JsonObject
+        val sessionId = (p?.get("sessionId") as? JsonPrimitive)?.textOrNull
+        val req = IncomingRequest(id, method, p, sessionId, seq)
         // A handler that already answered and then throws would otherwise send
         // a SECOND message with the same id (the catch block's error response).
         val responded = AtomicBoolean(false)
@@ -530,17 +655,62 @@ class AcpClient(
         }
     }
 
-    private fun handleNotification(method: String, params: JsonElement?) {
+    private fun handleNotification(method: String, params: JsonElement?, seq: Long) {
         val p = params as? JsonObject ?: return
+        val sessionId = (p["sessionId"] as? JsonPrimitive)?.textOrNull
         when (method) {
-            AcpMethods.SESSION_UPDATE -> handleSessionUpdate(p)
+            AcpMethods.SESSION_UPDATE -> handleSessionUpdate(p, sessionId, seq)
+            // Gateway-private markers (journaled, so they carry _seq).
+            "_devingo/session_resync" ->
+                emit(sessionId, seq, AcpEvent.SessionResync)
+            "_devingo/session_deleted" ->
+                emit(sessionId, seq, AcpEvent.SessionDeleted)
+            "_devingo/agent_dead" -> emit(
+                sessionId, seq,
+                AcpEvent.AgentDead(
+                    (p["reason"] as? JsonPrimitive)?.textOrNull
+                        ?: "devin 进程已退出",
+                ),
+            )
+            "_devingo/permission_resolved" -> {
+                val requestId = (p["requestId"] as? JsonPrimitive)?.longOrNull ?: return
+                emit(
+                    sessionId, seq,
+                    AcpEvent.PermissionResolved(
+                        requestId,
+                        (p["outcome"] as? JsonPrimitive)?.textOrNull ?: "answered",
+                    ),
+                )
+            }
+            "_devingo/event" -> {
+                // A journaled response owned by another client. Only
+                // turn-ending frames matter here: a session/prompt result
+                // carries stopReason, a prompt's error frame carries only
+                // `error` — either way the remote turn is over. (An error
+                // on another request kind would just end the marker a
+                // beat early; the next chunk re-marks it.)
+                val frame = p["event"] as? JsonObject
+                val stopReason = ((frame?.get("result") as? JsonObject)
+                    ?.get("stopReason") as? JsonPrimitive)?.textOrNull
+                when {
+                    stopReason != null ->
+                        emit(sessionId, seq, AcpEvent.RemoteTurnEnd(stopReason))
+                    frame?.get("error") != null -> emit(
+                        sessionId, seq,
+                        AcpEvent.RemoteTurnEnd(
+                            ((frame["error"] as? JsonObject)?.get("message")
+                                as? JsonPrimitive)?.textOrNull,
+                        ),
+                    )
+                }
+            }
             "_cognition.ai/output" -> {
                 // Devin's extension channel for agent-side log lines.
                 val channel = p["channel"]?.jsonPrimitive?.textOrNull ?: ""
                 val message = p["message"]?.jsonPrimitive?.textOrNull ?: return
                 val level = p["level"]?.jsonPrimitive?.textOrNull ?: "info"
                 if (level != "info") {
-                    _events.trySend(AcpEvent.AgentLog(channel, message, level))
+                    emit(sessionId, seq, AcpEvent.AgentLog(channel, message, level))
                 }
             }
             "_cognition.ai/compaction" -> {
@@ -548,26 +718,26 @@ class AcpClient(
                 val status = (p["status"] as? JsonPrimitive)?.textOrNull
                     ?: (p["state"] as? JsonPrimitive)?.textOrNull
                 if (status != null) {
-                    _events.trySend(AcpEvent.CompactionUpdate(status))
+                    emit(sessionId, seq, AcpEvent.CompactionUpdate(status))
                 }
             }
             AcpMethods.REVERT_STEPS_UPDATED ->
-                _events.trySend(AcpEvent.RevertStepsUpdated(p))
+                emit(sessionId, seq, AcpEvent.RevertStepsUpdated(p))
             // _cognition.ai/mcp/serversChanged and other extensions: ignore.
         }
     }
 
-    private fun handleSessionUpdate(params: JsonObject) {
+    private fun handleSessionUpdate(params: JsonObject, sessionId: String?, seq: Long) {
         val update = params["update"] as? JsonObject ?: return
         when (val kind = update["sessionUpdate"]?.jsonPrimitive?.textOrNull) {
             "agent_message_chunk" -> update.textOfContent()?.let {
-                _events.trySend(AcpEvent.AgentChunk(it))
+                emit(sessionId, seq, AcpEvent.AgentChunk(it))
             }
             "agent_thought_chunk" -> update.textOfContent()?.let {
-                _events.trySend(AcpEvent.ThoughtChunk(it))
+                emit(sessionId, seq, AcpEvent.ThoughtChunk(it))
             }
             "user_message_chunk" -> update.textOfContent()?.let {
-                _events.trySend(AcpEvent.UserChunk(it))
+                emit(sessionId, seq, AcpEvent.UserChunk(it))
             }
             "available_commands_update" -> {
                 val commands = (update["availableCommands"] as? JsonArray)
@@ -587,13 +757,14 @@ class AcpClient(
                         )
                     }
                     .orEmpty()
-                _events.trySend(AcpEvent.CommandsAvailable(commands))
+                emit(sessionId, seq, AcpEvent.CommandsAvailable(commands))
             }
             "tool_call", "tool_call_update" -> {
                 val info = runCatching {
                     json.decodeFromJsonElement<ToolCallInfo>(update)
                 }.getOrNull() ?: return
-                _events.trySend(
+                emit(
+                    sessionId, seq,
                     if (kind == "tool_call") AcpEvent.ToolCall(info)
                     else AcpEvent.ToolCallUpdate(info),
                 )
@@ -608,11 +779,11 @@ class AcpClient(
                         priority = o["priority"]?.jsonPrimitive?.textOrNull,
                     )
                 }.orEmpty()
-                _events.trySend(AcpEvent.PlanUpdate(entries))
+                emit(sessionId, seq, AcpEvent.PlanUpdate(entries))
             }
             "current_mode_update" -> {
                 update["currentModeId"]?.jsonPrimitive?.textOrNull?.let {
-                    _events.trySend(AcpEvent.ModeChanged(it))
+                    emit(sessionId, seq, AcpEvent.ModeChanged(it))
                 }
             }
             "config_option_update" -> {
@@ -622,11 +793,12 @@ class AcpClient(
                         json.decodeFromJsonElement<ConfigOption>(el)
                     }.getOrNull()
                 }.orEmpty()
-                _events.trySend(AcpEvent.ConfigOptionsUpdated(options))
+                emit(sessionId, seq, AcpEvent.ConfigOptionsUpdated(options))
             }
             "session_info_update" -> {
                 update["title"]?.jsonPrimitive?.textOrNull?.let { title ->
-                    _events.trySend(
+                    emit(
+                        sessionId, seq,
                         AcpEvent.SessionTitle(title, update["_meta"] as? JsonObject)
                     )
                 }
@@ -636,7 +808,8 @@ class AcpClient(
                 val size = (update["size"] as? JsonPrimitive)?.numberAsLong
                 if (used != null && size != null) {
                     val meta = update["_meta"] as? JsonObject
-                    _events.trySend(
+                    emit(
+                        sessionId, seq,
                         AcpEvent.UsageUpdate(
                             used = used,
                             size = size,
@@ -658,16 +831,15 @@ class AcpClient(
         (this["content"] as? JsonObject)?.get("text")?.jsonPrimitive?.textOrNull
             ?: (this["content"] as? JsonPrimitive)?.textOrNull
 
-    private fun failAll(reason: String) {
-        sessionId = null
+    private fun failAll(reason: String, emitEvent: Boolean = true) {
         // Claim each deferred with an atomic remove — a put() racing a
         // values() snapshot + clear() could strand it uncompleted forever.
         pending.entries.forEach {
             if (pending.remove(it.key, it.value)) {
-                it.value.completeExceptionally(AcpException(reason))
+                it.value.deferred.completeExceptionally(AcpException(reason))
             }
         }
-        _events.trySend(AcpEvent.Disconnected(reason))
+        if (emitEvent) emit(null, 0, AcpEvent.Disconnected(reason))
     }
 
     private fun closeText(code: Int, reason: String): String =
@@ -714,39 +886,6 @@ data class BridgeHealth(
     val defaultCwd: String = "",
     val authEnabled: Boolean = false,
 )
-
-@Serializable
-data class BridgeSession(
-    val id: String = "",
-    @kotlinx.serialization.SerialName("working_directory") val workingDirectory: String = "",
-    val title: String = "",
-    @kotlinx.serialization.SerialName("last_activity_ago") val lastActivityAgo: String = "",
-)
-
-/** HTTP helper for the bridge's /sessions endpoint (past sessions list). */
-suspend fun fetchBridgeSessions(baseHttpUrl: String, token: String?, cwd: String): List<BridgeSession> =
-    withContext(Dispatchers.IO) {
-        val client = OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .build()
-        val url = "$baseHttpUrl/sessions?cwd=${java.net.URLEncoder.encode(cwd, "UTF-8")}"
-        val req = Request.Builder().url(url).apply {
-            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
-        }.build()
-        val body = client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw AcpException("sessions HTTP ${resp.code}")
-            resp.body?.string().orEmpty()
-        }
-        if (body.isBlank()) {
-            emptyList()
-        } else {
-            healthJson.decodeFromString(
-                kotlinx.serialization.builtins.ListSerializer(BridgeSession.serializer()),
-                body,
-            )
-        }
-    }
 
 /**
  * Models from the bridge's /models endpoint (`devin models list`). The JSON

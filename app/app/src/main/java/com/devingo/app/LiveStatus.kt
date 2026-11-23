@@ -1,6 +1,5 @@
 package com.devingo.app
 
-import com.devingo.app.ChatViewModel
 import com.devingo.app.acp.PermissionOption
 
 /**
@@ -19,6 +18,11 @@ data class LiveStatus(
     /** Labels for the notification's permission actions. */
     val allowLabel: String = "允许",
     val denyLabel: String = "拒绝",
+    /**
+     * The session this status describes — its 允许/拒绝 actions must resolve
+     * THIS session's pending request even if the user has since switched.
+     */
+    val sessionId: String? = null,
 ) {
     enum class State { Working, NeedsPermission, Idle, Reconnecting, Done, Failed }
 }
@@ -29,9 +33,9 @@ data class LiveStatus(
  * then idle.
  */
 fun deriveLiveStatus(
-    ui: ChatViewModel.UiState,
-    messages: List<ChatViewModel.ChatItem>,
-    pendingPermission: ChatViewModel.PendingPermission?,
+    ui: UiState,
+    messages: List<ChatItem>,
+    pendingPermission: PendingPermission?,
     turnStartedAtMillis: Long,
     /** Set by the caller for a few minutes after a turn ends: Done or Failed. */
     finished: LiveStatus.State? = null,
@@ -54,6 +58,7 @@ fun deriveLiveStatus(
             startedAtMillis = turnStartedAtMillis,
             allowLabel = allowOpt?.let(::permissionOptionLabel) ?: "允许",
             denyLabel = denyOpt?.let(::permissionOptionLabel) ?: "拒绝",
+            sessionId = ui.sessionId,
         )
     }
 
@@ -69,9 +74,9 @@ fun deriveLiveStatus(
     if (ui.running) {
         // Latest in-progress tool wins; otherwise a recent thought means the
         // model is "thinking"; with neither, generic processing.
-        val detail = messages.lastOrNull { it.kind == ChatViewModel.Kind.Tool && it.status == "in_progress" }
+        val detail = messages.lastOrNull { it.kind == Kind.Tool && it.status == "in_progress" }
             ?.text?.takeIf { it.isNotBlank() }
-            ?: if (messages.lastOrNull { it.kind == ChatViewModel.Kind.Thought } != null) "思考中"
+            ?: if (messages.lastOrNull { it.kind == Kind.Thought } != null) "思考中"
             else "处理中"
         return LiveStatus(
             state = LiveStatus.State.Working,

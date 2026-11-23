@@ -24,6 +24,18 @@ class SessionService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var idleRepost: Runnable? = null
 
+    /**
+     * The application-level ACP connection owner. Getting it here pins the
+     * singleton to the keep-alive service's lifetime — service restarts reuse
+     * the same manager/socket instead of spinning up a duplicate.
+     */
+    private lateinit var connectionManager: ConnectionManager
+
+    override fun onCreate() {
+        super.onCreate()
+        connectionManager = ConnectionManager.get(application)
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -43,6 +55,7 @@ class SessionService : Service() {
                     title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "DevinGo" },
                     detail = intent.getStringExtra(EXTRA_DETAIL).orEmpty(),
                     startedAtMillis = intent.getLongExtra(EXTRA_STARTED_AT, 0L),
+                    sessionId = intent.getStringExtra(Notifier.EXTRA_SESSION_ID),
                 )
                 scheduleIdleRepost()
             }
@@ -104,8 +117,14 @@ class SessionService : Service() {
 
         if (status.state == LiveStatus.State.NeedsPermission) {
             builder
-                .addAction(0, status.allowLabel, openIntent(REQ_ALLOW, EXTRA_ACTION_ALLOW))
-                .addAction(0, status.denyLabel, openIntent(REQ_DENY, EXTRA_ACTION_DENY))
+                .addAction(
+                    0, status.allowLabel,
+                    openIntent(REQ_ALLOW, EXTRA_ACTION_ALLOW, status.sessionId),
+                )
+                .addAction(
+                    0, status.denyLabel,
+                    openIntent(REQ_DENY, EXTRA_ACTION_DENY, status.sessionId),
+                )
         }
 
         when (status.state) {
@@ -174,9 +193,14 @@ class SessionService : Service() {
         LiveStatus.State.Idle -> "等待指令"
     }
 
-    private fun openIntent(requestCode: Int, action: String? = null): PendingIntent {
+    private fun openIntent(
+        requestCode: Int,
+        action: String? = null,
+        sessionId: String? = null,
+    ): PendingIntent {
         val intent = Intent(this, MainActivity::class.java)
         if (action != null) intent.putExtra(EXTRA_NOTIFICATION_ACTION, action)
+        if (sessionId != null) intent.putExtra(Notifier.EXTRA_SESSION_ID, sessionId)
         return PendingIntent.getActivity(
             this, requestCode, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -231,7 +255,8 @@ class SessionService : Service() {
                     .putExtra(EXTRA_STATE, status.state.name)
                     .putExtra(EXTRA_TITLE, status.title)
                     .putExtra(EXTRA_DETAIL, status.detail)
-                    .putExtra(EXTRA_STARTED_AT, status.startedAtMillis),
+                    .putExtra(EXTRA_STARTED_AT, status.startedAtMillis)
+                    .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId),
             )
         }
 

@@ -52,7 +52,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.devingo.app.ChatViewModel
+import com.devingo.app.PendingPermission
 import com.devingo.app.acp.PermissionOption
 import com.devingo.app.permissionOptionLabel
 import com.devingo.app.ui.theme.DevinGoColors
@@ -74,12 +74,12 @@ private val prettyJson = Json { prettyPrint = true }
  */
 @Composable
 fun PermissionCard(
-    pending: ChatViewModel.PendingPermission?,
+    pending: PendingPermission?,
     onResolve: (String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var lastPending by remember {
-        mutableStateOf<ChatViewModel.PendingPermission?>(null)
+        mutableStateOf<PendingPermission?>(null)
     }
     if (pending != null) lastPending = pending
     val haptic = LocalHapticFeedback.current
@@ -103,7 +103,7 @@ fun PermissionCard(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PermissionCardContent(
-    p: ChatViewModel.PendingPermission,
+    p: PendingPermission,
     onResolve: (String?) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -245,13 +245,13 @@ private fun permissionTitle(kind: String): String = when (kind) {
     else -> "Devin 请求权限"
 }
 
-private fun shownOptions(p: ChatViewModel.PendingPermission): List<PermissionOption> {
+private fun shownOptions(p: PendingPermission): List<PermissionOption> {
     val oneShot = p.options.filterNot { "always" in it.kind.orEmpty() }
     return if (oneShot.isEmpty()) p.options else oneShot
 }
 
 /** allow-once first, then other non-always options, then reject last. */
-private fun orderedOptions(p: ChatViewModel.PendingPermission): List<PermissionOption> =
+private fun orderedOptions(p: PendingPermission): List<PermissionOption> =
     shownOptions(p).sortedBy {
         val k = it.kind.orEmpty()
         when {

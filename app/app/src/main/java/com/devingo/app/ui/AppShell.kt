@@ -14,9 +14,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -26,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -33,23 +37,22 @@ import com.devingo.app.ChatViewModel
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
 import com.devingo.app.tailnet.TailnetManager
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
  * Root navigation (spec §N): Home full-screen when no session is open; with
  * a session open, Home becomes the left drawer over the chat. Phase changes
- * cross-fade+scale; session switches use the disconnect → 2.3s → connect
- * workaround for the VM's async socket teardown race.
+ * cross-fade+scale. Session switches re-bind the shared connection's store —
+ * no disconnect, no wait, no Home flash.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     val ui by vm.ui.collectAsState()
-    val sessionOpen = ui.phase == ChatViewModel.Phase.Ready
+    val openTarget by vm.openTarget.collectAsState()
+    val sessionOpen = ui.sessionId != null
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
-    var pendingSwitch by remember { mutableStateOf<PendingConnect?>(null) }
     // Shared with both Home surfaces so the drawer lists the same project
     // groups the user expanded on full-screen Home. homeState keeps the
     // list cache + display prefs alive while HomeScreen is uncomposed —
@@ -58,32 +61,39 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     // in the background behind the cached rows.
     var expandedProjects by remember { mutableStateOf(prefs.expandedProjects) }
     val homeState = remember { HomeState() }
+    val snackbarHostState = remember { SnackbarHostState() }
 
-    // Session switching / new session while one is open: the old socket can
-    // take ~2s to die asynchronously and would kill a fresh connection, so
-    // disconnect first, wait, then connect.
-    fun switchSession(resumeId: String?, cwd: String?, sessionId: String?) {
-        pendingSwitch = PendingConnect(resumeId, cwd, sessionId)
-        vm.disconnect()
-        scope.launch {
-            delay(2300)
-            val p = pendingSwitch ?: return@launch
-            pendingSwitch = null
-            // Tailnet failure keeps the raw host: the connect attempt then
-            // fails through the normal error path instead of silently no-oping.
-            val host = prefs.host.trim()
-            vm.connect(
-                runCatching { TailnetManager.resolveHost(host) }.getOrDefault(host),
-                prefs.token.trim(),
-                (p.cwd ?: prefs.cwd.trim()),
-                resumeSessionId = p.resumeId,
-                apiKey = prefs.apiKey,
-            )
+    // One background refresh per drawer opening; rows render the shared
+    // `_devingo/sessions` cache immediately.
+    LaunchedEffect(drawerState.targetValue) {
+        if (drawerState.targetValue == DrawerValue.Open) {
+            vm.refreshSessions(resolvedHost(prefs), prefs.token.trim())
         }
     }
 
-    // If disconnect leaves phase == Ready (e.g. socket already gone), the
-    // pending connect still fires on its own timer above.
+    // Something needs attention in a session that isn't on screen — the
+    // snackbar's action jumps straight to it.
+    LaunchedEffect(Unit) {
+        vm.alerts.collect { alert ->
+            val result = snackbarHostState.showSnackbar(
+                message = alert.message,
+                actionLabel = if (alert.openable) "打开" else null,
+                duration = SnackbarDuration.Short,
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                vm.openSession(alert.sessionId)
+            }
+        }
+    }
+
+    // Drawer picks pass the *current* prefs host+token so a settings-changed
+    // host is noticed before the open (noteHost drops the stale epoch).
+    fun pickSession(s: AcpSession) {
+        scope.launch {
+            drawerState.close()
+            vm.openSession(s.sessionId, s.cwd, resolvedHost(prefs), prefs.token.trim())
+        }
+    }
 
     AnimatedContent(
         targetState = sessionOpen,
@@ -131,18 +141,19 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                                     expandedProjects = it
                                     prefs.expandedProjects = it
                                 },
-                                pendingSwitch = pendingSwitch,
-                                onPickSession = { s: AcpSession ->
-                                    scope.launch { drawerState.close() }
-                                    switchSession(s.sessionId, s.cwd, s.sessionId)
-                                },
+                                openTarget = openTarget,
+                                onPickSession = ::pickSession,
                                 onNewSession = {
-                                    scope.launch { drawerState.close() }
-                                    switchSession(null, null, null)
+                                    scope.launch {
+                                        drawerState.close()
+                                        vm.newSession(null, resolvedHost(prefs), prefs.token.trim())
+                                    }
                                 },
                                 onNewSessionCwd = { cwd ->
-                                    scope.launch { drawerState.close() }
-                                    switchSession(null, cwd, null)
+                                    scope.launch {
+                                        drawerState.close()
+                                        vm.newSession(cwd, resolvedHost(prefs), prefs.token.trim())
+                                    }
                                 },
                             )
                         }
@@ -151,7 +162,6 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
             ) {
                 ChatScreen(
                     vm = vm,
-                    sessionCwd = prefs.lastSessionCwd,
                     onOpenDrawer = {
                         scope.launch { drawerState.open() }
                     },
@@ -168,7 +178,7 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                     expandedProjects = it
                     prefs.expandedProjects = it
                 },
-                pendingSwitch = pendingSwitch,
+                openTarget = openTarget,
                 onPickSession = { s ->
                     scope.launch { startConnectFromHome(vm, prefs, s) }
                 },
@@ -182,13 +192,19 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
             )
         }
     }
+    Box(Modifier.fillMaxSize()) {
+        DevinSnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
+    }
 }
 
 private suspend fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: AcpSession?) {
-    val host = prefs.host.trim()
+    val host = resolvedHost(prefs)
     if (host.isEmpty()) return
     vm.connect(
-        runCatching { TailnetManager.resolveHost(host) }.getOrDefault(host),
+        host,
         prefs.token.trim(),
         (s?.cwd ?: prefs.cwd.trim()),
         resumeSessionId = s?.sessionId,
@@ -196,12 +212,17 @@ private suspend fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: Acp
     )
 }
 
+private suspend fun resolvedHost(prefs: Prefs): String {
+    val host = prefs.host.trim()
+    return runCatching { TailnetManager.resolveHost(host) }.getOrDefault(host)
+}
+
 /** Project-group "+": fresh session rooted at that group's cwd. */
 private suspend fun startConnectCwd(vm: ChatViewModel, prefs: Prefs, cwd: String?) {
-    val host = prefs.host.trim()
+    val host = resolvedHost(prefs)
     if (host.isEmpty() || cwd.isNullOrBlank()) return
     vm.connect(
-        runCatching { TailnetManager.resolveHost(host) }.getOrDefault(host),
+        host,
         prefs.token.trim(),
         cwd,
         resumeSessionId = null,

@@ -1,0 +1,173 @@
+package com.devingo.app
+
+import androidx.compose.runtime.Immutable
+import com.devingo.app.acp.AcpException
+import com.devingo.app.acp.AvailableCommand
+import com.devingo.app.acp.ConfigOption
+import com.devingo.app.acp.PermissionOption
+import com.devingo.app.acp.PlanEntry
+import com.devingo.app.acp.SessionMode
+import com.devingo.app.acp.SessionModel
+import com.devingo.app.acp.ToolCallInfo
+import kotlinx.coroutines.CompletableDeferred
+
+/**
+ * Shared transcript/session types. They live outside [ChatViewModel] because
+ * the state they describe belongs to [SessionStore] — one per session — and
+ * the ViewModel only flattens the currently bound store for the UI.
+ */
+
+/** One-line user-facing form of a thrown connection/protocol error. */
+internal fun Throwable.display(): String = when (this) {
+    is AcpException -> message ?: "ACP 错误 $code"
+    is java.net.SocketTimeoutException -> "连接超时"
+    else -> message ?: javaClass.simpleName
+}
+
+/** Connection/session pipeline phase — the view contract's progress vocabulary. */
+enum class Phase { Idle, Checking, Connecting, Authenticating, StartingSession, Ready, Error }
+
+/**
+ * The merged UI state the screens read: connection-level fields come from
+ * [ConnectionManager]'s [ConnState], session-scoped fields from the bound
+ * [SessionStore]'s [SessionUi]. [ChatViewModel] flattens them into this one
+ * shape so the UI stays unchanged.
+ */
+data class UiState(
+    val phase: Phase = Phase.Idle,
+    val statusText: String = "",
+    val error: String? = null,
+    val agentTitle: String? = null,
+    val sessionId: String? = null,
+    val modes: List<SessionMode> = emptyList(),
+    val currentModeId: String? = null,
+    val models: List<SessionModel> = emptyList(),
+    val currentModelId: String? = null,
+    val commands: List<AvailableCommand> = emptyList(),
+    val sessionTitle: String? = null,
+    /** Context window usage: [contextUsed] of [contextSize] tokens. */
+    val contextUsed: Long = 0,
+    val contextSize: Long = 0,
+    /** Cumulative turn token accounting from `usage_update` (if the agent reports it). */
+    val usageInput: Long = 0,
+    val usageOutput: Long = 0,
+    val usageCacheRead: Long = 0,
+    val running: Boolean = false,
+    /** True while `authenticate` is in flight — the browser is waiting on the PC. */
+    val awaitingBrowserLogin: Boolean = false,
+    /** True while the auto-reconnect loop is retrying a dropped socket. */
+    val reconnecting: Boolean = false,
+    /** The shared socket is up — sessions may be streaming off-screen. */
+    val connected: Boolean = false,
+    val authMethods: List<String> = emptyList(),
+    /** configOptions entries outside mode/model (effort, thinking, …). */
+    val extraConfigOptions: List<ConfigOption> = emptyList(),
+)
+
+enum class Kind { User, Agent, Thought, Tool, Plan, System, Error }
+
+@Immutable
+data class ChatItem(
+    val id: Long,
+    val kind: Kind,
+    val text: String,
+    val status: String? = null,
+    val toolCallId: String? = null,
+    /** ACP tool kind (execute/read/edit/…) — drives the timeline node icon. */
+    val toolKind: String? = null,
+    /** Expandable detail for tool calls: output text, diff paths, etc. */
+    val detail: String? = null,
+    /** File diffs reported inside the tool call's content blocks. */
+    val diffs: List<ToolDiff> = emptyList(),
+    val planEntries: List<PlanEntry> = emptyList(),
+    /** True when the prompt never reached the agent (send threw before any update). */
+    val failed: Boolean = false,
+    /**
+     * The user prompt's image bytes — only a [failed] echo needs them
+     * (重发 source); SessionStore clears them once the prompt is delivered.
+     */
+    val attachments: List<ImageAttachment> = emptyList(),
+    /** Images sent with this prompt — badge source once bytes are cleared. */
+    val attachmentCount: Int = 0,
+)
+
+/** One `diff` content item of a tool call: unified old/new file text. */
+data class ToolDiff(val path: String, val oldText: String?, val newText: String)
+
+/**
+ * A permission request the user (or a peer client) can still answer.
+ * [requestId] is the wire id the gateway's `_devingo/permission_resolved`
+ * broadcast references.
+ */
+@Immutable
+data class PendingPermission(
+    val toolCall: ToolCallInfo,
+    val options: List<PermissionOption>,
+    internal val choice: CompletableDeferred<String?>,
+    internal val requestId: Long = -1,
+)
+
+/** A photo/screenshot picked on-device, sent as an ACP `image` block. */
+class ImageAttachment(val bytes: ByteArray, val mimeType: String)
+
+data class QueuedPrompt(
+    val text: String,
+    val attachments: List<ImageAttachment> = emptyList(),
+)
+
+/** Per-turn timing owned by a SessionStore (was UI-local in ChatScreen). */
+data class TurnTiming(val start: Long?, val end: Long?) {
+    val durationSec: Long?
+        get() = if (start != null && end != null && end > start) {
+            (end - start) / 1000
+        } else null
+}
+
+/**
+ * The session-scoped half of the chat UI state — one per SessionStore.
+ * Connection-level fields (phase, status, auth, reconnect) live on
+ * [ChatViewModel.UiState], which merges these in for the bound session.
+ */
+data class SessionUi(
+    val sessionId: String? = null,
+    val modes: List<SessionMode> = emptyList(),
+    val currentModeId: String? = null,
+    val models: List<SessionModel> = emptyList(),
+    val currentModelId: String? = null,
+    val commands: List<AvailableCommand> = emptyList(),
+    val sessionTitle: String? = null,
+    /** Context window usage: [contextUsed] of [contextSize] tokens. */
+    val contextUsed: Long = 0,
+    val contextSize: Long = 0,
+    /** Cumulative turn token accounting from `usage_update` (if reported). */
+    val usageInput: Long = 0,
+    val usageOutput: Long = 0,
+    val usageCacheRead: Long = 0,
+    val running: Boolean = false,
+    /** configOptions entries outside mode/model (effort, thinking, …). */
+    val extraConfigOptions: List<ConfigOption> = emptyList(),
+)
+
+/** Live per-session flags rendered as sidebar badges on the session list. */
+data class SessionBadge(
+    val pendingPermission: Boolean = false,
+    val running: Boolean = false,
+    /** Output arrived while another session was bound. */
+    val unread: Boolean = false,
+)
+
+/** The session an open/switch attempt is aimed at (drawer spinner + retry). */
+data class OpenTarget(
+    val resumeId: String?,
+    val cwd: String?,
+    val sessionId: String?,
+)
+
+/** A heads-up for something happening in a session that isn't on screen. */
+data class SessionAlert(
+    val sessionId: String,
+    /** Short text shown in the snackbar. */
+    val message: String,
+    /** When true the snackbar offers a jump action to that session. */
+    val openable: Boolean = true,
+)

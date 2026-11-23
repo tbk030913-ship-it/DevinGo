@@ -61,6 +61,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.devingo.app.SessionBadge
 import com.devingo.app.acp.AcpSession
 import com.devingo.app.ui.theme.DevinGoColors
 import me.rerere.hugeicons.HugeIcons
@@ -178,6 +179,7 @@ internal fun SessionRow(
     isCurrent: Boolean,
     switching: Boolean,
     lastSession: Boolean,
+    badge: SessionBadge?,
     canDelete: Boolean,
     onClick: () -> Unit,
     onDelete: () -> Unit,
@@ -286,7 +288,7 @@ internal fun SessionRow(
                     }
                 }
                 if (!compact) {
-                    SessionMetaLine(s, lastSession)
+                    SessionMetaLine(s, lastSession, badge)
                 }
             }
             // Trailing "…" menu, vertically centered on the row.
@@ -334,13 +336,16 @@ internal fun SessionRow(
 
 /** Second line: relative time followed by inline status badges. */
 @Composable
-private fun SessionMetaLine(s: AcpSession, lastSession: Boolean) {
+private fun SessionMetaLine(s: AcpSession, lastSession: Boolean, badge: SessionBadge?) {
     val cs = MaterialTheme.colorScheme
     // (label, showOrangeDot) pairs in display order.
     val items = mutableListOf<Pair<String, Boolean>>()
     relativeSessionTime(s.lastActivity).takeIf { it.isNotBlank() }
         ?.let { items += it to false }
     if (s.isLocked) items += "占用中" to true
+    if (s.pendingPermission || badge?.pendingPermission == true) items += "待授权" to true
+    if (s.running || badge?.running == true) items += "运行中" to false
+    if (badge?.unread == true) items += "新消息" to false
     if (s.planFilePath != null) items += "计划" to false
     if (!s.hasUserMessages && s.title.isNullOrBlank()) items += "空会话" to false
     if (lastSession) items += "上次" to false

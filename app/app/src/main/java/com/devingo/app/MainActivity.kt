@@ -28,11 +28,25 @@ class MainActivity : ComponentActivity() {
 
     private val prefs by lazy { Prefs(this) }
     private var pendingNotifAction: String? = null
-    private var notifActionHandler: ((String) -> Unit)? = null
+    /** Session an allow/deny action pins its answer to. */
+    private var pendingNotifActionSession: String? = null
+    /** Session a notification tap opens — never an allow/deny target. */
+    private var pendingNotifSession: String? = null
+    /** (action, sessionId) — the extra pins which session's request answers. */
+    private var notifActionHandler: ((String, String?) -> Unit)? = null
+    private var notifSessionHandler: ((String) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingNotifAction = intent?.getStringExtra(SessionService.EXTRA_NOTIFICATION_ACTION)
+        val notifSid = intent?.getStringExtra(Notifier.EXTRA_SESSION_ID)
+        // An allow/deny extra pins which session's request it answers; only a
+        // plain notification tap (no action) is a request to navigate there.
+        if (pendingNotifAction != null) {
+            pendingNotifActionSession = notifSid
+        } else {
+            pendingNotifSession = notifSid
+        }
         // Warm the embedded tailnet node early when the switch is on so the
         // first connect doesn't pay its startup latency.
         TailnetManager.init(this, prefs)
@@ -66,14 +80,13 @@ class MainActivity : ComponentActivity() {
 
                     val settingsVersion by prefs.settingsVersion.collectAsState()
 
-                    // Foreground-service keep-alive while a session is open.
+                    // Foreground-service keep-alive while the shared ACP
+                    // socket is up — including Home, where background
+                    // sessions still stream.
                     // Keyed on the settings version so toggles apply live.
-                    LaunchedEffect(
-                        ui.phase == ChatViewModel.Phase.Ready,
-                        prefs.keepAlive,
-                        settingsVersion,
-                    ) {
-                        if (ui.phase == ChatViewModel.Phase.Ready && prefs.keepAlive) {
+                    val connected = ui.connected || ui.reconnecting
+                    LaunchedEffect(connected, prefs.keepAlive, settingsVersion) {
+                        if (connected && prefs.keepAlive) {
                             SessionService.start(
                                 this@MainActivity,
                                 ui.sessionTitle ?: ui.agentTitle,
@@ -102,7 +115,7 @@ class MainActivity : ComponentActivity() {
                                     finished = null
                                 }
                                 if (!u.running && wasRunning) {
-                                    finished = if (u.phase == ChatViewModel.Phase.Error ||
+                                    finished = if (u.phase == Phase.Error ||
                                         !u.error.isNullOrBlank()
                                     ) {
                                         LiveStatus.State.Failed
@@ -134,7 +147,7 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                                 val gated = status.copy(promoteOngoing = prefs.liveUpdates)
-                                if (u.phase == ChatViewModel.Phase.Ready &&
+                                if ((u.connected || u.reconnecting) &&
                                     prefs.keepAlive
                                 ) {
                                     gated
@@ -150,16 +163,26 @@ class MainActivity : ComponentActivity() {
                             }
                     }
                     // Live notification actions (允许/拒绝) resolve through the
-                    // same path as the in-app permission card.
-                    notifActionHandler = { action ->
+                    // same path as the in-app permission card — but pinned to
+                    // the session the notification was issued for.
+                    notifActionHandler = { action, sid ->
                         when (action) {
-                            SessionService.EXTRA_ACTION_ALLOW -> resolvePermissionFromOptions(vm, allow = true)
-                            SessionService.EXTRA_ACTION_DENY -> resolvePermissionFromOptions(vm, allow = false)
+                            SessionService.EXTRA_ACTION_ALLOW ->
+                                resolvePermissionFromOptions(vm, allow = true, sessionId = sid)
+                            SessionService.EXTRA_ACTION_DENY ->
+                                resolvePermissionFromOptions(vm, allow = false, sessionId = sid)
                         }
                     }
+                    // A notification's sessionId routes to its owning session.
+                    notifSessionHandler = { sid -> vm.openSession(sid) }
                     LaunchedEffect(Unit) {
-                        pendingNotifAction?.let { notifActionHandler?.invoke(it) }
+                        pendingNotifAction?.let {
+                            notifActionHandler?.invoke(it, pendingNotifActionSession)
+                        }
                         pendingNotifAction = null
+                        pendingNotifActionSession = null
+                        pendingNotifSession?.let { notifSessionHandler?.invoke(it) }
+                        pendingNotifSession = null
                     }
                     AppShell(vm, prefs)
                 }
@@ -169,15 +192,40 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
-        intent.getStringExtra(SessionService.EXTRA_NOTIFICATION_ACTION)?.let { action ->
+        val sid = intent.getStringExtra(Notifier.EXTRA_SESSION_ID)
+        val action = intent.getStringExtra(SessionService.EXTRA_NOTIFICATION_ACTION)
+        if (action != null) {
+            // 允许/拒绝 answers the pinned session's request in place —
+            // answering from the shade must not teleport into that session.
             val handler = notifActionHandler
-            if (handler != null) handler(action) else pendingNotifAction = action
+            if (handler != null) {
+                handler(action, sid)
+            } else {
+                pendingNotifAction = action
+                pendingNotifActionSession = sid
+            }
+        } else if (sid != null) {
+            // Only a plain notification tap navigates into its session.
+            val handler = notifSessionHandler
+            if (handler != null) handler(sid) else pendingNotifSession = sid
         }
     }
 
-    /** Maps a notification 允许/拒绝 tap onto the pending permission's options. */
-    private fun resolvePermissionFromOptions(vm: ChatViewModel, allow: Boolean) {
-        val pending = vm.pendingPermission.value ?: return
+    /**
+     * Maps a notification 允许/拒绝 tap onto the pending permission's options —
+     * of the session the notification was issued for ([sessionId], null = the
+     * one on screen).
+     */
+    private fun resolvePermissionFromOptions(
+        vm: ChatViewModel,
+        allow: Boolean,
+        sessionId: String? = null,
+    ) {
+        val pending = if (sessionId != null) {
+            vm.pendingPermissionOf(sessionId)
+        } else {
+            vm.pendingPermission.value
+        } ?: return
         // Allow only ever picks allow_once — allow_always is a persistent
         // grant the notification must not hand out silently. Deny prefers
         // reject_once, then reject_always; no match resolves as cancelled.
@@ -187,7 +235,11 @@ class MainActivity : ComponentActivity() {
             pending.options.firstOrNull { it.kind == "reject_once" }
                 ?: pending.options.firstOrNull { it.kind == "reject_always" }
         }
-        vm.resolvePermission(option?.optionId)
+        if (sessionId != null) {
+            vm.resolvePermissionFor(sessionId, option?.optionId)
+        } else {
+            vm.resolvePermission(option?.optionId)
+        }
     }
 
     override fun onStart() {

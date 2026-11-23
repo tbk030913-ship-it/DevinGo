@@ -48,8 +48,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.devingo.app.ChatViewModel
-import com.devingo.app.ChatViewModel.UiState
+import com.devingo.app.UiState
 import com.devingo.app.acp.ConfigOption
 import com.devingo.app.acp.SessionMode
 import com.devingo.app.acp.SessionModel

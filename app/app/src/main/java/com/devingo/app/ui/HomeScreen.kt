@@ -63,6 +63,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatViewModel
+import com.devingo.app.OpenTarget
+import com.devingo.app.Phase
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
 import com.devingo.app.acp.fetchBridgeHealth
@@ -72,18 +74,12 @@ import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.QrCode01
 import me.rerere.hugeicons.stroke.Settings02
-
-/** What AppShell asks Home to do when the user picks a session/new session. */
-data class PendingConnect(
-    val resumeId: String?,
-    val cwd: String?,
-    val sessionId: String?,
-)
 
 /** A swipe-deleted session waiting on its undo snackbar before committing. */
 internal data class PendingSessionDelete(val session: AcpSession, val index: Int)
@@ -129,7 +125,7 @@ internal fun HomeScreen(
     homeState: HomeState,
     expandedProjects: Set<String>?,
     onExpandedChange: (Set<String>) -> Unit,
-    pendingSwitch: PendingConnect?,
+    openTarget: OpenTarget?,
     onPickSession: (AcpSession) -> Unit,
     onNewSession: () -> Unit,
     onNewSessionCwd: (String?) -> Unit,
@@ -154,10 +150,10 @@ internal fun HomeScreen(
     val tailnetState by TailnetManager.state.collectAsState()
     val tailnetRouted = prefs.tailnetEnabled && TailnetManager.hostNeedsTailnet(host)
     val busy = ui.phase in listOf(
-        ChatViewModel.Phase.Checking,
-        ChatViewModel.Phase.Connecting,
-        ChatViewModel.Phase.Authenticating,
-        ChatViewModel.Phase.StartingSession,
+        Phase.Checking,
+        Phase.Connecting,
+        Phase.Authenticating,
+        Phase.StartingSession,
     )
 
     /** resolveHost failed — tailnet host configured but the node isn't up. */
@@ -216,33 +212,22 @@ internal fun HomeScreen(
                 showTailnetError()
                 return@launch
             }
-            runCatching {
-                // cwd omitted → the bridge returns sessions for all projects.
-                vm.listSessionsOnBridge(resolved, prefs.token.trim(), "")
-            }.onSuccess {
-                homeState.sessions = it
-                sessionsLoading = false
-                pullRefreshing = false
-                lastLoadOk = true
-            }.onFailure { e ->
-                sessionsError = e.message ?: "加载失败"
-                sessionsLoading = false
-                pullRefreshing = false
-                lastLoadOk = false
-            }
+            // The shared `_devingo/sessions` cache fills homeState.sessions
+            // via the collector below; failures land on the same flow.
+            vm.refreshSessions(resolved, prefs.token.trim())
         }
     }
 
     fun commitSessionDelete(s: AcpSession) {
         scope.launch {
             val ok = runCatching {
-                val resolved = try {
+                try {
                     TailnetManager.resolveHost(host)
                 } catch (e: IllegalStateException) {
                     showTailnetError()
                     return@runCatching false
                 }
-                vm.deleteSessionOnBridge(resolved, prefs.token.trim(), s.sessionId)
+                vm.deleteSession(s.sessionId)
             }.getOrDefault(false)
             if (!ok) loadSessions()
         }
@@ -299,6 +284,27 @@ internal fun HomeScreen(
         } else {
             commitSessionDelete(p.session)
         }
+    }
+
+    // The shared `_devingo/sessions` cache is the single source: rows read
+    // it instantly, refreshes land here. Badges come from the same manager.
+    val badges by vm.badges.collectAsState()
+    LaunchedEffect(Unit) {
+        vm.sessions.collect { if (it != null) homeState.sessions = it }
+    }
+    LaunchedEffect(Unit) {
+        combine(vm.sessionsLoading, vm.sessionsError) { l, e -> l to e }
+            .collect { (loading, err) ->
+                sessionsLoading = loading
+                sessionsError = err
+                pullRefreshing = loading && homeState.sessions != null
+                if (!loading) {
+                    lastLoadOk = when {
+                        homeState.sessions == null -> null
+                        else -> err == null
+                    }
+                }
+            }
     }
 
     // Reload when the node reaches Running so a late-starting tailnet doesn't
@@ -491,8 +497,9 @@ internal fun HomeScreen(
                                                 s = sess,
                                                 compact = homeState.compact,
                                                 isCurrent = isCurrent,
-                                                switching = pendingSwitch?.sessionId ==
+                                                switching = openTarget?.sessionId ==
                                                     sess.sessionId,
+                                                badge = badges[sess.sessionId],
                                                 lastSession =
                                                     sess.sessionId == prefs.lastSessionId,
                                                 canDelete = !isCurrent,
@@ -553,11 +560,11 @@ internal fun HomeScreen(
                 // Short phase words only — the long statusText stays in the
                 // floating card above the bar.
                 statusText = when {
-                    pendingSwitch?.resumeId != null -> "正在切换…"
-                    ui.phase == ChatViewModel.Phase.Authenticating -> "登录中…"
-                    ui.phase == ChatViewModel.Phase.StartingSession -> "创建会话…"
-                    ui.phase == ChatViewModel.Phase.Checking ||
-                        ui.phase == ChatViewModel.Phase.Connecting -> "连接中…"
+                    openTarget?.resumeId != null -> "正在切换…"
+                    ui.phase == Phase.Authenticating -> "登录中…"
+                    ui.phase == Phase.StartingSession -> "创建会话…"
+                    ui.phase == Phase.Checking ||
+                        ui.phase == Phase.Connecting -> "连接中…"
                     else -> ""
                 },
                 sortBy = homeState.sortBy,
@@ -572,7 +579,7 @@ internal fun HomeScreen(
                     if (drawerMode) onNewSession() else startConnect()
                 },
                 newSessionLoading = busy ||
-                    (pendingSwitch != null && pendingSwitch.resumeId == null),
+                    (openTarget != null && openTarget?.resumeId == null),
                 modifier = Modifier
                     .fillMaxWidth()
                     .navigationBarsPadding()

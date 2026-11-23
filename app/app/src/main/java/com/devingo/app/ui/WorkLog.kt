@@ -57,9 +57,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.devingo.app.ChatViewModel.ChatItem
-import com.devingo.app.ChatViewModel.Kind
-import com.devingo.app.ChatViewModel.ToolDiff
+import com.devingo.app.ChatItem
+import com.devingo.app.Kind
+import com.devingo.app.ToolDiff
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext

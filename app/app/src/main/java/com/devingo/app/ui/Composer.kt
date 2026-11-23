@@ -89,8 +89,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
 import coil3.compose.AsyncImage
-import com.devingo.app.ChatViewModel
-import com.devingo.app.ChatViewModel.UiState
+import com.devingo.app.ImageAttachment
+import com.devingo.app.QueuedPrompt
+import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -115,14 +116,14 @@ import me.rerere.hugeicons.stroke.Queue01
 internal fun Composer(
     ui: UiState,
     input: String,
-    attachments: List<ChatViewModel.ImageAttachment>,
-    queued: List<ChatViewModel.QueuedPrompt>,
+    attachments: List<ImageAttachment>,
+    queued: List<QueuedPrompt>,
     permissionPending: Boolean,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
     onSteer: () -> Unit,
-    onAttach: (ChatViewModel.ImageAttachment) -> Unit,
-    onRemoveAttachment: (ChatViewModel.ImageAttachment) -> Unit,
+    onAttach: (ImageAttachment) -> Unit,
+    onRemoveAttachment: (ImageAttachment) -> Unit,
     onCancelQueued: (Int) -> Unit,
     onStop: () -> Unit,
 ) {
@@ -452,7 +453,7 @@ internal fun commandMatches(
 /** "排队中 N 条 ›" chip → menu listing queued prompts with remove buttons. */
 @Composable
 private fun QueueChip(
-    queued: List<ChatViewModel.QueuedPrompt>,
+    queued: List<QueuedPrompt>,
     onCancelQueued: (Int) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -507,8 +508,8 @@ private fun QueueChip(
 /** Attachment thumbnails with a remove badge per image. */
 @Composable
 private fun AttachmentStrip(
-    attachments: List<ChatViewModel.ImageAttachment>,
-    onRemoveAttachment: (ChatViewModel.ImageAttachment) -> Unit,
+    attachments: List<ImageAttachment>,
+    onRemoveAttachment: (ImageAttachment) -> Unit,
 ) {
     LazyRow(
         Modifier
@@ -642,7 +643,7 @@ private const val MAX_IMAGE_EDGE = 2048
 private const val IMAGE_QUALITY = 85
 
 /**
- * Read [uri] into a wire-ready [ChatViewModel.ImageAttachment]: a bounds-only
+ * Read [uri] into a wire-ready [ImageAttachment]: a bounds-only
  * pass picks `inSampleSize` so the long edge lands ≤ [MAX_IMAGE_EDGE], EXIF
  * orientation is applied, then the bitmap is encoded JPEG q85 (WebP when it
  * has alpha). Runs on [Dispatchers.IO]; null when the stream can't be read
@@ -651,7 +652,7 @@ private const val IMAGE_QUALITY = 85
 private suspend fun compressImage(
     resolver: ContentResolver,
     uri: Uri,
-): ChatViewModel.ImageAttachment? = withContext(Dispatchers.IO) {
+): ImageAttachment? = withContext(Dispatchers.IO) {
     val raw = runCatching {
         resolver.openInputStream(uri)?.use { it.readBytes() }
     }.getOrNull() ?: return@withContext null
@@ -677,7 +678,7 @@ private suspend fun compressImage(
     val encoded = bitmap.compress(format, IMAGE_QUALITY, out)
     bitmap.recycle()
     if (!encoded) return@withContext null
-    ChatViewModel.ImageAttachment(
+    ImageAttachment(
         out.toByteArray(),
         if (format == Bitmap.CompressFormat.JPEG) "image/jpeg" else "image/webp",
     )

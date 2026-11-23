@@ -66,33 +66,37 @@ class Notifier(context: Context) {
 
     /**
      * Shared gate: "仅在后台时提醒" suppresses posts only while the app is
-     * resumed AND the chat screen is on top — alerts still fire from Home.
+     * resumed AND this session's chat is on top — alerts still fire from
+     * Home or while the user is watching a different session.
      */
-    private fun shouldPost(): Boolean =
+    private fun shouldPost(sessionId: String?): Boolean =
         !prefs.notifyOnlyInBackground ||
-            !(AppVisibility.isForeground && AppVisibility.chatVisible)
+            !(AppVisibility.isForeground && AppVisibility.chatVisible &&
+                AppVisibility.chatSessionId == sessionId)
 
     /** The agent is blocked on a permission decision. */
-    fun notifyPermissionPending(title: String) {
-        if (!prefs.notifyPermission || !shouldPost()) return
+    fun notifyPermissionPending(title: String, sessionId: String? = null) {
+        if (!prefs.notifyPermission || !shouldPost(sessionId)) return
         post(
             channelId = CHANNEL_PERMISSION,
             id = ID_PERMISSION,
             title = "DevinGo 需要授权",
             text = title.ifBlank { "Devin 请求执行操作" },
             priority = NotificationCompat.PRIORITY_HIGH,
+            sessionId = sessionId,
         )
     }
 
     /** A prompt turn finished while the user may not be watching. */
-    fun notifyTurnDone(title: String) {
-        if (!prefs.notifyTurnDone || !shouldPost()) return
+    fun notifyTurnDone(title: String, sessionId: String? = null) {
+        if (!prefs.notifyTurnDone || !shouldPost(sessionId)) return
         post(
             channelId = CHANNEL_TURN,
             id = ID_TURN_DONE,
             title = title.ifBlank { "DevinGo" },
             text = "本轮已完成",
             priority = NotificationCompat.PRIORITY_DEFAULT,
+            sessionId = sessionId,
         )
     }
 
@@ -102,6 +106,7 @@ class Notifier(context: Context) {
         title: String,
         text: String,
         priority: Int,
+        sessionId: String? = null,
     ) {
         if (!canPost()) return
         val notification = NotificationCompat.Builder(appContext, channelId)
@@ -110,15 +115,18 @@ class Notifier(context: Context) {
             .setContentText(text)
             .setAutoCancel(true)
             .setPriority(priority)
-            .setContentIntent(contentIntent())
+            .setContentIntent(contentIntent(sessionId))
             .build()
         runCatching { manager?.notify(id, notification) }
     }
 
-    private fun contentIntent(): PendingIntent = PendingIntent.getActivity(
+    /** Tap → open the session the alert came from. */
+    private fun contentIntent(sessionId: String?): PendingIntent = PendingIntent.getActivity(
         appContext,
         0,
-        Intent(appContext, MainActivity::class.java),
+        Intent(appContext, MainActivity::class.java).apply {
+            if (sessionId != null) putExtra(EXTRA_SESSION_ID, sessionId)
+        },
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
@@ -139,6 +147,8 @@ class Notifier(context: Context) {
         const val CHANNEL_PERMISSION = "devingo.permission"
         const val CHANNEL_TURN = "devingo.turn"
         const val CHANNEL_SESSION = "devingo.session"
+        /** Intent extra carrying the sessionId a notification belongs to. */
+        const val EXTRA_SESSION_ID = "devingo.sessionId"
         const val REQ_POST_NOTIFICATIONS = 4201
         private const val ID_PERMISSION = 1001
         private const val ID_TURN_DONE = 1002

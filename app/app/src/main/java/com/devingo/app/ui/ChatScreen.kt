@@ -1,5 +1,6 @@
 package com.devingo.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -41,8 +42,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,8 +59,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.AppVisibility
 import com.devingo.app.ChatViewModel
-import com.devingo.app.ChatViewModel.Kind
-import com.devingo.app.ChatViewModel.UiState
+import com.devingo.app.Kind
+import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -76,7 +75,6 @@ import me.rerere.hugeicons.stroke.MoreHorizontal
 @Composable
 fun ChatScreen(
     vm: ChatViewModel,
-    sessionCwd: String,
     onOpenDrawer: () -> Unit,
 ) {
     val ui by vm.ui.collectAsState()
@@ -84,55 +82,32 @@ fun ChatScreen(
     val queuedPrompts by vm.queuedPrompts.collectAsState()
     val revertSteps by vm.revertSteps.collectAsState()
     val pendingPermission by vm.pendingPermission.collectAsState()
+    // Draft + per-turn timings live in the session store — they survive
+    // switching away and back, which Compose-local state never did.
+    val input by vm.draft.collectAsState()
+    val attachments by vm.draftAttachments.collectAsState()
+    val turnTimes by vm.turnTimes.collectAsState()
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
-    var input by remember { mutableStateOf("") }
-    var attachments by remember { mutableStateOf<List<ChatViewModel.ImageAttachment>>(emptyList()) }
     var modelSheet by remember { mutableStateOf(false) }
     var infoSheet by remember { mutableStateOf(false) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember { mutableStateMapOf<Long, Boolean>() }
 
-    // Notification alerts stay quiet only while the chat is actually on screen.
-    DisposableEffect(Unit) {
-        AppVisibility.chatVisible = true
-        onDispose { AppVisibility.chatVisible = false }
-    }
+    // Back returns to Home WITHOUT disconnecting — the session's store keeps
+    // streaming and its row shows running/unread badges.
+    BackHandler { vm.leaveSession() }
 
-    // ---- turn timing (UI-local; see spec §C TurnClock) ----------------------
-    val turnTimes = remember { mutableStateOf<Map<Long, TurnTiming>>(emptyMap()) }
-    var prevSize by remember { mutableIntStateOf(0) }
-    var wasRunning by remember { mutableStateOf(false) }
-    LaunchedEffect(messages, ui.running) {
-        val now = System.currentTimeMillis()
-        val bulk = messages.size - prevSize > 10
-        val updates = turnTimes.value.toMutableMap()
-        var changed = false
-        if (!bulk) {
-            messages.filter { it.kind == Kind.User }.forEach { u ->
-                if (u.id !in updates) {
-                    updates[u.id] = TurnTiming(now, null)
-                    changed = true
-                }
-            }
+    // Notification alerts stay quiet only while the chat is actually on
+    // screen — and only for the session that's on screen.
+    DisposableEffect(ui.sessionId) {
+        AppVisibility.chatVisible = true
+        AppVisibility.chatSessionId = ui.sessionId
+        onDispose {
+            AppVisibility.chatVisible = false
+            AppVisibility.chatSessionId = null
         }
-        if (wasRunning && !ui.running) {
-            val lastUser = messages.lastOrNull { it.kind == Kind.User }
-            lastUser?.id?.let { id ->
-                updates[id]?.let { t ->
-                    if (t.end == null) {
-                        updates[id] = t.copy(end = now)
-                        changed = true
-                    }
-                }
-            }
-        }
-        // Streaming flushes re-run this effect constantly; only publish a new
-        // map when a timing actually changed.
-        if (changed) turnTimes.value = updates
-        prevSize = messages.size
-        wasRunning = ui.running
     }
 
     val cs = MaterialTheme.colorScheme
@@ -185,7 +160,7 @@ fun ChatScreen(
                     messages = messages,
                     ui = ui,
                     pendingPermission = pendingPermission,
-                    timings = turnTimes.value,
+                    timings = turnTimes,
                     expandedWork = expandedWork,
                     onToggleWork = { key ->
                         expandedWork[key] = expandedWork[key] != true
@@ -233,7 +208,7 @@ fun ChatScreen(
             exit = fadeOut() + androidx.compose.animation.shrinkVertically(),
         ) {
             ComposerPopup {
-                CommandSuggestions(ui, input) { input = it }
+                CommandSuggestions(ui, input) { vm.setDraft(it) }
             }
         }
         // Inline permission card takes the popup slot above the composer.
@@ -252,20 +227,20 @@ fun ChatScreen(
             attachments = attachments,
             queued = queuedPrompts,
             permissionPending = pendingPermission != null,
-            onInputChange = { input = it },
+            onInputChange = vm::setDraft,
             onSend = {
                 if (vm.send(input, attachments)) {
                     haptic.performHapticFeedback(HapticFeedbackType.Confirm)
-                    input = ""
-                    attachments = emptyList()
+                    vm.setDraft("")
+                    vm.setDraftAttachments(emptyList())
                 }
             },
             onSteer = {
                 vm.steer(input)
-                input = ""
+                vm.setDraft("")
             },
-            onAttach = { attachments = attachments + it },
-            onRemoveAttachment = { attachments = attachments - it },
+            onAttach = { vm.setDraftAttachments(attachments + it) },
+            onRemoveAttachment = { vm.setDraftAttachments(attachments - it) },
             onCancelQueued = vm::cancelQueued,
             onStop = vm::cancelTurn,
         )
@@ -280,7 +255,7 @@ fun ChatScreen(
         )
     }
     if (infoSheet) {
-        SessionInfoSheet(ui, sessionCwd, onDismiss = { infoSheet = false })
+        SessionInfoSheet(ui, vm.boundCwd, onDismiss = { infoSheet = false })
     }
     if (revertSteps != null) {
         RevertSheet(
@@ -387,7 +362,7 @@ private fun ChatTopBar(
                         })
                         DevinMenuDivider()
                         DevinMenuItem(
-                            "断开连接",
+                            "清除会话状态",
                             onClick = {
                                 menuOpen = false
                                 onDisconnect()

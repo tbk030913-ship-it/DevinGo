@@ -224,6 +224,31 @@ data class AcpSession(
     val planFilePath: String? = null,
     val hasUserMessages: Boolean = false,
     val lastActivity: String? = null,
+    /** Hub overlay on `_devingo/sessions`: a turn is in flight. */
+    val running: Boolean = false,
+    /** Hub overlay on `_devingo/sessions`: an approval is unanswered. */
+    val pendingPermission: Boolean = false,
+)
+
+/** `_devingo/attach` result (gateway-private; see bridge/hub.go). */
+@Serializable
+data class AttachResult(
+    val sessionId: String = "",
+    /**
+     * True when the journal no longer reaches the requested `afterSeq`
+     * (truncated ring, or the session isn't hosted) — the caller must fall
+     * back to `session/load`.
+     */
+    val needLoad: Boolean = false,
+    /** Hub-side truth: a turn is believed in flight right now. */
+    val running: Boolean = false,
+    /** Journal high-water mark at attach time — replay frames carry `_seq`s
+     * up to here; anything above is live. */
+    val lastSeq: Long = 0,
+    /** An approval is still pending; its request re-delivers after attach. */
+    val pendingPermission: Boolean = false,
+    /** The session's last `session/new`/`session/load` result, when cached. */
+    val session: SessionNewResult? = null,
 )
 
 @Serializable
