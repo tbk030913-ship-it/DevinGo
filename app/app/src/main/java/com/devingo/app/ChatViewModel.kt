@@ -1,6 +1,7 @@
 package com.devingo.app
 
 import android.app.Application
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import android.util.Base64
@@ -78,6 +79,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     enum class Kind { User, Agent, Thought, Tool, Plan, System, Error }
 
+    @Immutable
     data class ChatItem(
         val id: Long,
         val kind: Kind,
@@ -105,6 +107,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** One `diff` content item of a tool call: unified old/new file text. */
     data class ToolDiff(val path: String, val oldText: String?, val newText: String)
 
+    @Immutable
     data class PendingPermission(
         val toolCall: ToolCallInfo,
         val options: List<PermissionOption>,

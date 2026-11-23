@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -85,7 +86,25 @@ data class PendingConnect(
 )
 
 /** A swipe-deleted session waiting on its undo snackbar before committing. */
-private data class PendingSessionDelete(val session: AcpSession, val index: Int)
+internal data class PendingSessionDelete(val session: AcpSession, val index: Int)
+
+/**
+ * Home state owned by AppShell so it survives HomeScreen leaving composition
+ * (the drawer drops its content while closed; full-screen Home while a
+ * session is open). A reopen renders the cached list instantly while the
+ * fresh composition's load refreshes it in the background, and an
+ * interrupted delete-undo snackbar re-arms instead of dropping the delete.
+ */
+internal class HomeState {
+    var sessions by mutableStateOf<List<AcpSession>?>(null)
+    var pendingDeletes by mutableStateOf(listOf<PendingSessionDelete>())
+    var sortBy by mutableStateOf(HomeSort.Recent)
+    var hideEmpty by mutableStateOf(false)
+    var compact by mutableStateOf(false)
+    var query by mutableStateOf("")
+    var searchOpen by mutableStateOf(false)
+    val listState = LazyListState()
+}
 
 /** Sessions bucketed under one project (canonical cwd) for §A grouping. */
 internal data class ProjectGroup(
@@ -103,16 +122,13 @@ internal data class ProjectGroup(
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(
+internal fun HomeScreen(
     vm: ChatViewModel,
     prefs: Prefs,
     drawerMode: Boolean,
+    homeState: HomeState,
     expandedProjects: Set<String>?,
     onExpandedChange: (Set<String>) -> Unit,
-    // Bumped by the shell each time the drawer opens so the list refreshes;
-    // the drawer content stays composed while closed, so LaunchedEffect keys
-    // alone would not refire.
-    reloadTick: Int = 0,
     pendingSwitch: PendingConnect?,
     onPickSession: (AcpSession) -> Unit,
     onNewSession: () -> Unit,
@@ -123,23 +139,14 @@ fun HomeScreen(
     val scope = rememberCoroutineScope()
     val cs = MaterialTheme.colorScheme
 
-    var sessions by remember { mutableStateOf<List<AcpSession>?>(null) }
     var sessionsLoading by remember { mutableStateOf(false) }
     var sessionsError by remember { mutableStateOf<String?>(null) }
     var lastLoadOk by remember { mutableStateOf<Boolean?>(null) }
     var pullRefreshing by remember { mutableStateOf(false) }
-    var sortBy by remember { mutableStateOf(HomeSort.Recent) }
-    var hideEmpty by remember { mutableStateOf(false) }
-    var compact by remember { mutableStateOf(false) }
-    var query by remember { mutableStateOf("") }
-    var searchOpen by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var pairOpen by remember { mutableStateOf(false) }
     var filterMenu by remember { mutableStateOf<HomeFilterPage?>(null) }
     var showAllGroups by remember { mutableStateOf(setOf<String>()) }
-    var pendingDeletes by remember {
-        mutableStateOf<List<PendingSessionDelete>>(emptyList())
-    }
     val snackbarHostState = remember { SnackbarHostState() }
 
     val host = prefs.host.trim()
@@ -190,10 +197,10 @@ fun HomeScreen(
     fun loadSessions() {
         sessionsError = null
         sessionsLoading = true
-        pullRefreshing = sessions != null
+        pullRefreshing = homeState.sessions != null
         scope.launch {
             if (host.isEmpty()) {
-                sessions = emptyList()
+                homeState.sessions = emptyList()
                 sessionsLoading = false
                 lastLoadOk = null
                 pullRefreshing = false
@@ -213,7 +220,7 @@ fun HomeScreen(
                 // cwd omitted → the bridge returns sessions for all projects.
                 vm.listSessionsOnBridge(resolved, prefs.token.trim(), "")
             }.onSuccess {
-                sessions = it
+                homeState.sessions = it
                 sessionsLoading = false
                 pullRefreshing = false
                 lastLoadOk = true
@@ -272,16 +279,19 @@ fun HomeScreen(
     }
 
     fun removeSessionLocal(s: AcpSession) {
-        val idx = sessions?.indexOfFirst { it.sessionId == s.sessionId }
+        val idx = homeState.sessions?.indexOfFirst { it.sessionId == s.sessionId }
             ?.coerceAtLeast(0) ?: 0
-        sessions = sessions?.filterNot { it.sessionId == s.sessionId }
-        pendingDeletes = pendingDeletes + PendingSessionDelete(s, idx)
+        homeState.sessions = homeState.sessions?.filterNot {
+            it.sessionId == s.sessionId
+        }
+        homeState.pendingDeletes = homeState.pendingDeletes +
+            PendingSessionDelete(s, idx)
     }
 
     fun settleDelete(p: PendingSessionDelete, undone: Boolean) {
-        pendingDeletes = pendingDeletes - p
+        homeState.pendingDeletes = homeState.pendingDeletes - p
         if (undone) {
-            sessions = sessions?.let { list ->
+            homeState.sessions = homeState.sessions?.let { list ->
                 list.toMutableList().apply {
                     add(p.index.coerceIn(0, size), p.session)
                 }
@@ -294,9 +304,11 @@ fun HomeScreen(
     // Reload when the node reaches Running so a late-starting tailnet doesn't
     // leave the list stuck on "Tailscale 未连接".
     val tailnetReady = tailnetRouted && tailnetState is TailnetState.Running
-    LaunchedEffect(host, reloadTick, tailnetReady) { loadSessions() }
-    LaunchedEffect(pendingDeletes.firstOrNull()?.session?.sessionId) {
-        val head = pendingDeletes.firstOrNull() ?: return@LaunchedEffect
+    // Fresh composition (each drawer open) refires this; it also re-runs
+    // in place if host changes or the tailnet node comes up while open.
+    LaunchedEffect(host, tailnetReady) { loadSessions() }
+    LaunchedEffect(homeState.pendingDeletes.firstOrNull()?.session?.sessionId) {
+        val head = homeState.pendingDeletes.firstOrNull() ?: return@LaunchedEffect
         val result = snackbarHostState.showSnackbar(
             message = "已删除会话",
             actionLabel = "撤销",
@@ -328,16 +340,19 @@ fun HomeScreen(
 
     // Filter + sort the flat session list first; grouping then buckets it
     // while preserving both orders (groups order by latest activity).
-    val visible = remember(sessions, query, hideEmpty, sortBy) {
-        sessions.orEmpty()
+    val visible = remember(
+        homeState.sessions, homeState.query, homeState.hideEmpty, homeState.sortBy,
+    ) {
+        homeState.sessions.orEmpty()
             .filter { s ->
-                (!hideEmpty || s.hasUserMessages || !s.title.isNullOrBlank()) &&
-                    (query.isBlank() ||
-                        s.title.orEmpty().contains(query, true) ||
-                        s.sessionId.contains(query, true))
+                (!homeState.hideEmpty ||
+                    s.hasUserMessages || !s.title.isNullOrBlank()) &&
+                    (homeState.query.isBlank() ||
+                        s.title.orEmpty().contains(homeState.query, true) ||
+                        s.sessionId.contains(homeState.query, true))
             }
             .sortedWith(
-                if (sortBy == HomeSort.Title) {
+                if (homeState.sortBy == HomeSort.Title) {
                     compareBy { it.title.orEmpty().lowercase() }
                 } else {
                     compareByDescending { it.lastActivity.orEmpty() }
@@ -371,7 +386,7 @@ fun HomeScreen(
             ?.let { keys += it.key }
         keys
     }
-    val effectiveExpanded = if (query.isNotBlank()) {
+    val effectiveExpanded = if (homeState.query.isNotBlank()) {
         groups.map { it.key }.toSet()
     } else {
         expandedProjects ?: defaultExpanded
@@ -396,19 +411,19 @@ fun HomeScreen(
                 configured = configured,
                 lastLoadOk = lastLoadOk,
                 tailnet = tailnetState.takeIf { tailnetRouted },
-                searchOpen = searchOpen,
-                query = query,
-                onToggleSearch = { searchOpen = !searchOpen },
-                onQueryChange = { query = it },
+                searchOpen = homeState.searchOpen,
+                query = homeState.query,
+                onToggleSearch = { homeState.searchOpen = !homeState.searchOpen },
+                onQueryChange = { homeState.query = it },
                 onScanPair = { pairOpen = true },
                 onOpenSettings = { settingsOpen = true },
             )
             // Session list states.
             val state = when {
                 !configured -> "notConfigured"
-                sessions == null && sessionsLoading -> "loading"
-                sessionsError != null && sessions.isNullOrEmpty() -> "error"
-                sessions?.isEmpty() == true -> "empty"
+                homeState.sessions == null && sessionsLoading -> "loading"
+                sessionsError != null && homeState.sessions.isNullOrEmpty() -> "error"
+                homeState.sessions?.isEmpty() == true -> "empty"
                 visible.isEmpty() -> "noMatch"
                 else -> "list"
             }
@@ -436,6 +451,7 @@ fun HomeScreen(
                         modifier = Modifier.fillMaxSize(),
                     ) {
                         LazyColumn(
+                            state = homeState.listState,
                             modifier = Modifier.fillMaxSize(),
                             contentPadding = PaddingValues(
                                 start = 8.dp, end = 8.dp, top = 4.dp, bottom = 96.dp,
@@ -473,7 +489,7 @@ fun HomeScreen(
                                                 sess.sessionId == ui.sessionId
                                             SessionRow(
                                                 s = sess,
-                                                compact = compact,
+                                                compact = homeState.compact,
                                                 isCurrent = isCurrent,
                                                 switching = pendingSwitch?.sessionId ==
                                                     sess.sessionId,
@@ -544,14 +560,14 @@ fun HomeScreen(
                         ui.phase == ChatViewModel.Phase.Connecting -> "连接中…"
                     else -> ""
                 },
-                sortBy = sortBy,
-                hideEmpty = hideEmpty,
-                compact = compact,
+                sortBy = homeState.sortBy,
+                hideEmpty = homeState.hideEmpty,
+                compact = homeState.compact,
                 filterPage = filterMenu,
                 onFilterPage = { filterMenu = it },
-                onSort = { sortBy = it },
-                onHideEmpty = { hideEmpty = it },
-                onCompact = { compact = it },
+                onSort = { homeState.sortBy = it },
+                onHideEmpty = { homeState.hideEmpty = it },
+                onCompact = { homeState.compact = it },
                 onNewSession = {
                     if (drawerMode) onNewSession() else startConnect()
                 },

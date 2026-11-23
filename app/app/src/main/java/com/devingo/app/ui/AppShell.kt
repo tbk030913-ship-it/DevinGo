@@ -22,7 +22,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,10 +51,13 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     var pendingSwitch by remember { mutableStateOf<PendingConnect?>(null) }
     // Shared with both Home surfaces so the drawer lists the same project
-    // groups the user expanded on full-screen Home; reloadTick refreshes the
-    // drawer list each time it opens (its content stays composed while closed).
+    // groups the user expanded on full-screen Home. homeState keeps the
+    // list cache + display prefs alive while HomeScreen is uncomposed —
+    // the drawer drops its content while closed (see below), so without it
+    // every open cold-started on a skeleton; a fresh composition refreshes
+    // in the background behind the cached rows.
     var expandedProjects by remember { mutableStateOf(prefs.expandedProjects) }
-    var drawerOpenCount by remember { mutableIntStateOf(0) }
+    val homeState = remember { HomeState() }
 
     // Session switching / new session while one is open: the old socket can
     // take ~2s to die asynchronously and would kill a fresh connection, so
@@ -106,30 +108,44 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                         drawerShape = androidx.compose.ui.graphics.RectangleShape,
                         drawerContentColor = MaterialTheme.colorScheme.onSurface,
                     ) {
-                        HomeScreen(
-                            vm = vm,
-                            prefs = prefs,
-                            drawerMode = true,
-                            expandedProjects = expandedProjects,
-                            onExpandedChange = {
-                                expandedProjects = it
-                                prefs.expandedProjects = it
-                            },
-                            reloadTick = drawerOpenCount,
-                            pendingSwitch = pendingSwitch,
-                            onPickSession = { s: AcpSession ->
-                                scope.launch { drawerState.close() }
-                                switchSession(s.sessionId, s.cwd, s.sessionId)
-                            },
-                            onNewSession = {
-                                scope.launch { drawerState.close() }
-                                switchSession(null, null, null)
-                            },
-                            onNewSessionCwd = { cwd ->
-                                scope.launch { drawerState.close() }
-                                switchSession(null, cwd, null)
-                            },
-                        )
+                        // Compose Home only while the sheet is open or
+                        // animating/dragging (targetValue flips to Open as
+                        // soon as an open starts; currentValue stays Open
+                        // until a close settles). A closed drawer is an
+                        // empty placeholder off-screen, so streaming chunks
+                        // never recompose the session list under it. The
+                        // gate relies on gesturesEnabled = isOpen above:
+                        // opens are programmatic only. If edge-swipe-to-open
+                        // is ever enabled, a sub-threshold drag would make
+                        // the partially slid-out sheet render empty.
+                        if (drawerState.currentValue == DrawerValue.Open ||
+                            drawerState.targetValue == DrawerValue.Open
+                        ) {
+                            HomeScreen(
+                                vm = vm,
+                                prefs = prefs,
+                                drawerMode = true,
+                                homeState = homeState,
+                                expandedProjects = expandedProjects,
+                                onExpandedChange = {
+                                    expandedProjects = it
+                                    prefs.expandedProjects = it
+                                },
+                                pendingSwitch = pendingSwitch,
+                                onPickSession = { s: AcpSession ->
+                                    scope.launch { drawerState.close() }
+                                    switchSession(s.sessionId, s.cwd, s.sessionId)
+                                },
+                                onNewSession = {
+                                    scope.launch { drawerState.close() }
+                                    switchSession(null, null, null)
+                                },
+                                onNewSessionCwd = { cwd ->
+                                    scope.launch { drawerState.close() }
+                                    switchSession(null, cwd, null)
+                                },
+                            )
+                        }
                     }
                 },
             ) {
@@ -137,7 +153,6 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                     vm = vm,
                     sessionCwd = prefs.lastSessionCwd,
                     onOpenDrawer = {
-                        drawerOpenCount += 1
                         scope.launch { drawerState.open() }
                     },
                 )
@@ -147,6 +162,7 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                 vm = vm,
                 prefs = prefs,
                 drawerMode = false,
+                homeState = homeState,
                 expandedProjects = expandedProjects,
                 onExpandedChange = {
                     expandedProjects = it

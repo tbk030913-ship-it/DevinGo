@@ -406,7 +406,18 @@ private fun DiffBody(diff: ToolDiff, memoKey: Long) {
             computeDiffRows(diff.oldText, diff.newText)
         }
     }
-    val all = rows ?: return
+    val all = rows
+    if (all == null) {
+        // Line-count placeholder while the LCS runs off the main thread.
+        val lines = remember(diff.newText) { diff.newText.lineSequence().count() }
+        Text(
+            "差异计算中 · $lines 行",
+            style = MaterialTheme.typography.labelMedium,
+            color = cs.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        )
+        return
+    }
     val display = remember(all) { hunkRows(all) }
     var expanded by remember(memoKey, diff.path) { mutableStateOf(false) }
     val shown = if (expanded) {

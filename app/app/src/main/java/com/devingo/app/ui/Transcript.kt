@@ -3,9 +3,7 @@ package com.devingo.app.ui
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
-import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -15,14 +13,12 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -36,7 +32,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Icon
@@ -44,10 +39,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -55,14 +50,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatViewModel
 import com.devingo.app.ChatViewModel.ChatItem
@@ -73,7 +64,6 @@ import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronRight
-import me.rerere.hugeicons.stroke.File01
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
 internal fun formatTokens(n: Long): String = when {
@@ -82,12 +72,24 @@ internal fun formatTokens(n: Long): String = when {
     else -> n.toString()
 }
 
-/** One conversation turn: optional user bubble + ordered non-user body. */
+/**
+ * One conversation turn: optional user bubble + ordered non-user body.
+ * Work items + stats are baked in at [buildTurns] time so lazy rows never
+ * re-derive them on every recomposition.
+ */
+@Immutable
 internal data class Turn(
     val key: Long,
     val user: ChatItem?,
     val body: List<ChatItem>,
-)
+    /** Thought/Tool items collapsed under the WorkRow — never render inline. */
+    val work: List<ChatItem>,
+    /** Failed tool calls — the WorkRow's "· N 个失败" badge. */
+    val failed: Int,
+) {
+    /** Turn-level +A/−R over all work diffs; computed once on first render. */
+    val diffStats: Pair<Int, Int> by lazy { workDiffStats(work) }
+}
 
 /** Pure O(n) turn split at every Kind.User boundary. */
 internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
@@ -96,10 +98,14 @@ internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
     var body = mutableListOf<ChatItem>()
     fun flush() {
         if (user != null || body.isNotEmpty()) {
+            val work =
+                body.filter { it.kind == Kind.Thought || it.kind == Kind.Tool }
             turns += Turn(
                 user?.id ?: body.firstOrNull()?.id ?: 0L,
                 user,
                 body.toList(),
+                work,
+                failedCount(work),
             )
         }
         body = mutableListOf()
@@ -117,15 +123,13 @@ internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
 }
 
 /** Per-turn timing captured in ChatScreen (UI-local, no VM change). */
+@Immutable
 internal data class TurnTiming(val start: Long?, val end: Long?) {
     val durationSec: Long?
         get() = if (start != null && end != null && end > start) {
             (end - start) / 1000
         } else null
 }
-
-private fun workItemsOf(turn: Turn): List<ChatItem> =
-    turn.body.filter { it.kind == Kind.Thought || it.kind == Kind.Tool }
 
 private fun failedCount(items: List<ChatItem>): Int =
     items.count { it.kind == Kind.Tool && it.status == "failed" }
@@ -159,9 +163,8 @@ internal fun Transcript(
         buildList {
             if (messages.isNotEmpty()) add(RowKind.Status)
             turns.asReversed().forEachIndexed { revIdx, turn ->
-                val work = workItemsOf(turn)
                 val isLast = revIdx == 0
-                if (work.isNotEmpty() || (isLast && ui.running)) {
+                if (turn.work.isNotEmpty() || (isLast && ui.running)) {
                     add(RowKind.Work(turn.key, isLast && ui.running))
                 }
                 turn.body.asReversed().forEach { item ->
@@ -213,7 +216,9 @@ internal fun Transcript(
                 Modifier
                     .animateItem(
                         fadeInSpec = tween(180),
-                        placementSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                        // No spring repositioning: during streaming a new row
+                        // would bounce the whole transcript every flush.
+                        placementSpec = null,
                         fadeOutSpec = tween(120),
                     )
                     .fillMaxWidth(),
@@ -234,21 +239,17 @@ internal fun Transcript(
                             val m = itemById[row.itemId] ?: return@items
                             BodyItem(
                                 m,
-                                ui,
                                 streaming = ui.running && m.id == lastItemId &&
                                     m.kind == Kind.Agent,
                             )
                         }
                         is RowKind.Work -> {
                             val turn = turnByKey[row.turnKey] ?: return@items
-                            val work = workItemsOf(turn)
                             val timing = timings[turn.user?.id ?: turn.key]
                             WorkRow(
-                                items = work,
+                                turn = turn,
                                 live = row.live,
                                 timing = timing,
-                                turnKey = turn.key,
-                                startedAt = timing?.start ?: 0L,
                                 expanded = expandedWork[turn.key] == true,
                                 onToggle = { onToggleWork(turn.key) },
                             )
@@ -331,18 +332,18 @@ private fun StatusLine(ui: UiState, pendingPermission: PendingPermission?) {
  */
 @Composable
 private fun WorkRow(
-    items: List<ChatItem>,
+    turn: Turn,
     live: Boolean,
     timing: TurnTiming?,
-    turnKey: Long,
-    startedAt: Long,
     expanded: Boolean,
     onToggle: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
-    val failed = failedCount(items)
-    val (diffAdd, diffDel) = remember(items) { workDiffStats(items) }
+    val items = turn.work
+    val failed = turn.failed
+    val (diffAdd, diffDel) = turn.diffStats
+    val startedAt = timing?.start ?: 0L
     // Live elapsed seconds — ticks once per second while this row is live.
     // Seed from startedAt so a re-composed row never flashes 0:00.
     var elapsed by remember(live, startedAt) {
@@ -469,7 +470,6 @@ private fun WorkRow(
 @Composable
 private fun BodyItem(
     m: ChatItem,
-    ui: UiState,
     streaming: Boolean = false,
     modifier: Modifier = Modifier,
 ) {

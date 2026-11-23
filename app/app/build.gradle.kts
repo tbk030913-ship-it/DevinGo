@@ -98,6 +98,15 @@ kotlin {
     }
 }
 
+// Stability allow-list in place of kotlinx-collections-immutable: every
+// List/Map/Set handed to a composable here is a replaced snapshot, never
+// mutated in place.
+composeCompiler {
+    stabilityConfigurationFiles.add(
+        layout.projectDirectory.file("stability_config.conf"),
+    )
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
