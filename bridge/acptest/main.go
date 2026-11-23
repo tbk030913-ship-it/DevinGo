@@ -91,6 +91,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "done")
+	conn.SetReadLimit(8 << 20) // match the app's unbounded reads; 32KiB default kills real turns
 
 	read := make(chan rpcMsg, 256)
 	go func() {

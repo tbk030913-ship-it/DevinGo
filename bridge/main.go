@@ -1,17 +1,17 @@
-// Command devingo-bridge relays ACP (Agent Client Protocol) JSON-RPC messages
-// between WebSocket clients and a local `devin acp` subprocess over stdio.
+// Command devingo-bridge hosts ACP (Agent Client Protocol) sessions between
+// WebSocket clients and ONE resident `devin acp` subprocess over stdio:
 //
-// Each WebSocket connection to /acp spawns its own `devin acp` process:
+//	Android app(s) --WS text frames--> bridge --stdin--> devin acp
+//	Android app(s) <--WS text frames-- bridge <--stdout-- devin acp
 //
-//	Android app --WS text frames--> bridge --stdin--> devin acp
-//	Android app <--WS text frames-- bridge <--stdout-- devin acp
-//
-// ACP over stdio is newline-delimited JSON, so the bridge simply maps one
-// WS text message to one stdin line and vice versa.
+// The bridge's Hub (hub.go) owns the process, journals every session's
+// events into a sequence-numbered ring buffer, and fans frames out to
+// subscribed clients — so a dropped phone reconnects and catches up without
+// losing the running turn. Plain-ACP clients are unaffected: initialize is
+// answered from the gateway's cache and ids are transparently rewritten.
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -47,25 +47,28 @@ var (
 	uninstall  = flag.Bool("uninstall", false, "remove the logon scheduled task, then exit")
 	model      = flag.String("model", os.Getenv("DEVIN_MODEL"), "default model for new ACP sessions (devin acp --model / DEVIN_MODEL)")
 	devinKey   = flag.String("devinkey", os.Getenv("DEVIN_API_KEY"), "api key injected into ACP `authenticate` for spawned devin processes; default reads windsurf_api_key from devin's credentials.toml")
+	idleTTL    = flag.Duration("idle-ttl", 10*time.Minute, "grace period a session with no subscribers/running work/pending approvals stays hosted before the hub releases it")
+	permTTL    = flag.Duration("perm-ttl", 30*time.Minute, "how long an unanswered agent permission request stays pending before the gateway cancels it")
 )
 
 const (
-	// maxActiveConns caps concurrent /acp sessions: each one spawns a
-	// `devin acp` process, so unbounded concurrency would let clients
-	// fork-bomb the host.
+	// maxActiveConns caps concurrent /acp WebSocket connections.
 	maxActiveConns = 8
 	// wsReadLimit bounds a single inbound WS message. ACP payloads
 	// (session transcripts, file contents) exceed the 32KiB default.
 	wsReadLimit = 4 << 20
 	// wsPingInterval/wsPingTimeout detect half-open TCP connections: a
-	// sleeping phone leaves the socket dead but unclosed, which would
-	// otherwise wedge devin's stdout once the pipe buffer fills.
+	// sleeping phone leaves the socket dead but unclosed.
 	wsPingInterval = 25 * time.Second
 	wsPingTimeout  = 10 * time.Second
-	// orphanReapDelay bounds how long an oversized-message connection
-	// leaves its devin process alive for a possible client reconnect.
+	// orphanReapDelay is the shortened idle grace for sessions orphaned by
+	// an oversized inbound frame (B2): long enough for a re-attach, short
+	// enough that a poisoned transcript doesn't linger.
 	orphanReapDelay = 5 * time.Minute
 )
+
+// bridgeHub is the process-wide session hub (swapped out wholesale in tests).
+var bridgeHub = newHub()
 
 var activeConns atomic.Int64
 
@@ -130,9 +133,9 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "DevinGo bridge")
 		fmt.Fprintln(w, "  GET /healthz   - bridge + devin status")
-		fmt.Fprintln(w, "  GET /sessions  - session list (`devin list --format json`)")
+		fmt.Fprintln(w, "  GET /sessions  - session list (via resident devin acp)")
 		fmt.Fprintln(w, "  GET /models    - model list (`devin models list --format json`)")
-		fmt.Fprintln(w, "  WS  /acp       - ACP JSON-RPC relay")
+		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
 
 	printBanner()
@@ -217,9 +220,17 @@ func resolveVersionedDevin() string {
 		return ""
 	}
 	var newest string
+	var newestVer []int
 	for _, e := range entries {
-		if e.IsDir() && e.Name() > newest {
-			newest = e.Name()
+		if !e.IsDir() {
+			continue
+		}
+		v, ok := parseDevinVersion(e.Name())
+		if !ok {
+			continue // not a version dir (stray folder, differently-named dir)
+		}
+		if newestVer == nil || compareDevinVersion(v, newestVer) > 0 {
+			newest, newestVer = e.Name(), v
 		}
 	}
 	if newest == "" {
@@ -230,6 +241,33 @@ func resolveVersionedDevin() string {
 		return ""
 	}
 	return exe
+}
+
+// parseDevinVersion splits "3000.12.57"-style directory names into numeric
+// components. Lexical name compare would rank "3000.12.100" below
+// "3000.12.57" — the components must compare numerically.
+func parseDevinVersion(name string) ([]int, bool) {
+	segs := strings.Split(name, ".")
+	parts := make([]int, len(segs))
+	for i, seg := range segs {
+		n, err := strconv.Atoi(seg)
+		if err != nil {
+			return nil, false
+		}
+		parts[i] = n
+	}
+	return parts, true
+}
+
+// compareDevinVersion orders two parsed versions component-wise; a longer
+// version wins ties (1.2.0 > 1.2).
+func compareDevinVersion(a, b []int) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return len(a) - len(b)
 }
 
 // resolveToken picks the client bearer token: explicit -token/DEVINGO_TOKEN
@@ -410,9 +448,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sessionsHandler proxies `devin list --format json` so the app can show
-// past sessions and offer resume. The cwd query param selects the project
-// directory the CLI scopes the listing to.
+// sessionsHandler serves the session list through the resident `devin acp`
+// process (ACP session/list) — no extra process is spawned just for listing.
+// Entries are translated back into the legacy `devin list` shape the app
+// decodes, with live running/pending flags overlaid from the hub.
 func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if !authorized(r) {
@@ -428,19 +467,34 @@ func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if cwd == "" {
 		cwd = *defaultDir
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	out, err := runDevinOutput(ctx, cwd, "list", "--format", "json")
+	result, err := bridgeHub.callSessionList(cwd)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 		return
 	}
-	trimmed := strings.TrimSpace(string(out))
-	if trimmed == "" {
-		trimmed = "[]"
+	var parsed struct {
+		Sessions []map[string]any `json:"sessions"`
 	}
-	w.Write([]byte(trimmed))
+	if json.Unmarshal(result, &parsed) != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]any{"error": "malformed session/list result"})
+		return
+	}
+	out := make([]map[string]any, 0, len(parsed.Sessions))
+	for _, sm := range parsed.Sessions {
+		sid, _ := sm["sessionId"].(string)
+		running, pendingPerm := bridgeHub.sessionOverlay(sid)
+		out = append(out, map[string]any{
+			"id":                 sid,
+			"working_directory":  sm["cwd"],
+			"title":              sm["title"],
+			"last_activity_ago":  sm["updatedAt"],
+			"running":            running,
+			"pending_permission": pendingPerm,
+		})
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 // modelsHandler proxies `devin models list --format json`. Unlike `devin
@@ -514,8 +568,10 @@ func runDevinOutput(ctx context.Context, dir string, args ...string) ([]byte, er
 	return io.ReadAll(f)
 }
 
-// acpHandler upgrades to WebSocket, spawns `devin acp`, and pipes frames
-// to stdin lines and stdout lines back to frames until either side dies.
+// acpHandler upgrades a connection into a hub Client. Nothing is spawned or
+// killed per connection: the resident devin process and the session
+// journals belong to the hub, so a dropped socket only detaches its
+// subscriptions.
 func acpHandler(w http.ResponseWriter, r *http.Request) {
 	if !authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -526,8 +582,8 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !acquireConn() {
-		log.Printf("acp: rejecting %s: %d/%d sessions active", r.RemoteAddr, activeConns.Load(), maxActiveConns)
-		http.Error(w, "too many concurrent sessions", http.StatusServiceUnavailable)
+		log.Printf("acp: rejecting %s: %d/%d conns active", r.RemoteAddr, activeConns.Load(), maxActiveConns)
+		http.Error(w, "too many concurrent connections", http.StatusServiceUnavailable)
 		return
 	}
 	defer releaseConn()
@@ -543,285 +599,31 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conn.SetReadLimit(wsReadLimit)
-	var closeOnce sync.Once
-	// closeConn is the sole conn.Close wrapper; closeOnce dedups the tail,
-	// the ping watchdog and fail() call sites. fail() runs before any
-	// goroutine starts; after that, close always goes through conn.Close's
-	// handshake and TCP teardown is what unblocks the other goroutines.
-	closeConn := func(code websocket.StatusCode, reason string) {
-		closeOnce.Do(func() { conn.Close(code, reason) })
+
+	client := newClient(bridgeHub, conn, r.Context(), r.RemoteAddr)
+	bridgeHub.addClient(client)
+	done := make(chan struct{})
+	defer close(done)
+	go client.writeLoop()
+	go client.pingLoop(done)
+
+	readErr := client.readLoop()
+	if readErr != nil {
+		log.Printf("client %s read loop ended: %v (close status=%v)",
+			client.id, readErr, websocket.CloseStatus(readErr))
 	}
-
-	acpArgs := []string{"acp"}
-	if *model != "" {
-		acpArgs = append(acpArgs, "--model", *model)
+	reapTTL := time.Duration(0)
+	if errors.Is(readErr, websocket.ErrMessageTooBig) {
+		// The read limit already put a 1009 close on the wire; the session
+		// stays hosted for a reconnect + re-attach (or session/load), then
+		// is reaped on the shorter orphan delay rather than the idle TTL.
+		log.Printf("client %s inbound frame exceeded %d-byte limit; devin acp left running",
+			client.id, wsReadLimit)
+		reapTTL = orphanReapDelay
 	}
-	cmd := exec.Command(*devinBin, acpArgs...)
-	cmd.Dir = *defaultDir
-	cmd.Stderr = &stderrLogger{}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		fail(closeConn, "stdin pipe: %v", err)
-		return
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		fail(closeConn, "stdout pipe: %v", err)
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		fail(closeConn, "start %s acp: %v", *devinBin, err)
-		return
-	}
-	pid := cmd.Process.Pid
-	log.Printf("[%d] devin acp started for %s", pid, r.RemoteAddr)
-	// oversized marks a connection torn down by an inbound frame over the
-	// read limit: the socket is finished but the agent is not, so the
-	// process is left running (and un-reaped) for the client to re-attach.
-	var oversized atomic.Bool
-	defer func() {
-		if !oversized.Load() {
-			killProcessTree(cmd)
-			log.Printf("[%d] devin acp stopped", pid)
-		}
-	}()
-
-	// Everything below races to finish; first failure wins and tears down
-	// the connection and the subprocess.
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	// exitVerdict reports how `devin acp` exited: "" = expected teardown
-	// (we killed it after ctx was cancelled), anything else = it died on
-	// its own while the session was still live, with the reason.
-	exitVerdict := make(chan string, 1)
-
-	// auto-auth state: once the client's initialize request is seen the gate
-	// arms; the injected authenticate resolves it. Client frames wait on
-	// authDone while armed so session/new can't race past the auth reply.
-	var stdinMu sync.Mutex
-	authGate := make(chan struct{})
-	var gateOpen sync.Once
-	var initID atomic.Value // json.RawMessage of the client's initialize id
-	var gateArmed atomic.Bool
-	apiKey := devinCredentialsKey()
-	closeGate := func() {
-		gateArmed.Store(false)
-		gateOpen.Do(func() { close(authGate) })
-	}
-	if apiKey == "" {
-		closeGate() // nothing to inject; never gate
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(4)
-
-	// devin stdout -> WebSocket
-	go func() {
-		defer wg.Done()
-		br := bufio.NewReaderSize(stdout, 1<<20)
-		for {
-			line, err := br.ReadBytes('\n')
-			trimmed := strings.TrimRight(string(line), "\r\n")
-			if trimmed != "" {
-				bline := []byte(trimmed)
-				head := rpcParse(bline)
-				if len(head.ID) > 0 {
-					id := string(head.ID)
-					if id == bridgeAuthID {
-						// The injected authenticate's reply: swallow it
-						// and release queued client frames.
-						log.Printf("[%d] devin auth injected: %s", pid, trimmed[:min(len(trimmed), 160)])
-						closeGate()
-						gateArmed.Store(false)
-						if err == nil {
-							continue
-						}
-					} else if v := initID.Load(); v != nil && id == string(v.(json.RawMessage)) {
-						// The initialize response just went through —
-						// inject authenticate unless devin asks for none.
-						if apiKey != "" && len(head.Result.AuthMethods) > 0 {
-							msg := authRequestLine(apiKey)
-							stdinMu.Lock()
-							_, werr := io.WriteString(stdin, string(msg)+"\n")
-							stdinMu.Unlock()
-							if werr != nil {
-								closeGate()
-							} else {
-								time.AfterFunc(30*time.Second, closeGate) // fail-open
-							}
-						} else {
-							closeGate()
-						}
-					}
-				}
-				// conn ops run on r.Context(), not the session ctx: a
-				// session-ctx op's timeout would hard-drop the TCP
-				// connection on cancel() and no close frame could
-				// reach the client afterwards.
-				if werr := conn.Write(r.Context(), websocket.MessageText, bline); werr != nil {
-					cancel()
-					return
-				}
-			}
-			if err != nil {
-				// stdout EOF means devin is exiting; do NOT cancel
-				// here — the wait goroutine must see whether ctx was
-				// still live at process death to classify the exit.
-				return
-			}
-		}
-	}()
-
-	// WebSocket -> devin stdin
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		for {
-			typ, data, err := conn.Read(r.Context())
-			if err != nil {
-				// A frame over the read limit already put a 1009 close
-				// ("read limited at N bytes") on the wire; flag it so the
-				// teardown below keeps devin alive instead of killing the
-				// session for one bad message.
-				if errors.Is(err, websocket.ErrMessageTooBig) {
-					oversized.Store(true)
-				}
-				return
-			}
-			if typ != websocket.MessageText {
-				continue // ACP is NDJSON text; ignore binary frames
-			}
-			head := rpcParse(data)
-			if gateArmed.Load() {
-				select {
-				case <-authGate:
-				case <-ctx.Done():
-					return
-				}
-			}
-			// Arm only after the check: the initialize frame itself must
-			// pass through for devin to produce the response we hook.
-			if head.Method == "initialize" && len(head.ID) > 0 {
-				initID.Store(head.ID)
-				gateArmed.Store(true)
-			}
-			stdinMu.Lock()
-			_, err = io.WriteString(stdin, string(data)+"\n")
-			stdinMu.Unlock()
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Half-open connection probe: a peer that vanishes without a TCP FIN
-	// (phone asleep, network drop) would keep the session — and the devin
-	// process — alive forever, with conn.Write eventually blocking on a
-	// full send buffer. The pong is read by the read goroutine above; a
-	// missed pong means the peer is gone.
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(wsPingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-			pctx, pcancel := context.WithTimeout(ctx, wsPingTimeout)
-			err := conn.Ping(pctx)
-			pcancel()
-			if err != nil {
-				if ctx.Err() != nil {
-					return // tearing down already; not a dead peer
-				}
-				log.Printf("[%d] ws ping failed, dropping half-open session: %v", pid, err)
-				// Close before cancel, same as the wait goroutine below.
-				closeConn(websocket.StatusInternalError, "ping timeout")
-				cancel()
-				return
-			}
-		}
-	}()
-
-	// Process exit -> report verdict + tear down
-	go func() {
-		defer wg.Done()
-		err := cmd.Wait()
-		if err != nil && !errors.Is(err, os.ErrProcessDone) {
-			log.Printf("[%d] devin acp exited: %v", pid, err)
-		}
-		// The only expected exits follow ctx cancellation (that is what
-		// triggers killProcessTree in the tail). If the process left
-		// while the session was still live it died on its own — a crash
-		// or self-termination the client must be told about. Genuine
-		// races (conn died in the same instant) can go either way.
-		verdict := ""
-		if ctx.Err() == nil {
-			verdict = "devin acp exited"
-			if err != nil {
-				verdict = fmt.Sprintf("devin acp exited: %v", err)
-			}
-		}
-		exitVerdict <- verdict
-		cancel()
-	}()
-
-	<-ctx.Done()
-	if oversized.Load() {
-		// One client message tripped the read limit — the session itself is
-		// still valid, so devin stays up for a reconnect + session/load.
-		// conn.Read already wrote the 1009 close ("read limited at N
-		// bytes") when the limit tripped; this closeConn is a best-effort
-		// dedup'd fallback carrying our own reason. If another teardown
-		// path cancelled ctx before the flag landed, we never get here and
-		// devin is killed as usual — the safer outcome anyway. Skipping
-		// wg.Wait() is deliberate: the stdout/wait goroutines stay parked
-		// on the live process and exit whenever it eventually does, rather
-		// than pinning this handler (and its conn slot) open.
-		log.Printf("[%d] inbound message exceeded %d-byte limit; closing ws, devin acp left running", pid, wsReadLimit)
-		closeConn(websocket.StatusMessageTooBig,
-			fmt.Sprintf("message exceeds %d MiB limit", wsReadLimit>>20))
-		// Without a bound, a client looping connect→oversize spawns devin
-		// processes past maxActiveConns, each holding its session lock
-		// until bridge restart. devin may hold the lock until the reaper
-		// fires — session/load against a locked session is clarified by
-		// probe task G1.
-		time.AfterFunc(orphanReapDelay, func() { killProcessTree(cmd) })
-		return
-	}
-	// Kill first: the stdout goroutine blocks on ReadBytes and the wait
-	// goroutine on cmd.Wait() until the process exits, so killing is what
-	// unblocks them and guarantees the verdict below has been sent.
-	killProcessTree(cmd)
-	code := websocket.StatusNormalClosure
-	reason := "session ended"
-	if verdict := <-exitVerdict; verdict != "" {
-		// StatusAbnormalClosure (1006) is reserved and cannot be sent in
-		// a close frame; StatusInternalError is the closest sendable
-		// "the agent, not the client, ended the session" signal.
-		code = websocket.StatusInternalError
-		reason = verdict
-	}
-	closeConn(code, closeReason(reason))
-	wg.Wait()
-}
-
-// closeReason truncates s to the 123-byte close-frame reason limit and
-// keeps it valid UTF-8 for the peer.
-func closeReason(s string) string {
-	if len(s) > 123 {
-		s = s[:123]
-	}
-	return strings.ToValidUTF8(s, "")
-}
-
-func fail(closeConn func(websocket.StatusCode, string), format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	log.Print(msg)
-	closeConn(websocket.StatusInternalError, msg)
+	bridgeHub.removeClient(client, reapTTL)
+	client.kick(websocket.StatusNormalClosure, "bye")
+	log.Printf("client %s (%s) disconnected", client.id, r.RemoteAddr)
 }
 
 func killProcessTree(cmd *exec.Cmd) {
@@ -836,22 +638,9 @@ func killProcessTree(cmd *exec.Cmd) {
 	cmd.Process.Kill()
 }
 
-// --- bridge-side auto-authentication -------------------------------------
-//
-// `devin acp` treats the ACP host as the sole credential source — local CLI
-// credentials are explicitly ignored, so every spawned process demands an
-// `authenticate` call before session/new. Without injection the phone would
-// be bounced into a browser login on every session. The bridge injects an
-// `authenticate` request right after forwarding the client's `initialize`
-// response, holds client frames until it resolves, and swallows the reply.
-// If the key is missing or rejected the relay simply carries on and the
-// client falls back to its own login flow.
-
-const bridgeAuthID = `"bridge-auto-auth"`
-
-// devinCredentialsKey returns the api key used for injected `authenticate`
-// calls: the -devinkey/DEVIN_API_KEY flag wins, else the windsurf_api_key
-// stored in devin's credentials.toml.
+// devinCredentialsKey returns the api key used for the gateway's own
+// `authenticate` call: the -devinkey/DEVIN_API_KEY flag wins, else the
+// windsurf_api_key stored in devin's credentials.toml.
 func devinCredentialsKey() string {
 	if *devinKey != "" {
 		return *devinKey
@@ -870,44 +659,15 @@ func devinCredentialsKey() string {
 		return ""
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "windsurf_api_key") {
-			if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
-				return strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-			}
+		// Anchor on the key name before '=': a bare HasPrefix would also
+		// match lookalike keys such as windsurf_api_key_backup.
+		key, val, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "windsurf_api_key" {
+			continue
 		}
+		return strings.Trim(strings.TrimSpace(val), `"'`)
 	}
 	return ""
-}
-
-type rpcHead struct {
-	ID     json.RawMessage `json:"id"`
-	Method string          `json:"method"`
-	Result struct {
-		AuthMethods []json.RawMessage `json:"authMethods"`
-	} `json:"result"`
-}
-
-// rpcParse pulls the envelope fields the relay needs: id (raw), method, and
-// authMethods when the line is an initialize result.
-func rpcParse(line []byte) rpcHead {
-	var h rpcHead
-	_ = json.Unmarshal(line, &h)
-	return h
-}
-
-// authRequestLine builds the NDJSON line for the injected authenticate call.
-func authRequestLine(apiKey string) []byte {
-	b, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      json.RawMessage(bridgeAuthID),
-		"method":  "authenticate",
-		"params": map[string]any{
-			"methodId": "devin-browser",
-			"_meta":    map[string]any{"api_key": apiKey},
-		},
-	})
-	return b
 }
 
 // stderrLogger forwards devin's stderr lines to the bridge log. devin's
