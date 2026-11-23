@@ -11,12 +11,11 @@ app/app/release/
 .idea/
 *.iml
 
-# Go bridge
+# Go bridge / local build artifacts
 bridge/devingo-bridge
-bridge/devingo-bridge*.exe
-bridge/acptest.exe
-bridge/*.log
+*.exe
 *.exe~
+*.log
 nul
 
 # Local tool indexes / test artifacts
@@ -32,7 +31,7 @@ app/app/signing.properties
 app/app/*.jks
 app/tailnet/build/
 bridge/acptest/probe-logs/
-shot-*.png
+/shot-*.png
 
 hs_err_pid*.log
 replay_pid*.log

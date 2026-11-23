@@ -28,12 +28,14 @@ bridge/ (Go, devingo-bridge.exe)
 ```bash
 cd bridge
 go build -o devingo-bridge.exe .
-./devingo-bridge.exe -token "s3cret-long-random"
+./devingo-bridge.exe
 ```
 
-默认 `-addr :8790` 绑定所有网卡，此时**必须**设置 `-token`（或 `DEVINGO_TOKEN` 环境变量），
-否则 bridge 拒绝启动——没有鉴权时局域网内任何人都能驱动你的 Devin。本机独占测试可以用
-`-addr 127.0.0.1:8790`（loopback 不强制 token）；确实要免密暴露时显式加 `-insecure`。
+默认 `-addr :8790` 绑定所有网卡。**Token 不用手填**：首次启动自动生成 32 字节随机串，
+存到 `%APPDATA%\DevinGo\bridge.json`，之后复用；`-token`/`DEVINGO_TOKEN` 可显式覆盖。
+局域网客户端不带 token 访问 `/acp`、`/sessions`、`/models` 一律 401；loopback（要求 Host
+也是 localhost）与 `/healthz`、`/pair` 放行，方便本机工具与配对探测。`-insecure` 显式关闭
+远端鉴权（启动打醒目警告，不推荐）；和 `-token` 同用时 token 仍然生效。
 
 常用参数：
 
@@ -42,13 +44,23 @@ go build -o devingo-bridge.exe .
   -addr 0.0.0.0:8790 \               # 监听地址
   -devin "C:\...\devin.exe" \        # devin 不在 PATH 时指定绝对路径
   -cwd "E:\project\my\DevinGo" \     # spawn devin 的工作目录（App 里也可覆盖）
-  -token "s3cret" \                  # 要求客户端带 Bearer token（也可 DEVINGO_TOKEN）
-  -insecure                          # 显式允许非 loopback 免 token（不推荐）
+  -token "s3cret" \                  # 覆盖自动生成的 Bearer token（也可 DEVINGO_TOKEN）
+  -insecure                          # 显式关闭远端鉴权（不推荐）
 ```
 
-启动日志会打印局域网 `ws://<ip>:8790/acp` 地址。
+开机自启（注册"当前用户登录时启动"的计划任务，登录凭据在用户目录下、不做系统服务）：
 
-- `GET /healthz` → bridge 状态 + devin 是否可用 + 默认 cwd
+```bash
+./devingo-bridge.exe -install        # schtasks 注册；任务以安装时的 cwd 作为 -cwd
+./devingo-bridge.exe -uninstall      # 移除；任务不存在也算成功
+```
+
+启动日志会打印局域网 `ws://<ip>:8790/acp` 地址和配对二维码（payload 同 /pair）。
+
+- `GET /healthz` → bridge 状态 + devin 是否可用 + 默认 cwd（配对探测用，免鉴权）
+- `GET /sessions`→ `devin list --format json` 历史会话列表
+- `GET /models`  → `devin models list --format json`
+- `GET /pair`    → 配对二维码网页（只有本机打开才带 token）
 - `WS  /acp`     → ACP 中继
 
 行为要点：单条 WS 消息上限 4MiB（默认 32KiB 会断大 payload）；最多 8 个并发 `/acp`
@@ -64,10 +76,15 @@ cd app
 ./gradlew :app:installDebug          # USB 连接手机，或先 assembleDebug 再手动装
 ```
 
-App 里填：
+打开 App 左侧二维码图标，扫 bridge 启动时终端打印的配对码（或在电脑浏览器开
+`http://localhost:8790/pair`）。配对码自带候选地址列表和 token，App 探测到第一个
+可用地址后自动填入并保存。从其它局域网设备打开 `/pair` 页拿到的二维码**不含 token**
+——token 只出现在操作者本机屏幕上。
+
+手动填也可以：
 
 - **Bridge 地址**：`192.168.x.x:8790`（bridge 日志里打印的那个）
-- **Token**：bridge 用 `-token` 启动时才需要
+- **Token**：远端连接必填，扫码会自动带上；也可看 `%APPDATA%\DevinGo\bridge.json`
 - **工作目录**：Devin 要在哪个目录干活（Windows 路径，留空 = bridge 的 cwd）
 
 ### 3. 首次登录
@@ -91,10 +108,11 @@ App 里填：
 
 - bridge 监听的是**明文 ws://**，App 声明了 `usesCleartextTraffic`。请只在可信局域网用，
   公网暴露务必加 `-token` + 前面套一层 TLS（如 Caddy/nginx wss 反代，或 Tailscale）。
-- bridge 拒绝带非 localhost Origin 的浏览器 WebSocket 连接（防 CSWSH/DNS rebinding），
-  原生 App 不受影响；绑非 loopback 地址且未设 token 时会拒绝启动（`-insecure` 可跳过）。
-- App 里保存的 token 是**明文 SharedPreferences**（离线依赖里没有
-  EncryptedSharedPreferences）——请用可丢弃的局域网 token，别用重要凭据。
+- 带非 localhost `Origin` 的浏览器请求会被拒绝（/acp 防 CSWSH，/sessions、/models
+  防 drive-by 刷 `devin list`）；无 Origin 的原生客户端不受影响。loopback 免鉴权同时
+  要求 `Host` 也是 localhost/127.0.0.1，堵住 DNS 重绑定借浏览器读数据的口子。
+- App 里保存的 token 经 AndroidKeyStore AES/GCM 加密后落 SharedPreferences，
+  仍建议把它当局域网共享密钥看待，别和重要凭据混用。
 - Devin 的权限模式决定 Agent 能干什么：Normal/Accept-Edits 模式下每次危险操作都会
   弹审批到手机上；想要无人值守可以建会话后在模式菜单里切 `bypass`（慎用）。
 - Windows 上 Devin 没有 sandbox（autonomous 模式不可用）。

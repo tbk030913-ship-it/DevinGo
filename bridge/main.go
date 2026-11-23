@@ -13,6 +13,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -39,8 +41,10 @@ var (
 	addr       = flag.String("addr", ":8790", "listen address")
 	devinBin   = flag.String("devin", "devin", "devin CLI binary name or absolute path")
 	defaultDir = flag.String("cwd", "", "working directory for spawned devin processes (default: bridge's own cwd)")
-	token      = flag.String("token", os.Getenv("DEVINGO_TOKEN"), "bearer token clients must present (or DEVINGO_TOKEN); empty = no auth")
-	insecure   = flag.Bool("insecure", false, "allow listening on a non-loopback address without a bearer token")
+	token      = flag.String("token", os.Getenv("DEVINGO_TOKEN"), "bearer token clients must present (or DEVINGO_TOKEN); default: auto-generated, persisted in the user config dir")
+	insecure   = flag.Bool("insecure", false, "disable remote-auth enforcement: without an explicit -token no token is generated (opt-out for unauthenticated LAN access)")
+	install    = flag.Bool("install", false, "register a per-user scheduled task that starts the bridge at logon, then exit")
+	uninstall  = flag.Bool("uninstall", false, "remove the logon scheduled task, then exit")
 	model      = flag.String("model", os.Getenv("DEVIN_MODEL"), "default model for new ACP sessions (devin acp --model / DEVIN_MODEL)")
 	devinKey   = flag.String("devinkey", os.Getenv("DEVIN_API_KEY"), "api key injected into ACP `authenticate` for spawned devin processes; default reads windsurf_api_key from devin's credentials.toml")
 )
@@ -79,6 +83,15 @@ func releaseConn() { activeConns.Add(-1) }
 func main() {
 	flag.Parse()
 
+	if *install {
+		installLogonTask()
+		return
+	}
+	if *uninstall {
+		uninstallLogonTask()
+		return
+	}
+
 	if *defaultDir == "" {
 		if wd, err := os.Getwd(); err == nil {
 			*defaultDir = wd
@@ -93,10 +106,14 @@ func main() {
 	if _, err := exec.LookPath(*devinBin); err != nil {
 		log.Printf("warning: %q not found on PATH: %v (spawned connections will fail until -devin points at a valid binary)", *devinBin, err)
 	}
-	if !isLoopbackBind(*addr) && *token == "" && !*insecure {
-		log.Fatalf("refusing to listen on %q without authentication: clients can drive the local Devin agent.\n"+
-			"run with -token <secret> (or DEVINGO_TOKEN) to require a bearer token,\n"+
-			"-addr 127.0.0.1:8790 for local-only use, or -insecure to explicitly allow unauthenticated LAN access", *addr)
+	// A bearer token is mandatory on non-loopback binds. resolveToken always
+	// returns one — flag/env, the persisted token, or a freshly minted one —
+	// so "" here means the operator opted out with -insecure.
+	*token = resolveToken()
+	if *token == "" {
+		log.Print("!!! WARNING: -insecure set, bearer-token auth DISABLED")
+		log.Print("!!! Any device that can reach this bridge can drive the local Devin agent.")
+		log.Print("!!! Omit -insecure to use the auto-generated token, or bind to 127.0.0.1.")
 	}
 
 	mux := http.NewServeMux()
@@ -130,9 +147,9 @@ func printBanner() {
 	log.Printf("devin binary : %s", *devinBin)
 	log.Printf("default cwd  : %s", *defaultDir)
 	if *token == "" {
-		log.Printf("auth         : DISABLED (set -token or DEVINGO_TOKEN to require a bearer token)")
+		log.Printf("auth         : DISABLED (-insecure)")
 	} else {
-		log.Printf("auth         : bearer token required")
+		log.Printf("auth         : bearer token required for remote clients (loopback exempt)")
 	}
 	if ips := lanIPs(); len(ips) > 0 {
 		for _, ip := range ips {
@@ -212,21 +229,125 @@ func resolveVersionedDevin() string {
 	return exe
 }
 
-func isLoopbackBind(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil || host == "" {
-		return false
+// resolveToken picks the client bearer token: explicit -token/DEVINGO_TOKEN
+// first, then the token persisted in bridge.json under the user config dir
+// (stable across restarts, so paired phones keep working), else a freshly
+// minted random one saved there. With -insecure and no explicit token it
+// returns "" — auth disabled, the caller warns.
+func resolveToken() string {
+	if *token != "" || *insecure {
+		return *token
 	}
-	if strings.EqualFold(host, "localhost") {
-		return true
+	path := bridgeConfigPath()
+	if path != "" {
+		var cfg struct {
+			Token string `json:"token"`
+		}
+		if b, err := os.ReadFile(path); err == nil &&
+			json.Unmarshal(b, &cfg) == nil && cfg.Token != "" {
+			return cfg.Token
+		}
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		log.Fatalf("generate bridge token: %v", err)
+	}
+	tok := base64.RawURLEncoding.EncodeToString(raw)
+	if path == "" {
+		log.Print("warning: no user config dir; generated token is ephemeral to this run")
+		return tok
+	}
+	b, _ := json.Marshal(map[string]string{"token": tok})
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("warning: cannot persist bridge token: %v (ephemeral this run)", err)
+	} else if err := os.WriteFile(path, b, 0o600); err != nil {
+		log.Printf("warning: cannot persist bridge token to %s: %v (ephemeral this run)", path, err)
+	} else {
+		log.Printf("generated new bridge token, saved to %s", path)
+	}
+	return tok
 }
 
+// bridgeConfigPath locates the persisted token file: %APPDATA%\DevinGo\
+// bridge.json on Windows (os.UserConfigDir resolves AppData\Roaming), the
+// os-native config dir elsewhere. "" when no config dir can be determined.
+func bridgeConfigPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "DevinGo", "bridge.json")
+}
+
+// schedTaskName is the Scheduled Tasks entry -install/-uninstall manage.
+// It is deliberately a per-user logon task, not a service: spawned `devin
+// acp` children read credentials under the user's profile, so the bridge
+// must run inside the user's session.
+const schedTaskName = "DevinGo Bridge"
+
+func installLogonTask() {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("locate exe: %v", err)
+	}
+	if exe, err = filepath.Abs(exe); err != nil {
+		log.Fatalf("resolve exe path: %v", err)
+	}
+	// Pin the session cwd into the task: Task Scheduler would otherwise
+	// start the exe under System32, making it the default project dir.
+	dir := *defaultDir
+	if dir == "" {
+		if dir, err = os.Getwd(); err != nil {
+			log.Fatalf("resolve working dir: %v", err)
+		}
+	}
+	if dir, err = filepath.Abs(dir); err != nil {
+		log.Fatalf("resolve working dir: %v", err)
+	}
+	cmd := exec.Command("schtasks", "/create", "/tn", schedTaskName,
+		"/sc", "onlogon", "/rl", "limited", "/f",
+		"/tr", fmt.Sprintf(`"%s" -cwd "%s"`, exe, dir))
+	log.Printf("running: %s", cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Fatalf("schtasks: %v\n%s", err, out)
+	}
+	log.Printf("installed logon task %q -> %s", schedTaskName, exe)
+}
+
+func uninstallLogonTask() {
+	cmd := exec.Command("schtasks", "/delete", "/tn", schedTaskName, "/f")
+	log.Printf("running: %s", cmd)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Idempotent: a missing task is already the desired end state
+		// (avoids parsing schtasks' localized "not found" text).
+		if exec.Command("schtasks", "/query", "/tn", schedTaskName).Run() != nil {
+			log.Printf("logon task %q not present; nothing to remove", schedTaskName)
+			return
+		}
+		log.Fatalf("schtasks: %v\n%s", err, out)
+	}
+	log.Printf("removed logon task %q", schedTaskName)
+}
+
+// authorized gates the protected endpoints (/acp, /sessions, /models). The
+// token only guards the LAN surface: loopback clients stay trusted so local
+// tooling keeps working without knowing the token.
 func authorized(r *http.Request) bool {
 	if *token == "" {
 		return true
+	}
+	// Loopback exemption — but only when the request also names this
+	// machine in Host. A DNS-rebound browser fetch lands on 127.0.0.1 yet
+	// keeps its hostile Host header, so RemoteAddr alone is not proof of
+	// a local client.
+	if isLoopbackRemote(r) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host // Host may arrive without a port
+		}
+		if isLocalHost(host) {
+			return true
+		}
 	}
 	if r.URL.Query().Get("token") == *token {
 		return true
@@ -239,9 +360,20 @@ func authorized(r *http.Request) bool {
 	return false
 }
 
-// validOrigin rejects browser cross-site WebSocket hijacking (CSWSH): a
-// hostile page can otherwise reach the bridge via DNS rebinding even when it
-// binds to localhost. Native apps send no Origin header and pass through.
+// isLocalHost reports whether a bare hostname (no port) names this machine:
+// "localhost" or a loopback IP literal (with or without brackets).
+func isLocalHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// validOrigin rejects browser cross-site request forgery (CSWSH on /acp,
+// drive-by spam on /sessions and /models): a hostile page can otherwise
+// reach the bridge via DNS rebinding even when it binds to localhost.
+// Native apps and curl send no Origin header and pass through.
 func validOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -251,21 +383,19 @@ func validOrigin(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return isLocalHost(u.Hostname())
 }
 
+// rejectForbiddenOrigin writes the shared 403 body for validOrigin failures.
+func rejectForbiddenOrigin(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusForbidden)
+	w.Write([]byte(`{"error":"forbidden origin"}`))
+}
+
+// healthHandler is intentionally unauthenticated: phones probe it during
+// pairing to find a reachable bridge address before they hold the token.
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if !authorized(r) {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":"unauthorized"}`))
-		return
-	}
 	_, lookErr := exec.LookPath(*devinBin)
 	json.NewEncoder(w).Encode(map[string]any{
 		"ok":          lookErr == nil,
@@ -285,6 +415,10 @@ func sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	if !authorized(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
 		return
 	}
 	cwd := r.URL.Query().Get("cwd")
@@ -314,6 +448,10 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 	if !authorized(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
@@ -393,6 +531,9 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Origin is pre-checked above; native apps send no Origin header.
 		InsecureSkipVerify: true,
+		// OkHttp offers permessage-deflate; the library default
+		// (CompressionDisabled) would refuse to negotiate it.
+		CompressionMode: websocket.CompressionNoContextTakeover,
 	})
 	if err != nil {
 		log.Printf("ws accept: %v", err)

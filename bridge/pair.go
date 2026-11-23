@@ -1,9 +1,9 @@
 // Phone pairing: serves a QR page the operator opens on the PC, carrying
 // everything DevinGo needs to point at this bridge without typing.
 //
-// The JSON payload is {v, host, tail, token}: `host` is the bridge's LAN
-// address, `tail` its Tailscale address (for phones that go through the
-// embedded tailnet), `token` the bearer token. The token is only handed to
+// The JSON payload is {v, hosts, tail, token}: `hosts` lists the bridge's
+// LAN addresses best-first, `tail` its Tailscale address (for phones that
+// go through the embedded tailnet), `token` the bearer token. The token is only handed to
 // loopback viewers — the QR page opened from another LAN device renders a
 // tokenless payload so the secret never leaves the operator's own screen.
 package main
