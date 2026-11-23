@@ -735,6 +735,12 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 			if cr.session.lastPrompter == cr.client {
 				cr.session.lastPrompter = nil
 			}
+			// Offline push: a turn that just ended with no live audience
+			// still reaches the user. s == cr.session confines this to the
+			// still-hosted session (a deleted mid-turn one drops out).
+			if cr.session.running == 0 && s == cr.session && !s.hasAudienceLocked() {
+				bridgePush.notify("任务完成", false)
+			}
 		}
 	}
 	if s == nil {
@@ -856,8 +862,16 @@ func (h *Hub) devinRequest(p *devinProc, line []byte, head rpcHead) {
 		h.resolveAgentReq(ar, "timeout", resultFrameRaw(ar.devinID, res))
 	})
 	noAnswer := len(targets) == 0 && head.Method != "session/request_permission"
+	// Offline push: the FIRST permission arriving with no live audience is
+	// worth paging the phone for — later ones ride the same ping
+	// (len(s.pending)==1 means the request just registered is the only one).
+	pushPerm := head.Method == "session/request_permission" && len(targets) == 0 &&
+		(s == nil || len(s.pending) == 1)
 	h.mu.Unlock()
 
+	if pushPerm {
+		bridgePush.notify("有新审批", true)
+	}
 	if noAnswer {
 		// Nothing to hang: nobody can answer fs/terminal-style calls.
 		h.resolveAgentReq(ar, "no_client",
@@ -909,6 +923,23 @@ func (h *Hub) agentReqTargetsLocked(s *Session, method string) []*Client {
 		}
 	}
 	return nil
+}
+
+// hasAudienceLocked reports whether any live client can see this session's
+// traffic right now — the same pool agentReqTargetsLocked routes to:
+// subscribers, plus loaders during a load window.
+func (s *Session) hasAudienceLocked() bool {
+	for c := range s.subs {
+		if !c.dead {
+			return true
+		}
+	}
+	for c := range s.loaders {
+		if !c.dead {
+			return true
+		}
+	}
+	return false
 }
 
 // devinNotification journals a session-scoped notification and fans it out;

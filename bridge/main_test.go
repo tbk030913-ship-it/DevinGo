@@ -131,6 +131,40 @@ func devinAlive(pid int) bool {
 	return err == nil && p.Signal(syscall.Signal(0)) == nil
 }
 
+// resolvePushURL: -push/DEVINGO_PUSH_URL wins over bridge.json's push_url;
+// nothing configured stays "" (push disabled by default).
+func TestResolvePushURL(t *testing.T) {
+	old := *pushURL
+	t.Cleanup(func() { *pushURL = old })
+
+	dir := t.TempDir()
+	// os.UserConfigDir: %AppData% on Windows, $XDG_CONFIG_HOME elsewhere.
+	t.Setenv("APPDATA", dir)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	*pushURL = ""
+	if got := resolvePushURL(); got != "" {
+		t.Fatalf("resolvePushURL with nothing configured = %q, want \"\"", got)
+	}
+
+	cfgPath := filepath.Join(dir, "DevinGo", "bridge.json")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(cfgPath,
+		[]byte(`{"token":"x","push_url":"https://ntfy.sh/topic"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if got := resolvePushURL(); got != "https://ntfy.sh/topic" {
+		t.Fatalf("resolvePushURL config fallback = %q, want config value", got)
+	}
+
+	*pushURL = "https://ntfy.sh/flag-wins"
+	if got := resolvePushURL(); got != "https://ntfy.sh/flag-wins" {
+		t.Fatalf("resolvePushURL flag precedence = %q, want flag value", got)
+	}
+}
+
 // Version dirs must sort numerically component-wise — lexical order ranks
 // "3000.12.100" below "3000.12.57" and would pick a stale devin binary.
 func TestCompareDevinVersion(t *testing.T) {

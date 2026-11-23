@@ -49,6 +49,7 @@ var (
 	devinKey   = flag.String("devinkey", os.Getenv("DEVIN_API_KEY"), "api key injected into ACP `authenticate` for spawned devin processes; default reads windsurf_api_key from devin's credentials.toml")
 	idleTTL    = flag.Duration("idle-ttl", 10*time.Minute, "grace period a session with no subscribers/running work/pending approvals stays hosted before the hub releases it")
 	permTTL    = flag.Duration("perm-ttl", 30*time.Minute, "how long an unanswered agent permission request stays pending before the gateway cancels it")
+	pushURL    = flag.String("push", os.Getenv("DEVINGO_PUSH_URL"), "offline-push endpoint (e.g. https://ntfy.sh/<topic> or a compatible webhook): POSTs approval/turn-end pings when no client watches the session; default off (or DEVINGO_PUSH_URL / bridge.json push_url)")
 )
 
 const (
@@ -122,6 +123,8 @@ func main() {
 		log.Print("!!! Omit -insecure to use the auto-generated token, or bind to 127.0.0.1.")
 	}
 
+	bridgePush = newPushNotifier(resolvePushURL())
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/acp", acpHandler)
@@ -156,6 +159,9 @@ func printBanner() {
 		log.Printf("auth         : DISABLED (-insecure)")
 	} else {
 		log.Printf("auth         : bearer token required for remote clients (loopback exempt)")
+	}
+	if bridgePush != nil {
+		log.Printf("push         : %s (approval/turn-end pings)", bridgePush.url)
 	}
 	if ips := lanIPs(); len(ips) > 0 {
 		for _, ip := range ips {
@@ -281,11 +287,7 @@ func resolveToken() string {
 	}
 	path := bridgeConfigPath()
 	if path != "" {
-		var cfg struct {
-			Token string `json:"token"`
-		}
-		if b, err := os.ReadFile(path); err == nil &&
-			json.Unmarshal(b, &cfg) == nil && cfg.Token != "" {
+		if cfg := loadBridgeConfig(path); cfg.Token != "" {
 			return cfg.Token
 		}
 	}
@@ -298,7 +300,9 @@ func resolveToken() string {
 		log.Print("warning: no user config dir; generated token is ephemeral to this run")
 		return tok
 	}
-	b, _ := json.Marshal(map[string]string{"token": tok})
+	cfg := loadBridgeConfig(path) // keep push_url & friends across the rewrite
+	cfg.Token = tok
+	b, _ := json.Marshal(cfg)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		log.Printf("warning: cannot persist bridge token: %v (ephemeral this run)", err)
 	} else if err := os.WriteFile(path, b, 0o600); err != nil {
@@ -307,6 +311,35 @@ func resolveToken() string {
 		log.Printf("generated new bridge token, saved to %s", path)
 	}
 	return tok
+}
+
+// bridgeConfig is the persisted bridge.json shape under the user config
+// dir: the minted bearer token plus the optional offline-push endpoint.
+type bridgeConfig struct {
+	Token   string `json:"token"`
+	PushURL string `json:"push_url,omitempty"`
+}
+
+// loadBridgeConfig reads bridge.json; a missing or malformed file yields
+// the zero config (each consumer treats its own field independently).
+func loadBridgeConfig(path string) bridgeConfig {
+	var cfg bridgeConfig
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &cfg)
+	}
+	return cfg
+}
+
+// resolvePushURL picks the offline-push endpoint: -push/DEVINGO_PUSH_URL
+// wins, then bridge.json's push_url. "" keeps push disabled (the default).
+func resolvePushURL() string {
+	if *pushURL != "" {
+		return *pushURL
+	}
+	if path := bridgeConfigPath(); path != "" {
+		return loadBridgeConfig(path).PushURL
+	}
+	return ""
 }
 
 // bridgeConfigPath locates the persisted token file: %APPDATA%\DevinGo\

@@ -55,6 +55,20 @@ go build -o devingo-bridge.exe .
 ./devingo-bridge.exe -uninstall      # 移除；任务不存在也算成功
 ```
 
+可选离线推送（默认关）：手机进程被杀、前台服务也不在时，审批和回合结束没人看得见。
+配一个端点后，bridge 会在「新审批到达且会话无客户端观看」或「回合结束且无观众」时
+POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容）。任何把 POST body 当消息
+文本的 webhook 都能用；[ntfy](https://ntfy.sh) 是测试过的路径——手机上装 ntfy App
+订阅同一个 topic 即可：
+
+```bash
+./devingo-bridge.exe -push "https://ntfy.sh/my-secret-topic"
+# 也可 DEVINGO_PUSH_URL 环境变量，或写进 %APPDATA%\DevinGo\bridge.json 的 "push_url"
+```
+
+用 `-install` 跑计划任务的建议走 `bridge.json` 的 `push_url`（`-push` 这类 flag
+不会带进 schtasks）。推送是 fire-and-forget，失败只记日志，不影响 hub。
+
 启动日志会打印局域网 `ws://<ip>:8790/acp` 地址和配对二维码（payload 同 /pair）。
 
 - `GET /healthz` → bridge 状态 + devin 是否可用 + 默认 cwd（配对探测用，免鉴权）

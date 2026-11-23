@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1102,6 +1103,82 @@ func TestPostDeathAgentRequestDropped(t *testing.T) {
 	}
 	if m, ok := a.nextWithin(400 * time.Millisecond); ok {
 		t.Fatalf("zombie permission reached the client: %v", m)
+	}
+}
+
+// Offline push (opt-in): with an endpoint configured, a permission nobody
+// can see pings "有新审批" once and the turn ending pings "任务完成" —
+// while a watching subscriber keeps both silent.
+func TestOfflinePushFiresWhenUnwatched(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	pushSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(pushSrv.Close)
+	oldPush := bridgePush
+	t.Cleanup(func() { bridgePush = oldPush })
+	setupHub(t, fakeDevin(t))
+	bridgePush = newPushNotifier(pushSrv.URL)
+	srv := newTestServer(t)
+
+	a := dialClient(t, srv)
+	sid := initAndNew(t, a) // a is subscribed -> the session has an audience
+
+	// A watched turn produces no push at all.
+	a.request(t, 9, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "hi"}},
+	})
+	a.awaitID(t, 9, 20*time.Second)
+	time.Sleep(200 * time.Millisecond) // push POSTs are async; give them a window
+	mu.Lock()
+	if len(bodies) != 0 {
+		t.Fatalf("push fired while a subscriber watched: %v", bodies)
+	}
+	mu.Unlock()
+
+	// Detach, then run a PERM turn: the permission pings once (first pending
+	// with no audience) and the turn-end pings — nothing else may arrive.
+	a.request(t, 3, "_devingo/detach", rpcMsg{"sessionId": sid})
+	a.awaitID(t, 3, 20*time.Second)
+	a.request(t, 10, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "PERM"}},
+	})
+	a.awaitID(t, 10, 20*time.Second)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	mu.Lock()
+	seen := map[string]bool{}
+	for _, b := range bodies {
+		seen[b] = true
+	}
+	n := len(bodies)
+	mu.Unlock()
+	if n != 2 || !seen["有新审批"] || !seen["任务完成"] {
+		t.Fatalf("push bodies = %v, want exactly {有新审批, 任务完成}", bodies)
+	}
+
+	// The unwatched permission still pends for a late-attaching client.
+	bridgeHub.mu.Lock()
+	pend := len(bridgeHub.sessions[sid].pending)
+	bridgeHub.mu.Unlock()
+	if pend != 1 {
+		t.Fatalf("pending approvals = %d, want 1", pend)
 	}
 }
 
