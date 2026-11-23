@@ -309,10 +309,11 @@ internal class ComposerEditText(context: Context) : EditText(context) {
         setPadding(0, 0, 0, 0)
         filters = arrayOf(InputFilter.LengthFilter(MAX_INPUT_CHARS))
         imeOptions = EditorInfo.IME_ACTION_SEND
-        // Keeps autofill services such as SMS verification codes out of the draft.
         setOnEditorActionListener { _, actionId, event ->
-            val isEnter = event?.keyCode == KeyEvent.KEYCODE_ENTER &&
-                event.action == KeyEvent.ACTION_DOWN
+            val isEnter = (
+                event?.keyCode == KeyEvent.KEYCODE_ENTER ||
+                    event?.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER
+                ) && event.action == KeyEvent.ACTION_DOWN
             if (actionId == EditorInfo.IME_ACTION_SEND || (singleLineMode && isEnter)) {
                 submitListener?.invoke()
                 true
@@ -393,6 +394,9 @@ internal class ComposerEditText(context: Context) : EditText(context) {
             }
         }
     }
+
+    // Keeps autofill services such as SMS verification codes out of the draft.
+    override fun getAutofillType(): Int = View.AUTOFILL_TYPE_NONE
 
     // ---- controlled text + tokens --------------------------------------------
 
@@ -586,7 +590,9 @@ internal class ComposerEditText(context: Context) : EditText(context) {
     // ---- image paste ------------------------------------------------------------
 
     override fun onTextContextMenuItem(id: Int): Boolean {
-        if (id == android.R.id.paste || id == android.R.id.pasteAsPlainText) {
+        // Only plain "paste" intercepts image clips — "paste as plain text"
+        // must keep producing text (t3 routes it to pasteInterceptedText).
+        if (id == android.R.id.paste) {
             val uris = clipboardImageUris()
             if (uris.isNotEmpty()) {
                 pasteImagesListener?.invoke(uris)

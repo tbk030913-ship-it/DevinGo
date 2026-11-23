@@ -26,11 +26,9 @@ internal data class ChipToken(
     val kind: String,
     /** Exact matched text — the span's validity check and removal range. */
     val source: String,
-    /** The token payload (path / id / url). */
-    val ref: String,
     /** Chip text: basename for file-ish kinds, ref for the rest. */
     val label: String,
-    /** Full ref — the context sheet's detail line. */
+    /** The token payload (path / id / url) — also the sheet's detail line. */
     val detail: String,
     val start: Int,
     val end: Int,
@@ -109,7 +107,6 @@ internal fun scanContextTokens(
         out += ChipToken(
             kind = kind,
             source = text.substring(m.range.first, end),
-            ref = ref,
             label = if (kind == "file" || kind == "folder" || kind == "image") {
                 basename(ref)
             } else {
@@ -130,7 +127,6 @@ internal fun scanContextTokens(
         out += ChipToken(
             kind = "file",
             source = g.value,
-            ref = rest,
             label = basename(rest),
             detail = rest,
             start = g.range.first,

@@ -205,7 +205,9 @@ internal fun Composer(
         mutableStateOf<List<String>?>(null)
     }
     var filesFailed by remember(ui.sessionId) { mutableStateOf(false) }
-    val needFiles = mentionQuery != null || input.contains("@file:")
+    // knownFiles feeds the space-in-path match for file + folder tokens.
+    val needFiles = mentionQuery != null ||
+        input.contains("@file:") || input.contains("@folder:")
     LaunchedEffect(needFiles, ui.sessionId) {
         if (needFiles && workspaceFiles == null && !filesFailed) {
             try {
