@@ -62,6 +62,9 @@ const (
 	// otherwise wedge devin's stdout once the pipe buffer fills.
 	wsPingInterval = 25 * time.Second
 	wsPingTimeout  = 10 * time.Second
+	// orphanReapDelay bounds how long an oversized-message connection
+	// leaves its devin process alive for a possible client reconnect.
+	orphanReapDelay = 5 * time.Minute
 )
 
 var activeConns atomic.Int64
@@ -572,9 +575,15 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	pid := cmd.Process.Pid
 	log.Printf("[%d] devin acp started for %s", pid, r.RemoteAddr)
+	// oversized marks a connection torn down by an inbound frame over the
+	// read limit: the socket is finished but the agent is not, so the
+	// process is left running (and un-reaped) for the client to re-attach.
+	var oversized atomic.Bool
 	defer func() {
-		killProcessTree(cmd)
-		log.Printf("[%d] devin acp stopped", pid)
+		if !oversized.Load() {
+			killProcessTree(cmd)
+			log.Printf("[%d] devin acp stopped", pid)
+		}
 	}()
 
 	// Everything below races to finish; first failure wins and tears down
@@ -671,6 +680,13 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 		for {
 			typ, data, err := conn.Read(r.Context())
 			if err != nil {
+				// A frame over the read limit already put a 1009 close
+				// ("read limited at N bytes") on the wire; flag it so the
+				// teardown below keeps devin alive instead of killing the
+				// session for one bad message.
+				if errors.Is(err, websocket.ErrMessageTooBig) {
+					oversized.Store(true)
+				}
 				return
 			}
 			if typ != websocket.MessageText {
@@ -754,6 +770,28 @@ func acpHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	<-ctx.Done()
+	if oversized.Load() {
+		// One client message tripped the read limit — the session itself is
+		// still valid, so devin stays up for a reconnect + session/load.
+		// conn.Read already wrote the 1009 close ("read limited at N
+		// bytes") when the limit tripped; this closeConn is a best-effort
+		// dedup'd fallback carrying our own reason. If another teardown
+		// path cancelled ctx before the flag landed, we never get here and
+		// devin is killed as usual — the safer outcome anyway. Skipping
+		// wg.Wait() is deliberate: the stdout/wait goroutines stay parked
+		// on the live process and exit whenever it eventually does, rather
+		// than pinning this handler (and its conn slot) open.
+		log.Printf("[%d] inbound message exceeded %d-byte limit; closing ws, devin acp left running", pid, wsReadLimit)
+		closeConn(websocket.StatusMessageTooBig,
+			fmt.Sprintf("message exceeds %d MiB limit", wsReadLimit>>20))
+		// Without a bound, a client looping connect→oversize spawns devin
+		// processes past maxActiveConns, each holding its session lock
+		// until bridge restart. devin may hold the lock until the reaper
+		// fires — session/load against a locked session is clarified by
+		// probe task G1.
+		time.AfterFunc(orphanReapDelay, func() { killProcessTree(cmd) })
+		return
+	}
 	// Kill first: the stdout goroutine blocks on ReadBytes and the wait
 	// goroutine on cmd.Wait() until the process exits, so killing is what
 	// unblocks them and guarantees the verdict below has been sent.

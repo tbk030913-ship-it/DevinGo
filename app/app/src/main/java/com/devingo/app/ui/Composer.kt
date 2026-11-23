@@ -1,5 +1,12 @@
 package com.devingo.app.ui
 
+import android.content.ContentResolver
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.net.Uri
+import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -61,16 +68,15 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
@@ -82,11 +88,16 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.exifinterface.media.ExifInterface
 import coil3.compose.AsyncImage
 import com.devingo.app.ChatViewModel
 import com.devingo.app.ChatViewModel.UiState
 import com.devingo.app.ui.theme.DevinGoColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.ArrowUp01
@@ -117,17 +128,22 @@ internal fun Composer(
     onStop: () -> Unit,
 ) {
     val context = LocalContext.current
-    val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.PickMultipleVisualMedia(4),
     ) { uris ->
-        uris.forEach { uri ->
-            runCatching {
-                val mime = context.contentResolver.getType(uri) ?: "image/*"
-                val bytes = context.contentResolver.openInputStream(uri)?.use {
-                    it.readBytes()
-                } ?: return@forEach
-                onAttach(ChatViewModel.ImageAttachment(bytes, mime))
+        // Sequential: keeps the strip in pick order and never holds more
+        // than one decoded bitmap at a time.
+        scope.launch {
+            uris.forEach { uri ->
+                val attachment = compressImage(context.contentResolver, uri)
+                if (attachment != null) {
+                    onAttach(attachment)
+                } else {
+                    Toast.makeText(
+                        context, "无法读取该图片", Toast.LENGTH_SHORT,
+                    ).show()
+                }
             }
         }
     }
@@ -290,12 +306,7 @@ internal fun Composer(
                                 when {
                                     !canSend -> Unit
                                     ui.running -> sendMenu = true
-                                    else -> {
-                                        haptic.performHapticFeedback(
-                                            HapticFeedbackType.Confirm,
-                                        )
-                                        onSend()
-                                    }
+                                    else -> onSend()
                                 }
                             },
                         ),
@@ -315,9 +326,6 @@ internal fun Composer(
                                     SendState.Send -> if (ui.running) {
                                         sendMenu = true
                                     } else {
-                                        haptic.performHapticFeedback(
-                                            HapticFeedbackType.Confirm,
-                                        )
                                         onSend()
                                     }
                                 }
@@ -641,6 +649,85 @@ private fun MentionHint(token: String) {
             )
         }
     }
+}
+
+// ---- image attachments ------------------------------------------------------
+
+private const val MAX_IMAGE_EDGE = 2048
+private const val IMAGE_QUALITY = 85
+
+/**
+ * Read [uri] into a wire-ready [ChatViewModel.ImageAttachment]: a bounds-only
+ * pass picks `inSampleSize` so the long edge lands ≤ [MAX_IMAGE_EDGE], EXIF
+ * orientation is applied, then the bitmap is encoded JPEG q85 (WebP when it
+ * has alpha). Runs on [Dispatchers.IO]; null when the stream can't be read
+ * or decoded.
+ */
+private suspend fun compressImage(
+    resolver: ContentResolver,
+    uri: Uri,
+): ChatViewModel.ImageAttachment? = withContext(Dispatchers.IO) {
+    val raw = runCatching {
+        resolver.openInputStream(uri)?.use { it.readBytes() }
+    }.getOrNull() ?: return@withContext null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+    val longEdge = maxOf(bounds.outWidth, bounds.outHeight)
+    if (longEdge <= 0) return@withContext null
+    var sample = 1
+    while (longEdge / sample > MAX_IMAGE_EDGE) sample *= 2
+    val decoded = BitmapFactory.decodeByteArray(
+        raw, 0, raw.size,
+        BitmapFactory.Options().apply { inSampleSize = sample },
+    ) ?: return@withContext null
+    val bitmap = applyExifOrientation(decoded, exifOrientation(raw))
+    if (bitmap !== decoded) decoded.recycle()
+    val format = when {
+        !bitmap.hasAlpha() -> Bitmap.CompressFormat.JPEG
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ->
+            Bitmap.CompressFormat.WEBP_LOSSY
+        else -> @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
+    }
+    val out = ByteArrayOutputStream()
+    val encoded = bitmap.compress(format, IMAGE_QUALITY, out)
+    bitmap.recycle()
+    if (!encoded) return@withContext null
+    ChatViewModel.ImageAttachment(
+        out.toByteArray(),
+        if (format == Bitmap.CompressFormat.JPEG) "image/jpeg" else "image/webp",
+    )
+}
+
+private fun exifOrientation(raw: ByteArray): Int = runCatching {
+    ExifInterface(ByteArrayInputStream(raw)).getAttributeInt(
+        ExifInterface.TAG_ORIENTATION,
+        ExifInterface.ORIENTATION_NORMAL,
+    )
+}.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+/** Re-orients [bitmap] per its EXIF tag; returns it untouched when normal. */
+private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+    val m = Matrix()
+    when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> m.setRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180 -> m.setRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270 -> m.setRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.setScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL -> {
+            m.setRotate(180f)
+            m.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            m.setRotate(90f)
+            m.postScale(-1f, 1f)
+        }
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            m.setRotate(270f)
+            m.postScale(-1f, 1f)
+        }
+        else -> return bitmap
+    }
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
 }
 
 /** Slash-command strip inside the popup card while input starts with "/". */

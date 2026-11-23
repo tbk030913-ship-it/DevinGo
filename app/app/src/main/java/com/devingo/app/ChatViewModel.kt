@@ -117,6 +117,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         const val PERMISSION_TIMEOUT_MS = 5 * 60_000L
         /** If session/cancel doesn't end the prompt job within this, kill it. */
         const val CANCEL_WATCHDOG_MS = 10_000L
+        /**
+         * Combined compressed bytes of one send's attachments (pre-Base64).
+         * Decimal MB: after 4/3 Base64 inflation + JSON envelope this still
+         * lands under the bridge's 4 MiB WS message limit.
+         */
+        const val MAX_ATTACHMENT_BYTES = 3_000_000L
         const val RECONNECT_MAX_ATTEMPTS = 3
         const val RECONNECT_BASE_DELAY_MS = 2_000L
         const val RECONNECT_MAX_DELAY_MS = 30_000L
@@ -596,16 +602,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * Send while idle. When a turn is running the message joins the queue
      * (Devin-style "Queue" semantics); use [steer] for an immediate
      * mid-turn interrupt, which `midTurnPrompts` support enables.
+     *
+     * Returns false when nothing was sent — the caller must keep the input
+     * and attachments so the user doesn't lose them.
      */
-    fun send(text: String, attachments: List<ImageAttachment> = emptyList()) {
-        val sid = _ui.value.sessionId ?: return
+    fun send(text: String, attachments: List<ImageAttachment> = emptyList()): Boolean {
+        val sid = _ui.value.sessionId ?: return false
         val trimmed = text.trimEnd()
-        if (trimmed.isBlank() && attachments.isEmpty()) return
+        if (trimmed.isBlank() && attachments.isEmpty()) return false
+        val total = attachments.sumOf { it.bytes.size.toLong() }
+        if (total > MAX_ATTACHMENT_BYTES) {
+            append(Kind.Error, "图片合计超过 3MB，未发送")
+            return false
+        }
         if (_ui.value.running || promptJob?.isActive == true) {
+            // Queued prompts only carry the attachment count — queueing a
+            // send with images would silently drop the bytes, so refuse.
+            if (attachments.isNotEmpty()) {
+                append(Kind.Error, "运行中发送会丢失图片，请等本轮结束或移除图片")
+                return false
+            }
             _queuedPrompts.update { it + QueuedPrompt(trimmed, attachments.size) }
-            return
+            return true
         }
         launchPrompt(sid, trimmed, attachments)
+        return true
     }
 
     /** Interrupt the running turn with a new instruction right now. */

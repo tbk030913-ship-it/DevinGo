@@ -253,10 +253,11 @@ fun ChatScreen(
             permissionPending = pendingPermission != null,
             onInputChange = { input = it },
             onSend = {
-                haptic.performHapticFeedback(HapticFeedbackType.Confirm)
-                vm.send(input, attachments)
-                input = ""
-                attachments = emptyList()
+                if (vm.send(input, attachments)) {
+                    haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                    input = ""
+                    attachments = emptyList()
+                }
             },
             onSteer = {
                 vm.steer(input)
