@@ -12,7 +12,9 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -25,7 +27,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -48,12 +49,12 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -80,6 +81,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -348,6 +350,19 @@ internal fun Composer(
                             .onFocusChanged { focused = it.isFocused },
                         onImeSend = onImeSend,
                     )
+                    // Spec: the toolbar row fades in over 160ms as the layer
+                    // expands — the transition state starts hidden so the
+                    // enter animation actually plays on layer entry.
+                    val toolbarVisible = remember {
+                        MutableTransitionState(false).apply { targetState = true }
+                    }
+                    AnimatedVisibility(
+                        visibleState = toolbarVisible,
+                        enter =
+                            if (isReducedMotion()) EnterTransition.None
+                            else fadeIn(tween(160)),
+                        exit = fadeOut(tween(120)),
+                    ) {
                     ComposerToolbarRow(
                         scrollContent = {
                             ComposerPlusButton(
@@ -410,6 +425,7 @@ internal fun Composer(
                             )
                         },
                     )
+                    }
                 } else {
                     // Compact layer: + | horizontally-scrolling text | send.
                     Row(
@@ -463,7 +479,11 @@ private enum class SendState { Disabled, Send, Stop }
 
 // ---- shared pieces (compact and expanded layers) --------------------------------
 
-/** The composer's text field — one impl, single-line or editor-shaped. */
+/**
+ * The composer's text field — one impl, single-line or editor-shaped.
+ * The compact line is a BasicTextField: M3's TextField floor is 56.dp, so
+ * it could never give the pill its spec'd 52.dp.
+ */
 @Composable
 private fun ComposerField(
     value: TextFieldValue,
@@ -474,6 +494,39 @@ private fun ComposerField(
     onImeSend: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
+    if (singleLine) {
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = modifier.heightIn(min = 52.dp),
+            textStyle = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
+            singleLine = true,
+            visualTransformation = mentionVisualTransformation(),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(onSend = { onImeSend() }),
+            cursorBrush = SolidColor(cs.primary),
+            decorationBox = { inner ->
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp),
+                    contentAlignment = Alignment.CenterStart,
+                ) {
+                    if (value.text.isEmpty()) {
+                        Text(
+                            placeholder,
+                            color = cs.outline,
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    inner()
+                }
+            },
+        )
+        return
+    }
     TextField(
         value = value,
         onValueChange = onValueChange,
@@ -493,9 +546,8 @@ private fun ComposerField(
             focusedIndicatorColor = Color.Transparent,
             unfocusedIndicatorColor = Color.Transparent,
         ),
-        singleLine = singleLine,
-        minLines = if (singleLine) 1 else 3,
-        maxLines = if (singleLine) 1 else 6,
+        minLines = 3,
+        maxLines = 6,
         visualTransformation = mentionVisualTransformation(),
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
         keyboardActions = KeyboardActions(onSend = { onImeSend() }),
@@ -825,7 +877,7 @@ private fun CitationChip(
             tint = cs.onSurfaceVariant,
         )
         Text(
-            citation.quotedText.trim(),
+            citation.quotedText.trim().ifBlank { "引用（待填写）" },
             style = MaterialTheme.typography.bodySmall,
             color = cs.onSurface,
             maxLines = 1,

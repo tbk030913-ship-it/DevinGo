@@ -843,9 +843,14 @@ class SessionStore(
         _draft.value = text.take(MAX_DRAFT_CHARS)
     }
 
-    /** Pin/replace/clear the composer's quote (null clears). */
+    /**
+     * Pin/replace/clear the composer's quote (null clears). A blank quote is
+     * kept — clearing the field mid-edit in the citation sheet must not yank
+     * the sheet out from under the user's cursor; [mergedWithCitation]
+     * already treats an empty quote as no citation.
+     */
     fun setDraftCitation(citation: CitationAttachment?) {
-        _draftCitation.value = citation?.takeIf { it.quotedText.isNotBlank() }
+        _draftCitation.value = citation
     }
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {
