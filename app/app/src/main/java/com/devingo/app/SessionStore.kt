@@ -498,6 +498,18 @@ class SessionStore(
         streamKind = null
         streamingId = null
         planItemId = null
+        // needLoad means the hub can't serve our cursor — a truncated
+        // ring, or a journal that restarted wholesale behind our back
+        // (idle eviction + lazy re-create, or a bridge restart: seqs go
+        // back to 1). Reset the seq machinery either way: replayed frames
+        // re-advance the cursor onto the live epoch, and a stale
+        // cursor/floor can no longer misread every new-epoch live frame
+        // below the old high-water as history.
+        synchronized(seqLock) {
+            seqCursor.set(0)
+            consumedSeqs.clear()
+        }
+        liveSeqFloor = 0
         preLoadUserIds = currentMessages.filter { it.kind == Kind.User }.map { it.id }
         staged = mutableListOf()
     }

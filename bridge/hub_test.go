@@ -71,6 +71,15 @@ func notifyUpdate(sid, text string) {
 
 func main() {
 	stats := os.Getenv("DEVINGO_TEST_STATS")
+	// DEVINGO_DIE_ONCE names a flag file: the first boot creates it and
+	// exits before answering anything, so the respawn-retry test gets a
+	// failed handshake; the file then gates later boots healthy.
+	if gate := os.Getenv("DEVINGO_DIE_ONCE"); gate != "" {
+		if _, err := os.Stat(gate); os.IsNotExist(err) {
+			os.WriteFile(gate, []byte("x"), 0o644)
+			os.Exit(1)
+		}
+	}
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 64<<10), 16<<20)
 	for sc.Scan() {
@@ -685,6 +694,35 @@ func mustAttachResult(t *testing.T, tc *testClient, id any) rpcMsg {
 	return res
 }
 
+// A cursor past the journal's high-water mark references a dead epoch —
+// the session was idle-evicted and lazily re-created (nextSeq restarted
+// at 1), or the bridge restarted. Serving it would replay nothing and
+// silently diverge, so attach must answer needLoad.
+func TestAttachNeedLoadOnJournalEpochReset(t *testing.T) {
+	setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+
+	// A fresh journal epoch: the session is hosted but its journal only
+	// just restarted — the client's cursor of 7 belongs to the dead one.
+	bridgeHub.mu.Lock()
+	bridgeHub.getSessionLocked("EPOCH-SID")
+	bridgeHub.mu.Unlock()
+
+	c := dialClient(t, srv)
+	c.request(t, 1, "_devingo/attach", rpcMsg{"sessionId": "EPOCH-SID", "afterSeq": 7})
+	res := mustAttachResult(t, c, 1)
+	if res["needLoad"] != true {
+		t.Fatalf("stale-epoch attach: needLoad=%v, want true (%v)", res["needLoad"], res)
+	}
+
+	// A cursor inside the live epoch still attaches normally.
+	c.request(t, 2, "_devingo/attach", rpcMsg{"sessionId": "EPOCH-SID", "afterSeq": 0})
+	res = mustAttachResult(t, c, 2)
+	if res["needLoad"] == true {
+		t.Fatalf("fresh attach on restarted journal: needLoad=true (%v)", res)
+	}
+}
+
 // Killing the resident process must error in-flight client requests,
 // resolve pending agent requests as agent_died, journal + broadcast
 // _devingo/agent_dead, and lazily respawn on the next demand.
@@ -750,6 +788,32 @@ func TestProcDeathErrorsInflightAndRespawns(t *testing.T) {
 	}
 	if n := countStats(t, stats, `"method":"initialize"`); n != 2 {
 		t.Fatalf("devin saw %d initialize calls, want 2 (original + respawn)", n)
+	}
+}
+
+// _devingo/sessions after a failed first handshake must be served by the
+// healthy respawn — the retry used to run off the end of the loop and
+// answer "devin process unavailable" anyway.
+func TestSessionListServedAfterRespawn(t *testing.T) {
+	stats := setupHub(t, fakeDevin(t))
+	// First boot exits before answering (flag file created); the respawn
+	// sees the file and behaves normally.
+	t.Setenv("DEVINGO_DIE_ONCE", filepath.Join(t.TempDir(), "die-once"))
+	srv := newTestServer(t)
+
+	c := dialClient(t, srv)
+	c.request(t, 1, "_devingo/sessions", rpcMsg{})
+	resp := c.awaitID(t, 1, 60*time.Second)
+	if resp["error"] != nil {
+		t.Fatalf("_devingo/sessions after respawn: %v", resp["error"])
+	}
+	res, _ := resp["result"].(rpcMsg)
+	if _, ok := res["sessions"].([]any); !ok {
+		t.Fatalf("_devingo/sessions result missing sessions array: %v", res)
+	}
+	// The dead first boot never read a line; only the respawn serves.
+	if n := countStats(t, stats, `"method":"session/list"`); n != 1 {
+		t.Fatalf("devin saw %d session/list calls, want 1 (respawn only)", n)
 	}
 }
 

@@ -1111,11 +1111,16 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64)
 		})))
 		return
 	}
-	// The client wants events from afterSeq on, but the journal no longer
-	// reaches back that far. afterSeq==0 (catch up from scratch) is a
-	// truncated request too once the ring has been cut (earliestSeq > 1);
-	// only a still-intact journal (earliestSeq == 1) may replay-all.
-	if s.earliestSeq() > afterSeq+1 {
+	// The client's cursor is unservable two ways: the journal no longer
+	// reaches back that far (afterSeq==0 counts too once the ring has been
+	// cut — only a still-intact journal, earliestSeq == 1, may replay-all),
+	// or the cursor sits PAST the high-water mark. afterSeq >= nextSeq is
+	// unreachable within one epoch — every seq the client saw was journaled
+	// here — so it can only reference a dead journal: the session was
+	// evicted and lazily re-created (nextSeq restarted at 1), or the whole
+	// bridge restarted. Replaying nothing would diverge silently AND pin
+	// the client's live floor above the new epoch's seqs.
+	if s.earliestSeq() > afterSeq+1 || afterSeq >= s.nextSeq {
 		h.deliverLocked(c, resultFrameRaw(id, mustJSON(map[string]any{
 			"sessionId": sid, "needLoad": true, "lastSeq": s.nextSeq - 1,
 		})))
@@ -1504,41 +1509,37 @@ func (h *Hub) callDevin(p *devinProc, timeout time.Duration, method string, para
 }
 
 // callSessionList backs _devingo/sessions — always over the resident process.
+// A failed first handshake buys exactly one respawn; when that proc comes
+// up healthy the list must run on it — falling off the loop would report
+// "unavailable" while a perfectly good process sits idle.
 func (h *Hub) callSessionList(cwd string) (json.RawMessage, error) {
 	for attempts := 0; attempts < 2; attempts++ {
 		p := h.ensureProc()
-		if p.readyClosed() {
-			h.mu.Lock()
-			initErr := p.initErr
-			h.mu.Unlock()
-			if initErr != nil && attempts == 0 {
+		if !p.readyClosed() {
+			// Wait for the handshake instead of erroring: a session list
+			// is exactly the cold-start demand.
+			t := time.NewTimer(initReadyTimeout)
+			select {
+			case <-p.ready:
+				t.Stop()
+			case <-t.C:
+				return nil, errors.New("devin process did not become ready")
+			}
+		}
+		h.mu.Lock()
+		initErr := p.initErr
+		h.mu.Unlock()
+		if initErr != nil {
+			if attempts == 0 {
 				continue // spawn failed once; respawn and retry
 			}
-			if initErr != nil {
-				return nil, initErr
-			}
-			var params map[string]any
-			if cwd != "" {
-				params = map[string]any{"cwd": cwd}
-			}
-			return h.callDevin(p, devinCallTimeout, "session/list", params)
+			return nil, initErr
 		}
-		// Wait for the handshake instead of erroring: a session list is
-		// exactly the cold-start demand.
-		t := time.NewTimer(initReadyTimeout)
-		select {
-		case <-p.ready:
-			t.Stop()
-		case <-t.C:
-			return nil, errors.New("devin process did not become ready")
+		var params map[string]any
+		if cwd != "" {
+			params = map[string]any{"cwd": cwd}
 		}
-	}
-	p := h.ensureProc()
-	h.mu.Lock()
-	err := p.initErr
-	h.mu.Unlock()
-	if err != nil {
-		return nil, err
+		return h.callDevin(p, devinCallTimeout, "session/list", params)
 	}
 	return nil, errors.New("devin process unavailable")
 }
