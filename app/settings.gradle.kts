@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "DevinGo"
 include(":app")
+include(":baselineprofile")

@@ -4,6 +4,7 @@ app/.gradle/
 app/local.properties
 app/app/build/
 app/app/release/
+app/baselineprofile/build/
 *.apk
 *.aab
 

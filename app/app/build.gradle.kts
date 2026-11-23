@@ -2,6 +2,7 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
+    alias(libs.plugins.baselineprofile)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
@@ -98,6 +99,13 @@ kotlin {
     }
 }
 
+// One generated profile covers every variant (release and the release-shaped
+// profile build): generation merges into src/main/generated/baselineProfiles
+// and is invoked manually via :app:generateBaselineProfile.
+baselineProfile {
+    mergeIntoMain = true
+}
+
 // Stability allow-list in place of kotlinx-collections-immutable: every
 // List/Map/Set handed to a composable here is a replaced snapshot, never
 // mutated in place.
@@ -143,4 +151,8 @@ dependencies {
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
     implementation(libs.mlkit.barcode)
+
+    // Installs the packaged baseline-prof.txt on first launch / update.
+    implementation(libs.androidx.profileinstaller)
+    baselineProfile(project(":baselineprofile"))
 }

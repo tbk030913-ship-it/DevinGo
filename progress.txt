@@ -14,3 +14,4 @@
 2026-11-23 07:13（北京时间）| B3及时发现网关断开：实现onClosing即刻应答+failAll，1011等关闭原因随Disconnected上屏、running立即复位；五个WS回调加stale socket守卫修新旧连接竞态（含手动断开后旧socket误触发重连的隐患）
 2026-11-23 07:37（北京时间）| B4四修复：排队消息带图（QueuedPrompt存附件原样发出、菜单排队放开）、错误重试复用原resumeId/cwd、工具failed计入失败数+图标、未发送消息可重发
 2026-11-23 08:11 | B5流式卡顿修复：animateItem去弹簧、Turn预存work/failed/diffStats+四类型@Immutable+stability_config白名单、BodyItem去掉ui参数、侧栏关闭不组合HomeScreen、DiffBody计算中行数占位；assembleDebug/Profile双过，janky frames待真机实测
+2026-11-23 09:04 | B6 Baseline Profile 基建：profileinstaller+androidx.baselineprofile 插件入 :app，新建 :baselineprofile（com.android.test）模块，生成器覆盖冷启动→首页→开会话→滚动→展开工作过程（无网桥时优雅跳过），StartupBenchmark 提供 None vs Partial 冷启动对比；:app:generateBaselineProfile→src/main 全变体共享，assembleDebug/Profile/Release 全绿
