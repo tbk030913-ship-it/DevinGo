@@ -76,7 +76,8 @@ interface AcpEvent {
     data class RevertStepsUpdated(val params: JsonObject) : AcpEvent
     data class AgentLog(val channel: String, val message: String, val level: String) : AcpEvent
     data class Failure(val message: String) : AcpEvent
-    data object Disconnected : AcpEvent
+    /** Socket dropped; [reason] is the close/failure detail shown to the user. */
+    data class Disconnected(val reason: String) : AcpEvent
 }
 
 data class PlanEntry(
@@ -146,7 +147,19 @@ class AcpClient(
         }
         suspendCancellableCoroutine { cont ->
             val socket = http.newWebSocket(reqBuilder.build(), object : WebSocketListener() {
+                // Every callback first checks the socket is still `ws`: a
+                // dying socket can fire late, after a fresh connect already
+                // replaced it, and must not failAll the new connection.
                 override fun onOpen(webSocket: WebSocket, response: Response) {
+                    if (webSocket !== ws) {
+                        // Superseded handshake — close it or the bridge keeps
+                        // a conn slot and a devin process alive for nothing.
+                        // Resume too: the loser of the ws-race must not leave
+                        // its connect() suspended forever.
+                        webSocket.close(1000, "superseded")
+                        cont.resumeWithException(AcpException("连接被取代"))
+                        return
+                    }
                     if (!cont.isActive) {
                         webSocket.close(1000, "cancelled")
                         return
@@ -155,10 +168,23 @@ class AcpClient(
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    if (webSocket !== ws) return
                     dispatch(text)
                 }
 
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    // Peer initiated the close: answer the handshake right
+                    // away, even on a stale socket.
+                    webSocket.close(code, reason)
+                    if (webSocket !== ws) return
+                    // Fail fast — the socket is already dead (e.g. devin
+                    // exited → 1011), so pending requests must not hang
+                    // until their own timeouts notice.
+                    failAll(closeText(code, reason))
+                }
+
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (webSocket !== ws) return
                     if (cont.isActive) {
                         cont.resumeWithException(
                             AcpException("连接失败: ${t.message ?: t.javaClass.simpleName}"),
@@ -169,7 +195,8 @@ class AcpClient(
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    failAll("连接已关闭 ($code $reason)")
+                    if (webSocket !== ws) return
+                    failAll(closeText(code, reason))
                 }
             })
             ws = socket
@@ -633,10 +660,18 @@ class AcpClient(
 
     private fun failAll(reason: String) {
         sessionId = null
-        pending.values.forEach { it.completeExceptionally(AcpException(reason)) }
-        pending.clear()
-        _events.trySend(AcpEvent.Disconnected)
+        // Claim each deferred with an atomic remove — a put() racing a
+        // values() snapshot + clear() could strand it uncompleted forever.
+        pending.entries.forEach {
+            if (pending.remove(it.key, it.value)) {
+                it.value.completeExceptionally(AcpException(reason))
+            }
+        }
+        _events.trySend(AcpEvent.Disconnected(reason))
     }
+
+    private fun closeText(code: Int, reason: String): String =
+        if (reason.isBlank()) "连接已断开 ($code)" else "连接已断开 ($code): $reason"
 
     companion object {
         private const val TAG = "AcpClient"

@@ -11,3 +11,4 @@
 2026-11-23 13:27 | 体验审查（只读，未改代码）：日志量化开会话服务端 2.0–2.9s；确认断线即杀 devin、切换会话固定等 2.3s 且重开进程、首页列表每次单起 devin 进程、原图超网关 4MiB 帧上限会断会话等，输出 P0–P2 清单
 2026-11-23 14:17 | B1网关整理：陈旧exe/日志收进bridge/_old，token自动生成持久化%APPDATA%\DevinGo\bridge.json并随配对码下发，远端/acp等端点免token返401（/healthz、/pair、loopback豁免），-insecure改显式警告，新增-install/-uninstall注册登录任务，WS启用permessage-deflate；hs_err查明是SybaseMcp缺内存非Gradle
 2026-11-23 06:53（北京时间）| B2图片压缩：选图即在IO线程压缩（长边≤2048、JPEG85/有透明走WebP、EXIF校正），附件合计超3MB拦下不丢内容；bridge超帧改1009关闭且不再杀devin（进程保留供重连续会话）
+2026-11-23 07:13（北京时间）| B3及时发现网关断开：实现onClosing即刻应答+failAll，1011等关闭原因随Disconnected上屏、running立即复位；五个WS回调加stale socket守卫修新旧连接竞态（含手动断开后旧socket误触发重连的隐患）

@@ -143,6 +143,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var promptJob: Job? = null
     private var reconnectJob: Job? = null
     private var steerJob: Job? = null
+    /** disconnect()'s async closeSession→client.disconnect tail; connect() joins it. */
+    private var teardownJob: Job? = null
 
     /** Prompts queued while a turn is running — sent FIFO when it ends. */
     private val _queuedPrompts = MutableStateFlow<List<QueuedPrompt>>(emptyList())
@@ -221,6 +223,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         lastHost = host
         pendingResumeId = resumeSessionId
         pendingApiKey = apiKey?.trim()?.ifBlank { null }
+        // A new connection epoch supersedes the old resume/cwd anchors —
+        // they're re-established once a session is up (rememberSession,
+        // pendingCwd). Leaving them stale would let a mid-handshake drop
+        // auto-resume the previous session or attach a dead cwd.
+        lastResumeSessionId = null
+        lastResumeCwd = ""
+        activeCwd = ""
+        pendingCwd = ""
         bridgeHttpUrl = healthUrl(host)
         bridgeToken = token.ifBlank { null }
         viewModelScope.launch {
@@ -241,6 +251,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 _ui.update { it.copy(phase = Phase.Connecting, statusText = "建立 WebSocket…") }
+                // disconnect()'s teardown can hold the old socket ~2s
+                // (closeSession) — it must finish before a fresh socket is
+                // created, or the tail's ws=null/close would kill it. Only
+                // then do drops count again, so re-arm the flag here, not at
+                // the top: while the old socket is still `ws`, its genuine
+                // Disconnected must stay swallowed too.
+                teardownJob?.join()
+                intentionalDisconnect = false
                 client.connect(wsUrl(host), token.ifBlank { null })
 
                 _ui.update { it.copy(statusText = "ACP 握手…") }
@@ -328,20 +346,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * backoff (2s, 4s, 8s — capped at 30s, at most 3 attempts); on success
      * `session/load` restores the session and its transcript replay.
      */
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(reason: String) {
         if (reconnectJob?.isActive == true) return
+        // e.g. "连接已断开 (1011): devin acp exited" — the bridge's close
+        // reason is why the socket dropped, so it belongs in the line.
+        val detail = reason.ifBlank { "连接已断开" }
         val host = lastHost
         val token = bridgeToken
-        val sessionId = lastResumeSessionId ?: _ui.value.sessionId
+        // pendingResumeId covers a drop mid-resume-handshake: the user
+        // already chose that session, so it stays the reconnect target.
+        val sessionId = lastResumeSessionId ?: _ui.value.sessionId ?: pendingResumeId
         val cwd = lastResumeCwd.ifBlank { activeCwd.ifBlank { pendingCwd } }
         if (host.isBlank() || sessionId.isNullOrBlank() || cwd.isBlank()) {
             _ui.update {
-                it.copy(phase = Phase.Error, error = "与 bridge 的连接已断开", running = false)
+                it.copy(phase = Phase.Error, error = detail, running = false)
             }
-            append(Kind.System, "连接已断开")
+            append(Kind.System, detail)
             return
         }
-        append(Kind.System, "连接已断开，尝试自动重连…")
+        append(Kind.System, "$detail，尝试自动重连…")
         reconnectJob = viewModelScope.launch {
             _ui.update {
                 it.copy(reconnecting = true, running = false, statusText = "连接已断开")
@@ -491,6 +514,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun disconnect() {
         intentionalDisconnect = true
         pendingResumeId = null
+        // The resume/cwd anchors belong to this connection epoch — the
+        // session is intentionally left, so a new connect() must never
+        // revive it or its working directory.
+        lastResumeSessionId = null
+        lastResumeCwd = ""
+        activeCwd = ""
         reconnectJob?.cancel()
         reconnectJob = null
         promptJob?.cancel()
@@ -498,7 +527,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // Tell the agent to release the session lock before the socket dies —
         // orphaned acp processes otherwise hold isLocked until reaped.
         val sid = _ui.value.sessionId
-        viewModelScope.launch {
+        teardownJob = viewModelScope.launch {
             if (sid != null) {
                 runCatching { withTimeoutOrNull(2_000) { client.closeSession(sid) } }
             }
@@ -980,15 +1009,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             is AcpEvent.Failure -> append(Kind.Error, ev.message)
-            AcpEvent.Disconnected -> {
-                if (intentionalDisconnect) {
-                    intentionalDisconnect = false
-                } else {
-                    // A dead socket strands any queued permission prompts.
-                    clearPermissions()
-                    _ui.update { it.copy(running = false) }
-                    scheduleReconnect()
-                }
+            is AcpEvent.Disconnected -> {
+                // Sticky, not consume-once: teardown's own "已断开" event and
+                // any late peer-close on the dying socket must never schedule
+                // a phantom reconnect. connect() re-arms the flag once the
+                // teardown has been joined and a new socket is imminent.
+                if (intentionalDisconnect) return
+                // A dead socket strands any queued permission prompts.
+                clearPermissions()
+                _ui.update { it.copy(running = false) }
+                scheduleReconnect(ev.reason)
             }
             else -> Unit // forward-compat with updates added alongside acp/ changes
         }
