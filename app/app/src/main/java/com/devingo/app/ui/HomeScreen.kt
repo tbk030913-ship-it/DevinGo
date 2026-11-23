@@ -560,7 +560,7 @@ internal fun HomeScreen(
                 // Short phase words only — the long statusText stays in the
                 // floating card above the bar.
                 statusText = when {
-                    openTarget?.resumeId != null -> "正在切换…"
+                    openTarget?.sessionId != null -> "正在切换…"
                     ui.phase == Phase.Authenticating -> "登录中…"
                     ui.phase == Phase.StartingSession -> "创建会话…"
                     ui.phase == Phase.Checking ||
@@ -579,7 +579,7 @@ internal fun HomeScreen(
                     if (drawerMode) onNewSession() else startConnect()
                 },
                 newSessionLoading = busy ||
-                    (openTarget != null && openTarget?.resumeId == null),
+                    (openTarget != null && openTarget?.sessionId == null),
                 modifier = Modifier
                     .fillMaxWidth()
                     .navigationBarsPadding()

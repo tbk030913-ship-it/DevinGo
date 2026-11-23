@@ -58,7 +58,6 @@ class ConnectionManager private constructor(private val app: Application) {
         val statusText: String = "",
         val error: String? = null,
         val agentTitle: String? = null,
-        val authMethods: List<String> = emptyList(),
         val awaitingBrowserLogin: Boolean = false,
         val reconnecting: Boolean = false,
         /**
@@ -273,7 +272,6 @@ class ConnectionManager private constructor(private val app: Application) {
                     phase = Phase.Ready,
                     statusText = "",
                     agentTitle = init.agentInfo?.title ?: init.agentInfo?.name,
-                    authMethods = init.authMethods.map { m -> m.id },
                     connected = true,
                 )
             }
@@ -321,7 +319,7 @@ class ConnectionManager private constructor(private val app: Application) {
     ) {
         noteHost(host, token)
         lastApiKey = apiKey?.trim()?.ifBlank { null }
-        pendingOpen = OpenTarget(resumeSessionId, cwd, resumeSessionId)
+        pendingOpen = OpenTarget(resumeSessionId, cwd)
         pendingCwd = cwd
         openJob?.cancel()
         openJob = scope.launch {
@@ -350,13 +348,17 @@ class ConnectionManager private constructor(private val app: Application) {
         token: String = "",
     ) {
         if (host.isNotBlank()) noteHost(host, token)
-        if (_currentStore.value?.sessionId == sessionId) {
-            _currentStore.value?.unread?.value = false
+        // Bound AND subscribed = a genuine no-op re-tap. A bound-but-
+        // unattached store (attach failed on a live socket) must fall
+        // through so openOrCreate re-attaches it.
+        val current = _currentStore.value
+        if (current != null && current.sessionId == sessionId && current.attached) {
+            current.unread.value = false
             return
         }
         val knownCwd = stores[sessionId]?.cwd
             ?: _sessions.value?.firstOrNull { it.sessionId == sessionId }?.cwd
-        pendingOpen = OpenTarget(sessionId, cwd ?: knownCwd, sessionId)
+        pendingOpen = OpenTarget(sessionId, cwd ?: knownCwd)
         pendingCwd = cwd ?: knownCwd.orEmpty()
         openJob?.cancel()
         openJob = scope.launch {
@@ -376,7 +378,7 @@ class ConnectionManager private constructor(private val app: Application) {
     /** Fresh session rooted at [cwd] (or the bridge default). */
     fun newSession(cwd: String? = null, host: String = "", token: String = "") {
         if (host.isNotBlank()) noteHost(host, token)
-        pendingOpen = OpenTarget(null, cwd, null)
+        pendingOpen = OpenTarget(null, cwd)
         pendingCwd = cwd.orEmpty()
         openJob?.cancel()
         openJob = scope.launch {
@@ -394,7 +396,7 @@ class ConnectionManager private constructor(private val app: Application) {
     }
 
     private suspend fun openOrCreate(resumeId: String?, cwd: String) {
-        _openTarget.value = OpenTarget(resumeId, cwd, resumeId)
+        _openTarget.value = OpenTarget(resumeId, cwd)
         _conn.update { it.copy(phase = Phase.StartingSession, statusText = "打开会话…") }
         try {
             if (resumeId == null) {
@@ -460,26 +462,32 @@ class ConnectionManager private constructor(private val app: Application) {
             try {
                 val r = client.attach(store.sessionId, store.lastSeq)
                 if (r.needLoad) {
-                    loadInto(store)
+                    loadInto(store, r.running)
                 } else {
                     store.markAttached(r)
                 }
                 if (announce) store.append(Kind.System, "会话已恢复 · ${store.cwd}")
             } finally {
                 store.endReplay()
-                // Live-forwarded frames the backlog didn't also cover (seq
-                // past the replayed cursor) are real live traffic — route
-                // them now, in order.
+                // Usually empty — a frame only parks here when it arrived
+                // (we were already subscribed) while the attach RPC was in
+                // flight AND the backlog didn't cover it (seq past the
+                // replayed cursor). Those are real live traffic, re-routed
+                // in order; a failed attach drops them so a later attach
+                // can re-cover them from the journal instead of consuming
+                // them twice.
                 store.drainDeferred().forEach { route(it) }
             }
         }
     }
 
-    /** `session/load` replay (journal no longer reaches back far enough). */
-    private suspend fun loadInto(store: SessionStore) {
+    /** `session/load` replay (journal no longer reaches back far enough).
+     *  [running] is the attach result's turn state — the load response
+     *  itself doesn't carry it. */
+    private suspend fun loadInto(store: SessionStore, running: Boolean) {
         store.beginLoad()
         val r = client.loadSession(store.sessionId, store.cwd)
-        store.finishLoad(r)
+        store.finishLoad(r, running)
     }
 
     private suspend fun createStore(sessionId: String, cwd: String): SessionStore {
@@ -833,7 +841,7 @@ class ConnectionManager private constructor(private val app: Application) {
                     _conn.update {
                         it.copy(phase = Phase.StartingSession, statusText = "已登录，打开会话…")
                     }
-                    openOrCreate(target.resumeId, target.cwd.orEmpty().ifBlank { defaultCwd })
+                    openOrCreate(target.sessionId, target.cwd.orEmpty().ifBlank { defaultCwd })
                 } else {
                     _conn.update { it.copy(phase = Phase.Ready, statusText = "") }
                 }
@@ -871,7 +879,7 @@ class ConnectionManager private constructor(private val app: Application) {
                 client.authenticate("devin-browser")
             }
             _conn.update { it.copy(awaitingBrowserLogin = false) }
-            openOrCreate(target.resumeId, target.cwd.orEmpty().ifBlank { defaultCwd })
+            openOrCreate(target.sessionId, target.cwd.orEmpty().ifBlank { defaultCwd })
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -890,7 +898,7 @@ class ConnectionManager private constructor(private val app: Application) {
      * snackbar's 重试 replays exactly these. Null resumeId = a new session.
      */
     fun retryTarget(): Pair<String?, String> =
-        (pendingOpen?.resumeId) to (pendingOpen?.cwd ?: pendingCwd)
+        (pendingOpen?.sessionId) to (pendingOpen?.cwd ?: pendingCwd)
 
     private fun AcpException.isAuthError(): Boolean =
         code == ACP_ERROR_AUTH_REQUIRED || message?.let {

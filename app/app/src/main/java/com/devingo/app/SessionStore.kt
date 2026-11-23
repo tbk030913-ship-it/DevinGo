@@ -97,8 +97,14 @@ class SessionStore(
     private val seqCursor = java.util.concurrent.atomic.AtomicLong(0)
     val lastSeq: Long get() = seqCursor.get()
 
-    /** Subscribed at the gateway (attach done, or new/load auto-subscribed). */
+    /** Subscribed at the gateway (attach done, or new/load auto-subscribed).
+     *  Mirrored into [SessionUi.attached] so a dead subscription on a live
+     *  socket is visible to the UI (ConnBanner), not just to open paths. */
     @Volatile var attached: Boolean = false
+        private set(value) {
+            field = value
+            _ui.update { it.copy(attached = value) }
+        }
 
     /** Serializes attach replays — a resync reattach and a manual re-open must not interleave. */
     internal val attachMutex = Mutex()
@@ -261,11 +267,44 @@ class SessionStore(
 
     // ---- journal cursor / attach bookkeeping -----------------------------------
 
+    /**
+     * Journaled seqs consumed OFF the ordered demux — agent->client
+     * requests held open for an answer, `_devingo/event` frames surfacing
+     * nothing — parked here by [seedSeq] until the cursor can cover them
+     * contiguously. They are delivered frames, never withheld traffic, so
+     * advancing over them is always truthful.
+     */
+    private val consumedSeqs = java.util.concurrent.ConcurrentSkipListSet<Long>()
+
+    /**
+     * Serializes seqCursor read-modify-write against [consumedSeqs] —
+     * [noteSeq] runs on the Main demux while [seedSeq] runs on OkHttp's
+     * dispatch thread, and a remove-then-advance split across them could
+     * overshoot the cursor by one. The coarse rewinds
+     * (`seqCursor.set(replayBaseSeq)`/`set(cachedSeq)`) deliberately stay
+     * outside: parked seqs above a rewound cursor just drain later.
+     */
+    private val seqLock = Any()
+
     /** Record a journaled `_seq`; the skip-ahead check lives in [liveGap]. */
     fun noteSeq(seq: Long) {
         if (seq <= 0) return
-        seqCursor.updateAndGet { maxOf(it, seq) }
+        synchronized(seqLock) {
+            seqCursor.updateAndGet { maxOf(it, seq) }
+            // Entries below the cursor are covered — drop them (they only
+            // pile up after a rewind). Strictly-below bound: the entry AT
+            // cursor+1 must drain through advanceCursor, not be swept.
+            consumedSeqs.headSet(seqCursor.get() + 1).clear()
+            advanceCursor()
+        }
         commitIfCaughtUp(seq)
+    }
+
+    /** Advance over parked seqs the cursor now reaches; adjacency only. */
+    private fun advanceCursor() {
+        while (consumedSeqs.remove(seqCursor.get() + 1)) {
+            seqCursor.incrementAndGet()
+        }
     }
 
     /**
@@ -316,9 +355,19 @@ class SessionStore(
      * frame's gap check re-attaches and the backlog covers the window. The
      * response itself still completes its request — only the cursor
      * bookkeeping ignores out-of-order seqs.
+     *
+     * Non-adjacent seqs park in [consumedSeqs] instead of being dropped:
+     * a request seq recorded while earlier frames sit deferred (attach
+     * window) drains once their routing notes them, so the request never
+     * reads as a hole either way.
      */
     fun seedSeq(seq: Long) {
-        seqCursor.updateAndGet { if (seq == it + 1) seq else it }
+        if (seq <= 0) return
+        synchronized(seqLock) {
+            if (seq <= seqCursor.get()) return
+            consumedSeqs.add(seq)
+            advanceCursor()
+        }
     }
 
     /** The store is subscribed and its replay boundary is known. */
@@ -437,12 +486,17 @@ class SessionStore(
         staged = mutableListOf()
     }
 
-    /** `session/load` finished: timings remapped, staged copy committed. */
-    fun finishLoad(result: SessionNewResult) {
+    /** `session/load` finished: timings remapped, staged copy committed.
+     *  [running] is the attach result's hub-side turn state — the needLoad
+     *  path is the only attach that doesn't pass through [markAttached],
+     *  so without it a running turn would wait for the next live frame. */
+    fun finishLoad(result: SessionNewResult, running: Boolean) {
         remapLoadTimings()
         commitStaged()
         replaying = false
         attached = true
+        remoteTurn = running
+        refreshRunning()
         // Replay frames still landing past the response are history — pin the
         // live floor at the cursor so they can't masquerade as a live turn.
         liveSeqFloor = maxOf(liveSeqFloor, lastSeq)
@@ -482,8 +536,10 @@ class SessionStore(
 
     // ---- events ---------------------------------------------------------------
 
-    /** True for live traffic — never attach/load replay backlog. */
-    fun isLive(seq: Long): Boolean = !replaying && (seq == 0L || seq > liveSeqFloor)
+    /** True for live traffic — never attach/load replay backlog. A seq-0
+     *  frame is by definition unjournaled, so it can't BE backlog: it is
+     *  live even when it lands inside a replay window. */
+    fun isLive(seq: Long): Boolean = seq == 0L || (!replaying && seq > liveSeqFloor)
 
     /**
      * A journaled frame [seq] skipped ahead of the cursor while live — the
@@ -996,8 +1052,9 @@ class SessionStore(
     // ---- agent -> client requests -----------------------------------------------
 
     suspend fun handleAgentRequest(req: IncomingRequest) {
-        // Journaled requests never pass noteSeq — they still count toward
-        // attach-backlog coverage.
+        // Journaled request seqs are seeded at dispatch (AcpClient), in
+        // wire order — the cursor already covers req.seq here; it still
+        // counts toward attach-backlog coverage.
         commitIfCaughtUp(req.seq)
         when (req.method) {
             AcpMethods.SESSION_REQUEST_PERMISSION -> handlePermission(req)
@@ -1196,7 +1253,12 @@ class SessionStore(
     private fun capMessages(list: List<ChatItem>): List<ChatItem> {
         if (list.size <= MAX_MESSAGES) return list
         val head = list.take(KEEP_HEAD)
-        return head + list.drop(KEEP_HEAD).drop(list.size - MAX_MESSAGES)
+        val capped = head + list.drop(KEEP_HEAD).drop(list.size - MAX_MESSAGES)
+        // Turn timings keyed on evicted items would leak for the store's
+        // lifetime — drop them with the items.
+        val kept = capped.mapTo(HashSet()) { it.id }
+        _turnTimes.update { t -> t.filterKeys { it in kept } }
+        return capped
     }
 
     private fun noteTurnStart(itemId: Long) {

@@ -59,7 +59,9 @@ data class UiState(
     val reconnecting: Boolean = false,
     /** The shared socket is up — sessions may be streaming off-screen. */
     val connected: Boolean = false,
-    val authMethods: List<String> = emptyList(),
+    /** The bound store is subscribed — false mid-attach or after a failed
+     *  attach on a still-live socket (the chat looks dead but isn't down). */
+    val attached: Boolean = false,
     /** configOptions entries outside mode/model (effort, thinking, …). */
     val extraConfigOptions: List<ConfigOption> = emptyList(),
 )
@@ -145,6 +147,9 @@ data class SessionUi(
     val usageOutput: Long = 0,
     val usageCacheRead: Long = 0,
     val running: Boolean = false,
+    /** The store is subscribed at the gateway — false while attaching and
+     *  after a failed attach/subscription loss on a still-live socket. */
+    val attached: Boolean = false,
     /** configOptions entries outside mode/model (effort, thinking, …). */
     val extraConfigOptions: List<ConfigOption> = emptyList(),
 )
@@ -168,11 +173,11 @@ sealed interface Page {
     data class Chat(val sessionId: String) : Page
 }
 
-/** The session an open/switch attempt is aimed at (drawer spinner + retry). */
+/** The session an open/switch attempt is aimed at (drawer spinner + retry);
+ *  null sessionId = the attempt creates a new session. */
 data class OpenTarget(
-    val resumeId: String?,
-    val cwd: String?,
     val sessionId: String?,
+    val cwd: String?,
 )
 
 /** A heads-up for something happening in a session that isn't on screen. */

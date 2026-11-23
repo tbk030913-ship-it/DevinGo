@@ -84,7 +84,10 @@ class TranscriptCache(context: Context, private val json: Json) {
         runCatching {
             val f = fileFor(sessionId)
             if (!f.isFile) return@runCatching null
-            json.decodeFromString<CachedTranscript>(f.readText()).takeIf { it.v == 1 }
+            // The filename is sanitized, so distinct ids can collide onto
+            // one file — the stored id is the only trustworthy check.
+            json.decodeFromString<CachedTranscript>(f.readText())
+                .takeIf { it.v == 1 && it.sessionId == sessionId }
         }.getOrNull()
     }
 
@@ -100,6 +103,10 @@ class TranscriptCache(context: Context, private val json: Json) {
                         f.writeText(tmp.readText())
                         tmp.delete()
                     }
+                    // A save killed mid-write leaves its .tmp behind —
+                    // sweep strays under the same lock.
+                    dir.listFiles { _, name -> name.endsWith(".tmp") }
+                        ?.forEach { it.delete() }
                     // LRU: drop everything past the newest MAX_SESSIONS files.
                     dir.listFiles { _, name -> name.endsWith(".json") }
                         ?.sortedByDescending { it.lastModified() }

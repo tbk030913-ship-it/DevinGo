@@ -311,7 +311,14 @@ private fun WorkRow(
             Spacer(Modifier.width(6.dp))
             if (live) {
                 Text(
-                    "工作中 · ${elapsed / 60}:${(elapsed % 60).toString().padStart(2, '0')}",
+                    // No turn start (e.g. a remote turn we never saw the
+                    // prompt for) → no elapsed; "0:00" would just freeze.
+                    if (startedAt > 0L) {
+                        "工作中 · ${elapsed / 60}:" +
+                            (elapsed % 60).toString().padStart(2, '0')
+                    } else {
+                        "工作中"
+                    },
                     style = MaterialTheme.typography.labelLarge,
                     color = cs.onSurfaceVariant,
                     maxLines = 1,

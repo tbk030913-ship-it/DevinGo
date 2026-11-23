@@ -192,9 +192,12 @@ class AcpClient(
     var requestHandler: (suspend (IncomingRequest) -> Unit)? = null
 
     /**
-     * Called with (sessionId, seq) for every journaled response frame we
-     * receive — the gateway splices `_seq` into session-scoped results so
-     * callers can keep a per-session journal cursor.
+     * Called with (sessionId, seq) for every journaled frame that consumes
+     * a `_seq` outside the ordered event demux — responses to our own
+     * requests, agent->client requests held open for an answer, and
+     * `_devingo/event` frames that surface no event. The callback runs on
+     * the reader thread, in wire order, so the cursor never trails a frame
+     * the demux hasn't seen yet.
      */
     var seqTracker: ((sessionId: String, seq: Long) -> Unit)? = null
 
@@ -622,6 +625,12 @@ class AcpClient(
     private fun handleIncomingRequest(method: String, id: JsonElement, params: JsonElement?, seq: Long) {
         val p = params as? JsonObject
         val sessionId = (p?.get("sessionId") as? JsonPrimitive)?.textOrNull
+        // A journaled agent->client request consumed its _seq: record it
+        // NOW, on the reader thread. The handler runs async on clientScope,
+        // so seeding any later would let the next frame's liveGap check
+        // read this seq as a hole (adjacency-only — a real gap before it
+        // still trips and re-attaches).
+        if (sessionId != null && seq > 0) seqTracker?.invoke(sessionId, seq)
         val req = IncomingRequest(id, method, p, sessionId, seq)
         // A handler that already answered and then throws would otherwise send
         // a SECOND message with the same id (the catch block's error response).
@@ -683,11 +692,14 @@ class AcpClient(
                 )
             }
             "_devingo/event" -> {
-                // A journaled response owned by another client. Only
-                // turn-ending frames matter here: a session/prompt result
-                // carries stopReason, a prompt's error frame carries only
-                // `error` — either way the remote turn is over. (An error
-                // on another request kind would just end the marker a
+                // A journaled response owned by another client consumed its
+                // _seq even when nothing below surfaces an event — seed it
+                // or the next live frame reads the hole as a gap.
+                if (sessionId != null && seq > 0) seqTracker?.invoke(sessionId, seq)
+                // Only turn-ending frames matter here: a session/prompt
+                // result carries stopReason, a prompt's error frame carries
+                // only `error` — either way the remote turn is over. (An
+                // error on another request kind would just end the marker a
                 // beat early; the next chunk re-marks it.)
                 val frame = p["event"] as? JsonObject
                 val stopReason = ((frame?.get("result") as? JsonObject)

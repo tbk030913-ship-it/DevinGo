@@ -55,6 +55,9 @@ class SessionService : Service() {
                     title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "DevinGo" },
                     detail = intent.getStringExtra(EXTRA_DETAIL).orEmpty(),
                     startedAtMillis = intent.getLongExtra(EXTRA_STARTED_AT, 0L),
+                    promoteOngoing = intent.getBooleanExtra(EXTRA_PROMOTE, false),
+                    allowLabel = intent.getStringExtra(EXTRA_ALLOW_LABEL) ?: "允许",
+                    denyLabel = intent.getStringExtra(EXTRA_DENY_LABEL) ?: "拒绝",
                     sessionId = intent.getStringExtra(Notifier.EXTRA_SESSION_ID),
                 )
                 scheduleIdleRepost()
@@ -234,6 +237,9 @@ class SessionService : Service() {
         private const val EXTRA_TITLE = "live_title"
         private const val EXTRA_DETAIL = "live_detail"
         private const val EXTRA_STARTED_AT = "live_started_at"
+        private const val EXTRA_PROMOTE = "live_promote"
+        private const val EXTRA_ALLOW_LABEL = "live_allow_label"
+        private const val EXTRA_DENY_LABEL = "live_deny_label"
         private const val EXTRA_FALLBACK_TITLE = "title"
 
         /** Survives START_STICKY restarts while the process lives. */
@@ -256,6 +262,9 @@ class SessionService : Service() {
                     .putExtra(EXTRA_TITLE, status.title)
                     .putExtra(EXTRA_DETAIL, status.detail)
                     .putExtra(EXTRA_STARTED_AT, status.startedAtMillis)
+                    .putExtra(EXTRA_PROMOTE, status.promoteOngoing)
+                    .putExtra(EXTRA_ALLOW_LABEL, status.allowLabel)
+                    .putExtra(EXTRA_DENY_LABEL, status.denyLabel)
                     .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId),
             )
         }

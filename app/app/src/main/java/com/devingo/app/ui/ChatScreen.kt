@@ -24,7 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -46,6 +46,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -90,17 +91,25 @@ fun ChatScreen(
     val input by vm.draft.collectAsState()
     val attachments by vm.draftAttachments.collectAsState()
     val turnTimes by vm.turnTimes.collectAsState()
-    val listState = rememberLazyListState()
+    // Keyed on the bound session — the page stays Page.Chat across a
+    // session switch, so without the key scroll position and expansions
+    // would leak into the next session's transcript.
+    val listState = rememberSaveable(ui.sessionId, saver = LazyListState.Saver) {
+        LazyListState()
+    }
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
     var modelSheet by remember { mutableStateOf(false) }
     var infoSheet by remember { mutableStateOf(false) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
-    val expandedWork = remember { mutableStateMapOf<Long, Boolean>() }
+    val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
 
     // Back returns to Home WITHOUT disconnecting — the session's store keeps
-    // streaming and its row shows running/unread badges.
-    BackHandler { vm.leaveSession() }
+    // streaming and its row shows running/unread badges. An open sheet
+    // consumes back first (dismisses itself).
+    BackHandler(enabled = !modelSheet && !infoSheet && revertSteps == null) {
+        vm.leaveSession()
+    }
 
     // Notification alerts stay quiet only while the chat is actually on
     // screen — and only for the session that's on screen.
@@ -407,20 +416,24 @@ private fun SignalBars(modifier: Modifier = Modifier) {
 // ---- misc rows --------------------------------------------------------------------
 
 /**
- * Slim connection banner pinned under the top bar (U6): only while the
- * socket is down or coming back — connecting, reconnecting, dropped.
- * `connected` stays true through the session attach/open handshake that
- * follows, so the banner never covers it. Page state never depends on it.
+ * Slim connection banner pinned under the top bar (U6): while the socket
+ * is down or coming back — connecting, reconnecting, dropped — plus an
+ * attach failure on a live socket (the chat looks dead but isn't down) or
+ * the attach handshake itself. Page state never depends on it.
  */
 @Composable
 private fun ConnBanner(ui: UiState, modifier: Modifier = Modifier) {
     val cs = MaterialTheme.colorScheme
     val content = when {
-        ui.connected -> null
-        ui.reconnecting -> (ui.statusText.ifBlank { "正在重连…" }) to cs.outline
         ui.phase == Phase.Error ->
             (ui.statusText.ifBlank { ui.error ?: "连接已断开" }) to cs.error
-        else -> (ui.statusText.ifBlank { "连接中…" }) to cs.outline
+        ui.reconnecting -> (ui.statusText.ifBlank { "正在重连…" }) to cs.outline
+        !ui.connected -> (ui.statusText.ifBlank { "连接中…" }) to cs.outline
+        // Socket live but the bound session isn't subscribed — mid-attach,
+        // or an attach that failed quietly.
+        ui.sessionId != null && !ui.attached ->
+            (ui.statusText.ifBlank { "会话恢复中…" }) to cs.outline
+        else -> null
     }
     AnimatedVisibility(visible = content != null, modifier = modifier) {
         Row(
