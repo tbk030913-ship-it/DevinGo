@@ -12,13 +12,14 @@ bridge/ (Go, devingo-bridge.exe)
 
 `devin acp` 是 Devin CLI 自带的 [Agent Client Protocol](https://agentclientprotocol.com/)
 服务器（Zed / JetBrains 集成 Devin 用的同一套协议）。它只讲 stdio，所以手机上无法直连——
-`bridge/` 是一个纯管道：每条 WebSocket text frame ↔ devin stdin/stdout 的一行 JSON-RPC。
+`bridge/` 是会话托管网关：所有 WS 客户端共享**一个常驻 `devin acp`** 进程，hub 按
+sessionId 解复用、给每个会话记序号化 journal，手机掉线/杀进程后 attach 回放补齐。
 
 ## 目录
 
 | 路径 | 说明 |
 |---|---|
-| `bridge/` | Go 写的 WS↔stdio 中继。每个 WS 连接 spawn 一个 `devin acp` 进程 |
+| `bridge/` | Go 写的会话托管网关：一个常驻 `devin acp` 托管全部会话 + 配对/推送等 HTTP 端点 |
 | `app/`    | Android 工程（Kotlin + Compose + OkHttp + kotlinx.serialization） |
 
 ## 快速开始
@@ -33,7 +34,7 @@ go build -o devingo-bridge.exe .
 
 默认 `-addr :8790` 绑定所有网卡。**Token 不用手填**：首次启动自动生成 32 字节随机串，
 存到 `%APPDATA%\DevinGo\bridge.json`，之后复用；`-token`/`DEVINGO_TOKEN` 可显式覆盖。
-局域网客户端不带 token 访问 `/acp`、`/sessions`、`/models` 一律 401；loopback（要求 Host
+局域网客户端不带 token 访问 `/acp`、`/models` 一律 401；loopback（要求 Host
 也是 localhost）与 `/healthz`、`/pair` 放行，方便本机工具与配对探测。`-insecure` 显式关闭
 远端鉴权（启动打醒目警告，不推荐）；和 `-token` 同用时 token 仍然生效。
 
@@ -72,16 +73,16 @@ POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容�
 启动日志会打印局域网 `ws://<ip>:8790/acp` 地址和配对二维码（payload 同 /pair）。
 
 - `GET /healthz` → bridge 状态 + devin 是否可用 + 默认 cwd（配对探测用，免鉴权）
-- `GET /sessions`→ `devin list --format json` 历史会话列表
-- `GET /models`  → `devin models list --format json`
+- `GET /models`  → 缓存的模型列表（启动后异步 + 每 6h 跑一次 `devin models list`，只留 id/name）
 - `GET /pair`    → 配对二维码网页（只有本机打开才带 token）
-- `WS  /acp`     → ACP 中继
+- `WS  /acp`     → ACP 会话托管（标准 ACP + `_devingo/*` 私有扩展，见下）
 
 行为要点：单条 WS 消息上限 4MiB（默认 32KiB 会断大 payload）；最多 8 个并发 `/acp`
-会话（每个都 spawn 一个 `devin acp`），超出返回 503；`devin acp` 自行退出/崩溃时
-WS 以 close 1011 + 退出原因关闭（正常结束仍是 1000）；每 25s ping、10s pong 超时，
-用来发现手机睡死留下的半开连接并杀掉对应 devin；`/sessions`、`/models` 的 502
-`error` 字段会附带 devin stderr 的前 2KiB。
+连接（共享同一个常驻 devin），超出返回 503；常驻 `devin acp` 退出/崩溃时在途请求报错、
+hub 广播 `_devingo/agent_dead` 并按需懒重拉进程，会话本体在 devin 侧持久化、
+`session/load` 复活；每 25s ping、10s pong 超时，用来发现手机睡死留下的半开连接；
+会话无订阅/无在途请求/无待批满 `-idle-ttl`（默认 10min）后 hub 回收；`/models` 的
+502 `error` 字段会附带 devin stderr 的前 2KiB。
 
 ### 2. 安装并连接 App
 
@@ -103,27 +104,59 @@ cd app
 
 ### 3. 首次登录
 
-这个版本的 `devin acp` **不复用** `devin auth login` 的本地凭据——ACP host 是唯一凭据来源。
-所以首次建会话会返回 `auth_required`，App 会自动发起 `authenticate`（`devin-browser`），
-此时**电脑上会弹出浏览器，完成一次 Devin 登录即可**。之后凭据在 PC 侧持久化，
+正常情况下**无感**：常驻 `devin acp` 起来后，bridge 会自己完成 `authenticate`——把
+`%APPDATA%\devin\credentials.toml` 里的 `windsurf_api_key` 注入 ACP 握手
+（`-devinkey`/`DEVIN_API_KEY` 可覆盖），App 拿到的 initialize 应答就是已登录状态。
 
-重连一般不用再登。
+凭据缺失或注入失败时退回浏览器登录：App 发起 `authenticate`（`devin-browser`），电脑上
+弹出浏览器完成一次 Devin 登录即可。凭据之后由 devin 侧持久化，重连不用再登。
+
+## 会话托管机制（hub）
+
+一个常驻 `devin acp` 进程承载所有客户端的所有会话。网关代办 `initialize`/`authenticate`
+（应答缓存直接回客户端，客户端握手零等待），其余请求 id 重写到网关内部序列再转发、响应
+映射回来——普通 ACP 客户端无感，可以直接连。每个会话的事件进 5000 条 / 8MiB 的序号化
+环形 journal（帧上带 `_seq`）：掉线、杀进程、换设备都不丢回合，重连后 `_devingo/attach`
+按游标补放缺口，journal 已截断则回退 `session/load`。审批由 hub 持有（`-perm-ttl` 默认
+30min），同会话多客户端广播、首个应答获胜、其余收到 `permission_resolved`。无订阅、
+无在途、无待批的会话超过 `-idle-ttl`（默认 10min）被 hub 释放（`session/close`），
+下次打开再 `session/load` 拉起。
+
+## `_devingo/*` 私有方法
+
+`_devingo/` 前缀的请求由网关自己应答，永不转发给 devin：
+
+| 方法 / 通知 | 说明 |
+|---|---|
+| `_devingo/hello` | 客户端报到；回 clientId、版本、能力集 |
+| `_devingo/sessions` | `session/list` 合并 hub 实时态（`running`、`pendingPermission`）；会话列表只走它，HTTP `/sessions` 已移除 |
+| `_devingo/attach` | 订阅会话 + `afterSeq` 之后 journal 回放；回 `lastSeq`/`running`/`pendingPermission`，截断或未托管返 `needLoad` |
+| `_devingo/detach` | 退订；hub 继续托管该会话 |
+| `_devingo/event`（通知） | 别的客户端请求产生的回合结果（`session/prompt` 应答） |
+| `_devingo/permission_resolved`（通知） | 审批被其他客户端/TTL 解决，`outcome` 附结果 |
+| `_devingo/session_resync`（通知） | 他人的 `session/load` 回放期本客户端漏了 live 帧——按 `lastSeq` 重新 attach |
+| `_devingo/session_deleted`（通知） | 会话被删除 |
+| `_devingo/agent_dead`（通知） | 常驻 devin 进程死亡，running/待批已复位 |
 
 ## App 已实现的协议面
 
-- `initialize` / `authenticate` / `session/new` / `session/prompt` / `session/cancel`
-- `session/set_mode`、`session/set_model`
-- `session/update` 通知：agent 回复流式追加、思考流、tool_call(+update)、plan、mode 变更
-- `session/request_permission` → App 弹审批框（allow / reject 按钮由 Devin 给的 options 决定）
-- Devin 私有扩展 `_cognition.ai/output`：只显示 warn/error 级日志
+- `initialize` / `authenticate` / `session/new` / `session/load` / `session/prompt` /
+  `session/cancel` / `session/delete` / `session/close`
+- `session/set_config_option`（mode / model / effort 等统一入口）、`session/list`、
+  `_cognition.ai/session/rename`
+- `session/update` 通知：agent 回复流式追加、思考流、tool_call(+update)、plan、
+  mode/model 变更、token 用量、上下文压缩
+- `session/request_permission` → App 内审批卡 + 系统通知（锁屏可直接允许/拒绝）
+- Devin 私有扩展：`_cognition.ai/revert/*`（回退步骤列表 + 分叉）、`_cognition.ai/output`
+  （warn/error 级日志）、`available_commands_update`（斜杠命令）
 - 未知 agent→client 请求（如 `fs/*`、`terminal/*`）统一回 `method_not_found` —— Devin 会自行完成文件/终端操作
 
 ## 安全注意
 
 - bridge 监听的是**明文 ws://**，App 声明了 `usesCleartextTraffic`。请只在可信局域网用，
   公网暴露务必加 `-token` + 前面套一层 TLS（如 Caddy/nginx wss 反代，或 Tailscale）。
-- 带非 localhost `Origin` 的浏览器请求会被拒绝（/acp 防 CSWSH，/sessions、/models
-  防 drive-by 刷 `devin list`）；无 Origin 的原生客户端不受影响。loopback 免鉴权同时
+- 带非 localhost `Origin` 的浏览器请求会被拒绝（/acp 防 CSWSH，/models
+  防 drive-by 探测）；无 Origin 的原生客户端不受影响。loopback 免鉴权同时
   要求 `Host` 也是 localhost/127.0.0.1，堵住 DNS 重绑定借浏览器读数据的口子。
 - App 里保存的 token 经 AndroidKeyStore AES/GCM 加密后落 SharedPreferences，
   仍建议把它当局域网共享密钥看待，别和重要凭据混用。
@@ -133,7 +166,12 @@ cd app
 
 ## 已知限制 / TODO
 
-- 只实现了 `session/new`；`session/load`（恢复历史会话）协议上支持（`loadSession: true`）但 UI 还没做
-- 图片/文件附件、`@` 引用、斜杠命令面板：未实现（`available_commands_update` 已在协议层收到）
-- Devin 私有 `_meta` 能力（sessionList、rename、share 等）未接线
-- 断线自动重连、后台保活：未实现，App 退后台 WS 会断
+- 回退只接了「列表 + 分叉成新会话」：`revert/preview`、`revert/execute`（在本会话内回滚）
+  协议常量已留但未接线；agent 不支持 revert 时菜单项自动隐藏
+- 附件只支持图片（压缩后 ≤3MB/条）；`@` 引用靠文本路径推断，没有文件选择器
+- `/models` 只留 id + name（无描述/参数）；模型列表主要靠会话内 `configOptions`，
+  `/models` 是兜底
+- `-install` 的计划任务是 Windows schtasks（登录时启动，非系统服务）——未登录的
+  Windows 会话里 bridge 不跑
+- F 批功能（变更汇总 diff、语音输入、`/fs/list` 文件选择、git 快捷操作、多设备只读页）
+  未开始

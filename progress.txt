@@ -29,3 +29,9 @@
 2026-11-24 00:58 | C6：草稿持久化——draft_<sessionId>入DataStore(500ms防抖)，createStore恢复，绑定会话草稿镜像进SavedStateHandle，gone才删drop时回刷；onStop全量flush；草稿cap 64k；图片仍纯内存
 2026-11-24 01:12 | C7锁屏直接审批：通知允许/拒绝改getBroadcast→PermissionActionReceiver(exported=false)，按requestId+toolCallId在openRequests原子complete核仍挂起未答才回复，stale只尝试开App不替用户决定；允许仍只选allow_once，拒绝reject_once→reject_always；LiveStatus带requestId/toolCallId/pendingCount，>1显"N 个审批待处理"无按钮点开进App；store加pendingPermissionCount流，CM汇总pendingApprovals+同步pendingApprovalCount()；答后goAsync等出队再重建卡片(Activity死也刷新)；EXTRA_NOTIFICATION_ACTION旧路径保留
 2026-11-24 01:25 | C8离线推送(默认关)：bridge新增push.go——新审批到达且会话无观众时POST「有新审批」(ntfy Priority=4)、回合running降零且无观众时POST「任务完成」，纯文本body不带会话内容，5s超时fire-and-forget只记日志；-push/DEVINGO_PUSH_URL优先、bridge.json push_url兜底(resolveToken重写保留全字段)；hasAudienceLocked与agentReqTargetsLocked同池(subs+loaders非dead)；首条pending才去重、被删会话不推；README补启用方式
+2026-11-24 01:40（北京时间）| P1–P5维护批：/models改缓存（启动异步+6h刷新、只留id/name、冷miss单飞同步取、失败保旧值，新增models.go+TestSlimModels）；删死代码——HTTP /sessions端点+sessionsHandler+sessionOverlay移除（app早已走_devingo/sessions，fetchBridgeSessions在C2已删）；P4回退菜单——revert调用-32601即标记ConnState.revertSupported=false（per-bridge、换bridge复位），隐藏菜单项+禁长按；P5 README重写首次登录/已知限制并补hub托管机制+_devingo/*表；P3 MCP建议见下
+  P3 MCP 盘点（实测进程树，不改动任何配置，交给用户决定）：
+  - 配置来源：devin acp 合并读取 ~/.claude.json 的 mcpServers 和 %APPDATA%\devin\mcp_config.json；每个 acp 进程各起一套 stdio MCP。
+  - 实测每个 devin acp 带起 4 个 stdio 子进程：sybase(java -jar SybaseMcp)、zai-mcp-server(npx @z_ai/mcp-server)、codegraph(codegraph serve --mcp)、mcp-playwright(npx @playwright/mcp)。当前 3 个 acp（IDE 主/summarizer/codemap，bridge 的常驻进程同理）=> 每服务 3 份属预期。
+  - 连不上的 4 个（与计划一致）：.claude.json 里 web-reader/web-search-prime/zread 三个 open.bigmodel.cn HTTP MCP——实测 endpoint 可达但所存 Z.ai key 被拒（返回"身份验证失败"，建议换 key 或删除）；mcp_config.json 的 github-mcp-server(api.githubcopilot.com/mcp) 401——配置无凭据，建议加 PAT 或删除。
+  - context7（两处配置都有）可达（空 POST 400 属正常握手）。
