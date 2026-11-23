@@ -53,6 +53,8 @@ class TranscriptCache(context: Context, private val json: Json) {
         val planEntries: List<CachedPlanEntry> = emptyList(),
         val failed: Boolean = false,
         val attachmentCount: Int = 0,
+        /** U5.4: the mid-turn "↪ 已转向" badge survives cache restores too. */
+        val steered: Boolean = false,
     )
 
     @Serializable

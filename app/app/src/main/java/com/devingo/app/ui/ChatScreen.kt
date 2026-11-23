@@ -4,12 +4,9 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,8 +25,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material3.DropdownMenuItem
+
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -48,7 +44,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,6 +79,7 @@ fun ChatScreen(
     val model by vm.transcript.collectAsState()
     val tail by vm.streamingTail.collectAsState()
     val queuedPrompts by vm.queuedPrompts.collectAsState()
+    val editingQueuedId by vm.editingQueuedId.collectAsState()
     val revertSteps by vm.revertSteps.collectAsState()
     val pendingPermission by vm.pendingPermission.collectAsState()
     // Draft + per-turn timings live in the session store — they survive
@@ -101,13 +97,16 @@ fun ChatScreen(
     val haptic = LocalHapticFeedback.current
     var modelSheet by remember { mutableStateOf(false) }
     var infoSheet by remember { mutableStateOf(false) }
+    var queueSheet by remember { mutableStateOf(false) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
 
     // Back returns to Home WITHOUT disconnecting — the session's store keeps
     // streaming and its row shows running/unread badges. An open sheet
     // consumes back first (dismisses itself).
-    BackHandler(enabled = !modelSheet && !infoSheet && revertSteps == null) {
+    BackHandler(
+        enabled = !modelSheet && !infoSheet && !queueSheet && revertSteps == null,
+    ) {
         vm.leaveSession()
     }
 
@@ -126,12 +125,14 @@ fun ChatScreen(
     val canScrollUp by remember {
         derivedStateOf { listState.canScrollBackward }
     }
-    // Scroll-to-bottom button: visible while the transcript isn't at bottom.
+    // Scroll-to-bottom: "at bottom" is first-visible == row 0 at offset 0
+    // (reverseLayout); an empty list is trivially at bottom.
     val atBottom by remember {
         derivedStateOf {
             val info = listState.layoutInfo
-            info.visibleItemsInfo.firstOrNull()?.index == 0 &&
-                info.visibleItemsInfo.firstOrNull()?.offset == 0
+            info.visibleItemsInfo.isEmpty() ||
+                (info.visibleItemsInfo.firstOrNull()?.index == 0 &&
+                    info.visibleItemsInfo.firstOrNull()?.offset == 0)
         }
     }
     // Auto-scroll only on a NEW user message (spec §P — no per-chunk scroll).
@@ -168,7 +169,7 @@ fun ChatScreen(
         // swaps the page back to a status screen (U6).
         ConnBanner(ui)
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            if (model.itemById.isEmpty()) {
+            if (model.itemById.isEmpty() && queuedPrompts.isEmpty()) {
                 ChatEmptyState(hasCommands = ui.commands.isNotEmpty())
             } else {
                 Transcript(
@@ -178,6 +179,7 @@ fun ChatScreen(
                     pendingPermission = pendingPermission,
                     timings = turnTimes,
                     expandedWork = expandedWork,
+                    queued = queuedPrompts,
                     onToggleWork = { key ->
                         expandedWork[key] = expandedWork[key] != true
                     },
@@ -191,16 +193,37 @@ fun ChatScreen(
                         }
                     },
                     onResend = { vm.resend(it) },
+                    onEditQueued = { vm.beginQueuedEdit(it) },
                     listState = listState,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
-            ScrollToBottomButton(
-                visible = model.itemById.isNotEmpty() && !atBottom,
-                onClick = { scope.launch { listState.animateScrollToItem(0) } },
+            // U5.4: the floating work capsule replaces the lone ↓ button —
+            // connection/running status + queue + subagent stub on the left,
+            // scroll-to-end sliding out on the right.
+            FloatingWorkingControl(
+                reconnecting = ui.reconnecting,
+                connectionFailed = ui.phase == Phase.Error,
+                reconnectRetryAtMs = ui.reconnectRetryAtMs,
+                statusText = ui.statusText.ifBlank { ui.error.orEmpty() },
+                running = ui.running && !atBottom,
+                runningDetail = model.runningDetail,
+                turnStartedAtMs = turnTimes[model.lastUserId]?.start ?: 0L,
+                queuedCount = queuedPrompts.size,
+                // A7.3 lands the real subagent flow; the segment exists and
+                // wakes up the moment a count arrives.
+                subagentCount = 0,
+                showScrollToEnd = !atBottom && model.itemById.isNotEmpty(),
+                onReconnect = vm::reconnectNow,
+                onStop = vm::cancelTurn,
+                onOpenQueue = { queueSheet = true },
+                onOpenSubagents = {},
+                onScrollToEnd = {
+                    scope.launch { listState.animateScrollToItem(0) }
+                },
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 12.dp),
+                    .padding(bottom = 8.dp),
             )
         }
         // Context warning chip once usage passes 80% — hidden while a
@@ -246,11 +269,16 @@ fun ChatScreen(
             ui = ui,
             input = input,
             attachments = attachments,
-            queued = queuedPrompts,
+            queueEditing = editingQueuedId != null,
             permissionPending = pendingPermission != null,
             onInputChange = vm::setDraft,
             onSend = {
-                if (vm.send(input, attachments)) {
+                if (editingQueuedId != null) {
+                    // The composer doubles as the queue editor — save
+                    // rewrites the parked prompt, nothing is sent.
+                    vm.saveQueuedEdit()
+                    haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                } else if (vm.send(input, attachments)) {
                     haptic.performHapticFeedback(HapticFeedbackType.Confirm)
                     vm.setDraft("")
                     vm.setDraftAttachments(emptyList())
@@ -262,7 +290,7 @@ fun ChatScreen(
             },
             onAttach = { vm.setDraftAttachments(attachments + it) },
             onRemoveAttachment = { vm.setDraftAttachments(attachments - it) },
-            onCancelQueued = vm::cancelQueued,
+            onCancelQueuedEdit = vm::cancelQueuedEdit,
             onStop = vm::cancelTurn,
         )
     }
@@ -283,6 +311,21 @@ fun ChatScreen(
             steps = revertSteps.orEmpty(),
             onDismiss = vm::dismissRevertSteps,
             onPick = vm::forkFromStep,
+        )
+    }
+    if (queueSheet) {
+        ThreadQueueSheet(
+            queued = queuedPrompts,
+            running = ui.running,
+            editingId = editingQueuedId,
+            onDismiss = { queueSheet = false },
+            onSteer = vm::steerQueued,
+            // t3's edit path also pops back to the composer.
+            onEdit = {
+                vm.beginQueuedEdit(it)
+                queueSheet = false
+            },
+            onRemove = vm::cancelQueued,
         )
     }
 }
@@ -459,45 +502,6 @@ private fun ConnBanner(ui: UiState, modifier: Modifier = Modifier) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-        }
-    }
-}
-
-@Composable
-private fun ScrollToBottomButton(
-    visible: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val cs = MaterialTheme.colorScheme
-    val interaction = remember { MutableInteractionSource() }
-    // AnimatedVisibility lives here (not at the call site) so the plain
-    // top-level overload resolves — a ColumnScope receiver would otherwise
-    // shadow it inside the transcript Box.
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn() + scaleIn(initialScale = 0.8f),
-        exit = fadeOut() + scaleOut(targetScale = 0.8f),
-        modifier = modifier,
-    ) {
-        Surface(
-            onClick = onClick,
-            interactionSource = interaction,
-            modifier = Modifier
-                .size(40.dp)
-                .pressScale(interaction),
-            shape = CircleShape,
-            color = cs.surfaceContainerLowest,
-            border = androidx.compose.foundation.BorderStroke(Hairline, cs.outlineVariant),
-            shadowElevation = 3.dp,
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    HugeIcons.ChevronDown, "滚动到底部",
-                    modifier = Modifier.size(20.dp),
-                    tint = cs.onSurface,
-                )
-            }
         }
     }
 }

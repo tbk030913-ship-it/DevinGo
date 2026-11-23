@@ -72,6 +72,12 @@ class ConnectionManager private constructor(private val app: Application) {
         val awaitingBrowserLogin: Boolean = false,
         val reconnecting: Boolean = false,
         /**
+         * Wall-clock when the loop's next dial attempt fires — the floating
+         * capsule reads it for its "重连中 (Ns)" countdown. Null while a dial
+         * is actually in flight (nothing left to count down to).
+         */
+        val reconnectRetryAtMs: Long? = null,
+        /**
          * The shared socket is established + handshaken — independent of
          * whether a session is bound (background sessions still stream).
          */
@@ -890,9 +896,16 @@ class ConnectionManager private constructor(private val app: Application) {
                     reconnectKick = kick
                     try {
                         val waitMs = backoff / 2 + Random.nextLong(backoff / 2 + 1)
+                        _conn.update {
+                            it.copy(
+                                reconnectRetryAtMs =
+                                    System.currentTimeMillis() + waitMs,
+                            )
+                        }
                         withTimeoutOrNull(waitMs) { kick.await() }
                     } finally {
                         reconnectKick = null
+                        _conn.update { it.copy(reconnectRetryAtMs = null) }
                     }
                 }
                 try {
@@ -916,6 +929,7 @@ class ConnectionManager private constructor(private val app: Application) {
                             statusText = "",
                             error = null,
                             reconnecting = false,
+                            reconnectRetryAtMs = null,
                             connected = true,
                         )
                     }
@@ -937,13 +951,13 @@ class ConnectionManager private constructor(private val app: Application) {
     }
 
     /**
-     * Recovery hint — the network regained a usable route or the app came
-     * back to the foreground: if the socket is down and shouldn't stay that
-     * way, retry NOW instead of waiting out the backoff. A connect already
-     * in flight (socketMutex held by ensureSocket) is left alone rather
-     * than raced.
+     * Recovery hint — the network regained a usable route, the app came
+     * back to the foreground, or the user tapped the floating capsule's
+     * retry: if the socket is down and shouldn't stay that way, retry NOW
+     * instead of waiting out the backoff. A connect already in flight
+     * (socketMutex held by ensureSocket) is left alone rather than raced.
      */
-    private fun kickReconnect() {
+    internal fun kickReconnect() {
         scope.launch {
             if (socketLive || intentionalDisconnect || lastHost.isBlank()) return@launch
             if (socketMutex.isLocked) return@launch

@@ -57,6 +57,11 @@ data class UiState(
     val awaitingBrowserLogin: Boolean = false,
     /** True while the auto-reconnect loop is retrying a dropped socket. */
     val reconnecting: Boolean = false,
+    /**
+     * Wall-clock when the reconnect loop's next attempt fires — the floating
+     * capsule's countdown source; null while dialing (or not reconnecting).
+     */
+    val reconnectRetryAtMs: Long? = null,
     /** The shared socket is up — sessions may be streaming off-screen. */
     val connected: Boolean = false,
     /** The bound store is subscribed — false mid-attach or after a failed
@@ -105,6 +110,11 @@ data class ChatItem(
     val createdAtMs: Long = System.currentTimeMillis(),
     /** Replayed history (session/load, attach backlog, cache) — never animates entry. */
     val isReplay: Boolean = false,
+    /**
+     * This prompt interrupted a running turn (steer/midTurnPrompts) — the
+     * bubble gets a "↪ 已转向" corner badge (U5.4).
+     */
+    val steered: Boolean = false,
 )
 
 /** One `diff` content item of a tool call: unified old/new file text. */
@@ -126,9 +136,16 @@ data class PendingPermission(
 /** A photo/screenshot picked on-device, sent as an ACP `image` block. */
 class ImageAttachment(val bytes: ByteArray, val mimeType: String)
 
+/**
+ * A prompt parked behind the running turn (B4 keeps its image bytes).
+ * [id] is a store-local counter — it keys the queue sheet's lazy rows and
+ * the edit-target slot; [createdAtMs] is the sheet's timestamp.
+ */
 data class QueuedPrompt(
+    val id: Long,
     val text: String,
     val attachments: List<ImageAttachment> = emptyList(),
+    val createdAtMs: Long = System.currentTimeMillis(),
 )
 
 /** Per-turn timing owned by a SessionStore (was UI-local in ChatScreen). */

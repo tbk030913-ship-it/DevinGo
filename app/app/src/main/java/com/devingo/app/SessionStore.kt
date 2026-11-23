@@ -165,6 +165,18 @@ class SessionStore(
     private val _queuedPrompts = MutableStateFlow<List<QueuedPrompt>>(emptyList())
     val queuedPrompts = _queuedPrompts.asStateFlow()
 
+    /**
+     * U5.4: the queued prompt pulled back into the composer for editing —
+     * keyed on the item's id so queue removals elsewhere can't shift the
+     * target. [queuedEditStash] holds the draft it displaced; cancel/save
+     * restore it (a drain that sends the edited item instead keeps the
+     * typed text as the new draft — the user's edits are never dropped).
+     */
+    private val _editingQueuedId = MutableStateFlow<Long?>(null)
+    val editingQueuedId = _editingQueuedId.asStateFlow()
+    private var queuedEditStash: Pair<String, List<ImageAttachment>>? = null
+    private val nextQueuedId = java.util.concurrent.atomic.AtomicLong(0)
+
     /** Steps offered by the revert sheet; null until [loadRevertSteps] runs. */
     private val _revertSteps = MutableStateFlow<List<RevertStep>?>(null)
     val revertSteps = _revertSteps.asStateFlow()
@@ -212,6 +224,7 @@ class SessionStore(
     // Row-model builder state — only ever touched on the Default dispatcher.
     private var modelMsgs: List<ChatItem> = emptyList()
     private var modelRunning = false
+    private var modelQueued: List<QueuedPrompt> = emptyList()
 
     private var nextItemId = 0L
     private var planItemId: Long? = null
@@ -249,9 +262,11 @@ class SessionStore(
             combine(
                 _messages,
                 _ui.map { it.running }.distinctUntilChanged(),
-            ) { msgs, running -> msgs to running }.collect { (msgs, running) ->
-                rebuildModel(msgs, running)
-            }
+                _queuedPrompts,
+            ) { msgs, running, queued -> Triple(msgs, running, queued) }
+                .collect { (msgs, running, queued) ->
+                    rebuildModel(msgs, running, queued)
+                }
         }
     }
 
@@ -263,9 +278,15 @@ class SessionStore(
      * leaves the model (and every other row) untouched; all other shapes
      * rebuild the full model.
      */
-    private fun rebuildModel(msgs: List<ChatItem>, running: Boolean) {
+    private fun rebuildModel(
+        msgs: List<ChatItem>,
+        running: Boolean,
+        queued: List<QueuedPrompt>,
+    ) {
         val old = modelMsgs
-        if (running == modelRunning && msgs.size == old.size && msgs.isNotEmpty()) {
+        if (queued == modelQueued && running == modelRunning &&
+            msgs.size == old.size && msgs.isNotEmpty()
+        ) {
             val nl = msgs.last()
             val ol = old.last()
             if (nl.id == ol.id && nl !== ol && nl.copy(text = ol.text) == ol) {
@@ -285,7 +306,8 @@ class SessionStore(
         }
         modelMsgs = msgs
         modelRunning = running
-        _transcript.value = buildTranscriptModel(msgs, running)
+        modelQueued = queued
+        _transcript.value = buildTranscriptModel(msgs, running, queued)
         _streamingTail.value = msgs.lastOrNull()
     }
 
@@ -831,7 +853,9 @@ class SessionStore(
         if (_ui.value.running || promptJob?.isActive == true) {
             // Queued prompts carry the attachments themselves — the bytes go
             // out when the queue drains, nothing is dropped.
-            _queuedPrompts.update { it + QueuedPrompt(trimmed, attachments) }
+            _queuedPrompts.update {
+                it + QueuedPrompt(nextQueuedId.getAndIncrement(), trimmed, attachments)
+            }
             return true
         }
         launchPrompt(trimmed, attachments)
@@ -842,7 +866,7 @@ class SessionStore(
     fun steer(text: String) {
         val trimmed = text.trimEnd()
         if (trimmed.isBlank()) return
-        append(Kind.User, trimmed)
+        append(Kind.User, trimmed, steered = true)
         promptAcked = true // the turn is live; a steer failure isn't a lost echo
         steerJob = scope.launch {
             try {
@@ -855,8 +879,110 @@ class SessionStore(
         }
     }
 
-    fun cancelQueued(index: Int) {
-        _queuedPrompts.update { q -> q.filterIndexed { i, _ -> i != index } }
+    /**
+     * The queue sheet's 立即转向: pull the item out of the queue and get it
+     * in front of the agent NOW. A text-only item steers into the running
+     * turn via midTurnPrompts (the turn keeps its context); an image
+     * prompt can't ride mid-turn blocks, so its send-now is cancel-then-
+     * send — the interrupted turn ends, the prompt starts fresh.
+     */
+    fun steerQueued(id: Long) {
+        val q = _queuedPrompts.value.firstOrNull { it.id == id } ?: return
+        if (q.text.isBlank() && q.attachments.isEmpty()) return
+        _queuedPrompts.update { q2 -> q2.filterNot { it.id == id } }
+        // The item went out — an open edit on it resolves to "keep the
+        // typed text" rather than resurrecting the stashed draft.
+        if (_editingQueuedId.value == q.id) endQueuedEdit(keepDraft = true)
+        if (q.attachments.isEmpty()) {
+            steer(q.text)
+            return
+        }
+        runCatching { client.cancel(sessionId) }
+        // cancelTurn's watchdog contract, keyed on the ABOUT-TO-BE-STALE
+        // job: launchPrompt reassigns promptJob, so an identity check like
+        // cancelTurn's could never reap a hung old request.
+        val stale = promptJob
+        scope.launch {
+            delay(CANCEL_WATCHDOG_MS)
+            if (stale?.isActive == true) {
+                stale.cancel()
+                append(Kind.System, "本轮已强制结束")
+            }
+        }
+        launchPrompt(q.text, q.attachments, steered = true)
+    }
+
+    fun cancelQueued(id: Long) {
+        var removed: QueuedPrompt? = null
+        _queuedPrompts.update { q ->
+            removed = q.firstOrNull { it.id == id }
+            q.filterNot { it.id == id }
+        }
+        if (removed != null && removed.id == _editingQueuedId.value) {
+            endQueuedEdit(keepDraft = false)
+        }
+    }
+
+    /**
+     * Pull queued[id]'s text + images into the composer as an edit: the
+     * item stays queued (a "编辑中" badge marks it) and saving rewrites it in
+     * place. The prior draft is stashed and restored on save/cancel.
+     */
+    fun beginQueuedEdit(id: Long) {
+        val q = _queuedPrompts.value.firstOrNull { it.id == id } ?: return
+        if (_editingQueuedId.value == null) {
+            queuedEditStash = _draft.value to _draftAttachments.value
+        }
+        _editingQueuedId.value = q.id
+        _draft.value = q.text
+        _draftAttachments.value = q.attachments
+    }
+
+    fun cancelQueuedEdit() = endQueuedEdit(keepDraft = false)
+
+    /**
+     * Write the composer's text + images back into the edited queue item.
+     * A blank-text/no-image save removes the item outright — it could only
+     * drain as an empty prompt — and an item that already left the queue
+     * (drained/cancelled) just ends the edit, keeping the typed text.
+     */
+    fun saveQueuedEdit() {
+        val id = _editingQueuedId.value ?: return
+        val text = _draft.value.trimEnd()
+        val attachments = _draftAttachments.value
+        var stillQueued = true
+        _queuedPrompts.update { q ->
+            val i = q.indexOfFirst { it.id == id }
+            stillQueued = i >= 0
+            when {
+                // Blank text + no images: a save means the item is emptied —
+                // it could only drain as an empty prompt, so drop it.
+                text.isBlank() && attachments.isEmpty() ->
+                    q.filterNot { it.id == id }
+                i < 0 -> q
+                else -> q.toMutableList().apply {
+                    set(i, q[i].copy(text = text, attachments = attachments))
+                }
+            }
+        }
+        // A target that already went out on its own keeps the typed text
+        // as the new draft rather than restoring the pre-edit stash.
+        endQueuedEdit(keepDraft = !stillQueued)
+    }
+
+    /**
+     * Exit queue-edit mode. [keepDraft] = the item already went out on its
+     * own (drained/steered): the typed text stays as the live draft instead
+     * of restoring the stash. Otherwise the pre-edit draft is restored.
+     */
+    private fun endQueuedEdit(keepDraft: Boolean) {
+        _editingQueuedId.value = null
+        val stash = queuedEditStash
+        queuedEditStash = null
+        if (!keepDraft && stash != null) {
+            _draft.value = stash.first
+            _draftAttachments.value = stash.second
+        }
     }
 
     /**
@@ -884,17 +1010,22 @@ class SessionStore(
     private fun drainQueue() {
         val next = _queuedPrompts.value.firstOrNull() ?: return
         _queuedPrompts.update { it.drop(1) }
+        // It sent with its original text — keep any in-flight edits as draft.
+        if (_editingQueuedId.value == next.id) endQueuedEdit(keepDraft = true)
         launchPrompt(next.text, next.attachments)
     }
 
     private fun launchPrompt(
         text: String,
         attachments: List<ImageAttachment>,
+        steered: Boolean = false,
     ) {
         val blocks = buildBlocks(text, attachments)
         // The echo keeps the raw text — UserBubble renders the "[N 张图片]"
         // suffix — so UserChunk dedup matches and resend() replays verbatim.
-        val userItem = append(Kind.User, text, attachments = attachments)
+        val userItem = append(
+            Kind.User, text, attachments = attachments, steered = steered,
+        )
         promptAcked = false
         promptJob = scope.launch {
             remoteTurn = false // our own job now speaks for the turn
@@ -1353,6 +1484,7 @@ class SessionStore(
         detailTruncated: Boolean = false,
         exitCode: Int? = null,
         attachments: List<ImageAttachment> = emptyList(),
+        steered: Boolean = false,
     ): ChatItem {
         flushStreaming()
         val item = ChatItem(
@@ -1360,7 +1492,7 @@ class SessionStore(
             toolKind = toolKind,
             detail = detail, detailTruncated = detailTruncated,
             exitCode = exitCode, attachments = attachments,
-            attachmentCount = attachments.size,
+            attachmentCount = attachments.size, steered = steered,
         )
         streamingId = null
         // A Kind.User here is always a live local echo (replayed user text
@@ -1576,6 +1708,7 @@ class SessionStore(
         },
         failed = m.failed,
         attachmentCount = m.attachmentCount,
+        steered = m.steered,
     )
 
     private fun restoreItem(c: TranscriptCache.CachedItem): ChatItem? {
@@ -1590,6 +1723,7 @@ class SessionStore(
             },
             failed = c.failed,
             attachmentCount = c.attachmentCount,
+            steered = c.steered,
             isReplay = true,
         )
     }

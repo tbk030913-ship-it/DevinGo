@@ -124,6 +124,9 @@ sealed interface RowKind {
     data class Work(val turnKey: Long, val live: Boolean) : RowKind
     data class Body(val itemId: Long, val turnKey: Long) : RowKind
     data class User(val itemId: Long) : RowKind
+
+    /** A not-yet-sent queued prompt's dashed preview bubble (U5.4). */
+    data class Queue(val index: Int) : RowKind
 }
 
 /**
@@ -160,10 +163,14 @@ data class TranscriptModel(
 internal fun buildTranscriptModel(
     messages: List<ChatItem>,
     running: Boolean,
+    queued: List<QueuedPrompt> = emptyList(),
 ): TranscriptModel {
     val turns = buildTurns(messages)
     val rows = buildList {
-        if (messages.isNotEmpty()) add(RowKind.Status)
+        if (messages.isNotEmpty() || queued.isNotEmpty()) add(RowKind.Status)
+        // U5.4: parked prompts preview directly above the status line —
+        // exactly where the bubbles land as they drain, earliest first.
+        queued.forEachIndexed { i, _ -> add(RowKind.Queue(i)) }
         turns.asReversed().forEachIndexed { revIdx, turn ->
             val isLast = revIdx == 0
             if (turn.work.isNotEmpty() || (isLast && running)) {

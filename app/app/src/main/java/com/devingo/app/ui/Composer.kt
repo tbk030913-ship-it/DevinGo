@@ -52,7 +52,6 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -90,7 +89,6 @@ import androidx.compose.ui.unit.sp
 import androidx.exifinterface.media.ExifInterface
 import coil3.compose.AsyncImage
 import com.devingo.app.ImageAttachment
-import com.devingo.app.QueuedPrompt
 import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
@@ -99,10 +97,9 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import me.rerere.hugeicons.HugeIcons
-import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.ArrowUp01
 import me.rerere.hugeicons.stroke.AtSign
-import me.rerere.hugeicons.stroke.Queue01
+import me.rerere.hugeicons.stroke.PencilEdit01
 
 // ---- composer ------------------------------------------------------------------
 
@@ -111,20 +108,22 @@ import me.rerere.hugeicons.stroke.Queue01
  * black round send/stop button. All v1 behaviors kept — image attachments,
  * @mention styling + hint, slash-command strip, queue/steer menu (queue
  * keeps images; steer is text-only and disables when attachments exist).
+ * U5.4: while a queued prompt is being edited, the top slot shows the
+ * 取消/保存 banner and the send button becomes 保存 ([onSend] routes).
  */
 @Composable
 internal fun Composer(
     ui: UiState,
     input: String,
     attachments: List<ImageAttachment>,
-    queued: List<QueuedPrompt>,
+    queueEditing: Boolean,
     permissionPending: Boolean,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
     onSteer: () -> Unit,
     onAttach: (ImageAttachment) -> Unit,
     onRemoveAttachment: (ImageAttachment) -> Unit,
-    onCancelQueued: (Int) -> Unit,
+    onCancelQueuedEdit: () -> Unit,
     onStop: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -167,6 +166,9 @@ internal fun Composer(
 
     val cs = MaterialTheme.colorScheme
     val sendState = when {
+        // Editing a queued prompt: the button is 保存, never the turn's
+        // Stop or the queue/steer menu.
+        queueEditing -> if (canSend) SendState.Send else SendState.Disabled
         ui.running && !canSend -> SendState.Stop
         canSend -> SendState.Send
         else -> SendState.Disabled
@@ -180,16 +182,21 @@ internal fun Composer(
             .imePadding(),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // Popup slot above the pill: queue chip, then the mention hint.
-        // (Slash-command suggestions render above the whole composer —
-        // ChatScreen owns that slot.)
+        // Popup slot above the pill: queue-edit banner, then the mention
+        // hint. (Slash-command suggestions render above the whole composer —
+        // ChatScreen owns that slot; the queue itself moved to U5.4's
+        // floating capsule + ThreadQueueSheet.)
         AnimatedVisibility(
-            visible = queued.isNotEmpty() && !permissionPending,
+            visible = queueEditing && !permissionPending,
             enter = fadeIn(tween(150)) + slideInVertically { it / 2 },
             exit = fadeOut(tween(100)) + shrinkVertically(),
         ) {
             ComposerPopup(Modifier.padding(horizontal = 16.dp)) {
-                QueueChip(queued, onCancelQueued)
+                QueueEditBanner(
+                    canSave = canSend,
+                    onSave = onSend,
+                    onCancel = onCancelQueuedEdit,
+                )
             }
         }
         AnimatedVisibility(
@@ -282,6 +289,7 @@ internal fun Composer(
                             Text(
                                 when {
                                     permissionPending -> "等你授权…"
+                                    queueEditing -> "编辑排队消息…"
                                     ui.running -> "补充指令…（排队或转向）"
                                     else -> "给 Devin 发消息"
                                 },
@@ -305,6 +313,7 @@ internal fun Composer(
                             onSend = {
                                 when {
                                     !canSend -> Unit
+                                    queueEditing -> onSend()
                                     ui.running -> sendMenu = true
                                     else -> onSend()
                                 }
@@ -323,10 +332,10 @@ internal fun Composer(
                                 when (sendState) {
                                     SendState.Disabled -> Unit
                                     SendState.Stop -> onStop()
-                                    SendState.Send -> if (ui.running) {
-                                        sendMenu = true
-                                    } else {
-                                        onSend()
+                                    SendState.Send -> when {
+                                        queueEditing -> onSend()
+                                        ui.running -> sendMenu = true
+                                        else -> onSend()
                                     }
                                 }
                             },
@@ -450,58 +459,57 @@ internal fun commandMatches(
     }.take(6)
 }
 
-/** "排队中 N 条 ›" chip → menu listing queued prompts with remove buttons. */
+/**
+ * U5.4's composer-top banner while a queued prompt is being edited —
+ * t3code's ComposerQueuedEditBanner plus the spec's 保存 action (saving
+ * rewrites the queue item in place via [onSave] = the normal send path).
+ */
 @Composable
-private fun QueueChip(
-    queued: List<QueuedPrompt>,
-    onCancelQueued: (Int) -> Unit,
+private fun QueueEditBanner(
+    canSave: Boolean,
+    onSave: () -> Unit,
+    onCancel: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
-    var open by remember { mutableStateOf(false) }
-    Box {
-        Surface(
-            onClick = { open = true },
-            shape = CircleShape,
-            color = cs.surfaceContainer,
-        ) {
-            Row(
-                Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Icon(
-                    HugeIcons.Queue01, null,
-                    modifier = Modifier.size(14.dp),
-                    tint = cs.onSurfaceVariant,
-                )
-                Text(
-                    "排队中 ${queued.size} 条",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = cs.onSurfaceVariant,
-                )
-            }
-        }
-        DevinMenu(expanded = open, onDismissRequest = { open = false }) {
-            queued.forEachIndexed { i, q ->
-                DevinMenuItem(
-                    text = if (q.text.isBlank()) {
-                        "[${q.attachments.size} 张图片]"
-                    } else {
-                        q.text.take(40) +
-                            if (q.attachments.isNotEmpty()) " [图×${q.attachments.size}]" else ""
-                    },
-                    subtitle = "点击移除",
-                    onClick = { open = false; onCancelQueued(i) },
-                    trailing = {
-                        Icon(
-                            Icons.Filled.Close, "取消排队",
-                            modifier = Modifier.size(16.dp),
-                            tint = cs.onSurfaceVariant,
-                        )
-                    },
-                )
-            }
-        }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Icon(
+            HugeIcons.PencilEdit01, null,
+            modifier = Modifier.size(14.dp),
+            tint = cs.onSurfaceVariant,
+        )
+        Text(
+            "正在编辑排队消息",
+            style = MaterialTheme.typography.labelMedium,
+            color = cs.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            "取消",
+            style = MaterialTheme.typography.labelMedium,
+            color = cs.onSurfaceVariant,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable(onClick = onCancel)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+        Text(
+            "保存",
+            style = MaterialTheme.typography.labelMedium,
+            color = if (canSave) DevinGoColors.link else cs.outline,
+            modifier = Modifier
+                .clip(RoundedCornerShape(6.dp))
+                .clickable(enabled = canSave, onClick = onSave)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+        )
     }
 }
 

@@ -51,7 +51,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.ClipEntry
@@ -63,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatItem
 import com.devingo.app.Kind
 import com.devingo.app.PendingPermission
+import com.devingo.app.QueuedPrompt
 import com.devingo.app.RowKind
 import com.devingo.app.TranscriptModel
 import com.devingo.app.Turn
@@ -80,6 +85,7 @@ import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.Brain
 import me.rerere.hugeicons.stroke.ChevronRight
 import me.rerere.hugeicons.stroke.Copy01
+import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
 internal fun formatTokens(n: Long): String = when {
@@ -158,10 +164,12 @@ internal fun Transcript(
     pendingPermission: PendingPermission?,
     timings: Map<Long, TurnTiming>,
     expandedWork: Map<Long, Boolean>,
+    queued: List<QueuedPrompt>,
     onToggleWork: (Long) -> Unit,
     onExpandWork: (Long) -> Unit,
     onUserLongPress: (ChatItem) -> Unit,
     onResend: (ChatItem) -> Unit,
+    onEditQueued: (Long) -> Unit,
     listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
@@ -190,6 +198,7 @@ internal fun Transcript(
                     is RowKind.Work -> "w${row.turnKey}"
                     is RowKind.Body -> "b${row.itemId}"
                     is RowKind.User -> "u${row.itemId}"
+                    is RowKind.Queue -> "qp${row.index}"
                 }
             },
             contentType = { row ->
@@ -198,6 +207,7 @@ internal fun Transcript(
                     is RowKind.Work -> "work"
                     is RowKind.Body -> itemById[row.itemId]?.kind?.name ?: "body"
                     is RowKind.User -> "user"
+                    is RowKind.Queue -> "queue"
                 }
             },
         ) { row ->
@@ -273,6 +283,13 @@ internal fun Transcript(
                             } else {
                                 BodyItem(m)
                             }
+                        }
+                        is RowKind.Queue -> {
+                            val q = queued.getOrNull(row.index) ?: return@items
+                            QueuedPreviewBubble(
+                                q,
+                                onClick = { onEditQueued(q.id) },
+                            )
                         }
                         is RowKind.Work -> {
                             val turn = turnByKey[row.turnKey] ?: return@items
@@ -1011,6 +1028,86 @@ private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
 
 // ---- user bubble -----------------------------------------------------------------
 
+/**
+ * U5.4: a parked prompt's placeholder in the transcript — a translucent,
+ * dashed-border echo of the user bubble it becomes when it drains (t3code
+ * appends queued messages as pending feed entries the same way). Tap pulls
+ * it into the composer for editing.
+ */
+@Composable
+private fun QueuedPreviewBubble(q: QueuedPrompt, onClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val label = when {
+        q.attachments.isEmpty() -> q.text
+        q.text.isEmpty() -> "[${q.attachments.size} 张图片]"
+        else -> "${q.text} [${q.attachments.size} 张图片]"
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp, bottom = 4.dp),
+        horizontalArrangement = Arrangement.End,
+    ) {
+        Box(Modifier.fillMaxWidth(0.82f), contentAlignment = Alignment.CenterEnd) {
+            Column(
+                horizontalAlignment = Alignment.End,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .clickable(onClick = onClick),
+            ) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        color = cs.onSurface.copy(alpha = 0.75f),
+                    ),
+                    modifier = Modifier
+                        .drawBehind {
+                            val r = CornerRadius(20.dp.toPx())
+                            drawRoundRect(
+                                color = cs.surfaceContainer.copy(alpha = 0.6f),
+                                cornerRadius = r,
+                            )
+                            drawRoundRect(
+                                color = cs.outline,
+                                cornerRadius = r,
+                                style = Stroke(
+                                    width = 1.dp.toPx(),
+                                    pathEffect = PathEffect.dashPathEffect(
+                                        floatArrayOf(
+                                            6.dp.toPx(),
+                                            4.dp.toPx(),
+                                        ),
+                                    ),
+                                ),
+                            )
+                        }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row(
+                    Modifier
+                        .align(Alignment.End)
+                        .padding(top = 4.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Icon(
+                        HugeIcons.PencilEdit01, null,
+                        modifier = Modifier.size(11.dp),
+                        tint = cs.onSurfaceVariant,
+                    )
+                    Text(
+                        "排队中 · 点击编辑",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = cs.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
 /** Right-aligned user message; long text collapses behind 展开. */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -1076,6 +1173,27 @@ private fun UserBubble(
                             .clickable { expanded = true }
                             .padding(top = 4.dp, end = 4.dp),
                     )
+                }
+                if (m.steered && !m.failed) {
+                    // U5.4: mid-turn prompts wear the ↪ 已转向 corner badge.
+                    Row(
+                        Modifier
+                            .align(Alignment.End)
+                            .padding(top = 4.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(
+                            HugeIcons.ArrowTurnForward, null,
+                            modifier = Modifier.size(12.dp),
+                            tint = cs.onSurfaceVariant,
+                        )
+                        Text(
+                            "已转向",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = cs.onSurfaceVariant,
+                        )
+                    }
                 }
                 if (m.failed) {
                     Row(

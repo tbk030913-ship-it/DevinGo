@@ -79,6 +79,7 @@ class ChatViewModel(
             agentTitle = conn.agentTitle,
             awaitingBrowserLogin = conn.awaitingBrowserLogin,
             reconnecting = conn.reconnecting,
+            reconnectRetryAtMs = conn.reconnectRetryAtMs,
             connected = conn.connected,
             sessionId = sui.sessionId,
             attached = sui.attached,
@@ -106,6 +107,8 @@ class ChatViewModel(
     val streamingTail: StateFlow<ChatItem?> = bound({ streamingTail }, null)
     val pendingPermission: StateFlow<PendingPermission?> = bound({ pendingPermission }, null)
     val queuedPrompts: StateFlow<List<QueuedPrompt>> = bound({ queuedPrompts }, emptyList())
+    /** The queued prompt pulled into the composer for editing (U5.4). */
+    val editingQueuedId: StateFlow<Long?> = bound({ editingQueuedId }, null)
     val revertSteps: StateFlow<List<com.devingo.app.acp.RevertStep>?> = bound({ revertSteps }, null)
     val turnTimes: StateFlow<Map<Long, TurnTiming>> = bound({ turnTimes }, emptyMap())
     val draft: StateFlow<String> = bound({ draft }, "")
@@ -206,9 +209,30 @@ class ChatViewModel(
         store?.steer(text)
     }
 
-    fun cancelQueued(index: Int) {
-        store?.cancelQueued(index)
+    fun cancelQueued(id: Long) {
+        store?.cancelQueued(id)
     }
+
+    /** Queue sheet's 立即转向 — de-queue the item and interrupt the turn. */
+    fun steerQueued(id: Long) {
+        store?.steerQueued(id)
+    }
+
+    /** Pull a queued prompt's text + images into the composer for editing. */
+    fun beginQueuedEdit(id: Long) {
+        store?.beginQueuedEdit(id)
+    }
+
+    fun cancelQueuedEdit() {
+        store?.cancelQueuedEdit()
+    }
+
+    fun saveQueuedEdit() {
+        store?.saveQueuedEdit()
+    }
+
+    /** The floating capsule's retry tap — cut the reconnect backoff short. */
+    fun reconnectNow() = cm.kickReconnect()
 
     fun resend(item: ChatItem) {
         store?.resend(item)
