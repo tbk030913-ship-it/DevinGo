@@ -19,6 +19,7 @@ import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
 import com.devingo.app.acp.postBridgeFile
+import com.devingo.app.acp.postBridgeGitDiff
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
 import com.devingo.app.tailnet.TailnetState
@@ -610,6 +611,9 @@ class ConnectionManager private constructor(private val app: Application) {
             // Read at call time so a re-dialed host/token is picked up.
             workspaceFileWriter = { path, content ->
                 postBridgeFile(healthUrl(dialHost), lastToken, sessionId, path, content)
+            },
+            gitDiffFetcher = {
+                postBridgeGitDiff(healthUrl(dialHost), lastToken, sessionId)
             },
         )
         // U7: show the last cached transcript right away — the attach replay

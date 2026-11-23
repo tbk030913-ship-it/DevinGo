@@ -168,7 +168,8 @@ internal fun Transcript(
     expandedWork: Map<Long, Boolean>,
     queued: List<QueuedPrompt>,
     onToggleWork: (Long) -> Unit,
-    onExpandWork: (Long) -> Unit,
+    /** N6.1: a turn/file opens the native review sheet (turnKey, filePath?). */
+    onReviewDiff: (Long, String?) -> Unit,
     onUserLongPress: (ChatItem) -> Unit,
     onResend: (ChatItem) -> Unit,
     onEditQueued: (Long) -> Unit,
@@ -284,7 +285,7 @@ internal fun Transcript(
                                                         turn.user?.let(onUserLongPress)
                                                     },
                                                     onShowDiff = {
-                                                        onExpandWork(turn.key)
+                                                        onReviewDiff(turn.key, null)
                                                     },
                                                 )
                                             }
@@ -318,9 +319,12 @@ internal fun Transcript(
                                 timing = timing,
                                 expanded = expandedWork[turn.key] == true,
                                 onToggle = { onToggleWork(turn.key) },
-                                // No diff sheet yet (N6.1) — the pill opens
-                                // the turn's WorkRow where DiffCards render.
-                                onShowDiff = { onExpandWork(turn.key) },
+                                // N6.1 — the pill opens the review sheet
+                                // scoped to this turn.
+                                onShowDiff = { onReviewDiff(turn.key, null) },
+                                onReviewDiff = { path ->
+                                    onReviewDiff(turn.key, path)
+                                },
                             )
                         }
                     }
@@ -396,6 +400,7 @@ private fun WorkRow(
     expanded: Boolean,
     onToggle: () -> Unit,
     onShowDiff: () -> Unit,
+    onReviewDiff: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -613,7 +618,7 @@ private fun WorkRow(
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
-            WorkLogColumn(entries = entries, live = live)
+            WorkLogColumn(entries = entries, live = live, onReviewDiff = onReviewDiff)
         }
     }
 }
@@ -873,8 +878,7 @@ private fun AssistantMetaBar(
             }
         }
         if (diffAdd > 0 || diffDel > 0) {
-            // U5.2 wires the pill to the turn's inline WorkRow expansion
-            // (the DiffCards); the dedicated diff sheet lands with N6.1.
+            // N6.1: the pill opens the native review sheet on this turn.
             Row(
                 Modifier
                     .clip(RoundedCornerShape(6.dp))

@@ -131,6 +131,7 @@ func main() {
 	mux.HandleFunc("/acp", acpHandler)
 	mux.HandleFunc("/models", modelsHandler)
 	mux.HandleFunc("/fs/write", fsWriteHandler)
+	mux.HandleFunc("/git/diff", gitDiffHandler)
 	mux.HandleFunc("/pair", pairHandler)
 	mux.HandleFunc("/pair/qr.png", pairQRHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +140,7 @@ func main() {
 		fmt.Fprintln(w, "  GET /healthz   - bridge + devin status")
 		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
 		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
+		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
 		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
 
@@ -558,6 +560,59 @@ func fsWriteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "path": req.Path})
+}
+
+// gitDiffMaxBody bounds the JSON request payload — it only carries a session id.
+const gitDiffMaxBody = 16 << 10
+
+// gitDiffHandler serves a session workspace's uncommitted `git diff`
+// ({sessionId} → {patch, truncated}). Same auth/origin gates as /fs/write;
+// the workspace resolves through the hub's recorded cwd and the git call
+// itself runs under gitDiffTimeout with a 4 MiB output cap (N6.1).
+func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, gitDiffMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if req.SessionID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId is required"}`))
+		return
+	}
+	patch, truncated, err := bridgeHub.sessionGitDiff(req.SessionID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSessionNotHosted) {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"patch":     patch,
+		"truncated": truncated,
+	})
 }
 
 // runDevinOutput runs `devin <args...>` and returns its stdout. Output goes

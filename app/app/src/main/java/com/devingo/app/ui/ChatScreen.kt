@@ -65,11 +65,15 @@ import com.devingo.app.CitationAttachment
 import com.devingo.app.Phase
 import com.devingo.app.RowKind
 import com.devingo.app.UiState
+import com.devingo.app.ui.diff.ReviewRequest
+import com.devingo.app.ui.diff.ReviewSheet
+import com.devingo.app.ui.diff.formatReviewCitation
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
+import me.rerere.hugeicons.stroke.Diff
 import me.rerere.hugeicons.stroke.MoreHorizontal
 
 /**
@@ -108,6 +112,8 @@ fun ChatScreen(
     var infoSheet by remember { mutableStateOf(false) }
     var queueSheet by remember { mutableStateOf(false) }
     var citationSheet by remember { mutableStateOf(false) }
+    // N6.1: which review the sheet shows — a turn scope, or the session's.
+    var reviewRequest by remember { mutableStateOf<ReviewRequest?>(null) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
 
@@ -116,7 +122,7 @@ fun ChatScreen(
     // consumes back first (dismisses itself).
     BackHandler(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
-            revertSteps == null,
+            reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()
     }
@@ -170,9 +176,12 @@ fun ChatScreen(
         ChatTopBar(
             ui = ui,
             canScrollUp = canScrollUp,
+            diffStats = model.diffs.takeIf { it.files.isNotEmpty() }
+                ?.let { it.additions to it.deletions },
             onOpenDrawer = onOpenDrawer,
             onOpenModel = { modelSheet = true },
             onOpenInfo = { infoSheet = true },
+            onOpenReview = { reviewRequest = ReviewRequest.Session() },
             onRevert = vm::loadRevertSteps,
             onDisconnect = vm::disconnect,
         )
@@ -208,9 +217,11 @@ fun ChatScreen(
                     onToggleWork = { key ->
                         expandedWork[key] = expandedWork[key] != true
                     },
-                    // The meta-bar diff pill only opens — never collapses —
-                    // the turn's WorkRow (U5.2).
-                    onExpandWork = { key -> expandedWork[key] = true },
+                    // N6.1: diff pills + DiffCard's 全屏审查 open the native
+                    // review sheet scoped to that turn/file.
+                    onReviewDiff = { key, path ->
+                        reviewRequest = ReviewRequest.Turn(key, path)
+                    },
                     onUserLongPress = {
                         if (ui.revertSupported) {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -377,6 +388,25 @@ fun ChatScreen(
             onRemove = vm::cancelQueued,
         )
     }
+    reviewRequest?.let { req ->
+        ReviewSheet(
+            diffs = model.diffs,
+            request = req,
+            fetchGitDiff = vm::fetchGitDiff,
+            onSubmitComment = { sel, comment ->
+                // Row comments ride the existing draft-citation slot —
+                // mergedWithCitation emits the markdown quote at send.
+                vm.setDraftCitation(
+                    CitationAttachment(
+                        messageId = -1L,
+                        quotedText = formatReviewCitation(sel),
+                        comment = comment,
+                    ),
+                )
+            },
+            onDismiss = { reviewRequest = null },
+        )
+    }
     val clipboard = LocalClipboard.current
     val reducedMotion = isReducedMotion()
     val c = citation
@@ -423,9 +453,11 @@ fun ChatScreen(
 private fun ChatTopBar(
     ui: UiState,
     canScrollUp: Boolean,
+    diffStats: Pair<Int, Int>?,
     onOpenDrawer: () -> Unit,
     onOpenModel: () -> Unit,
     onOpenInfo: () -> Unit,
+    onOpenReview: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -489,6 +521,26 @@ private fun ChatTopBar(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                    }
+                }
+                // N6.1: session diff badge — opens the review sheet. Only
+                // rendered when the session has accumulated tool diffs.
+                if (diffStats != null) {
+                    IconButton(onClick = onOpenReview) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                HugeIcons.Diff, "审查改动",
+                                modifier = Modifier.size(20.dp),
+                                tint = cs.onSurface,
+                            )
+                            Spacer(Modifier.width(3.dp))
+                            Text(
+                                "+${diffStats.first} −${diffStats.second}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = cs.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                        }
                     }
                 }
                 Box {

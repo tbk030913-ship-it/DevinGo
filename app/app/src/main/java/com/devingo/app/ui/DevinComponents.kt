@@ -391,6 +391,7 @@ fun DevinMenuCheckItem(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
+    enabled: Boolean = true,
 ) {
     val cs = MaterialTheme.colorScheme
     DevinMenuItem(
@@ -398,6 +399,7 @@ fun DevinMenuCheckItem(
         onClick = onClick,
         modifier = modifier,
         subtitle = subtitle,
+        enabled = enabled,
         trailing = {
             if (checked) {
                 Icon(

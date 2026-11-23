@@ -967,6 +967,44 @@ suspend fun postBridgeFile(
     }
 }
 
+/**
+ * The bridge's `/git/diff`: the session workspace's uncommitted `git diff`
+ * patch (token-authed; server caps it ~4 MiB). Throws [AcpException] on any
+ * non-2xx so the review sheet can surface the error.
+ */
+suspend fun postBridgeGitDiff(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+): String = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+    val payload = buildJsonObject {
+        put("sessionId", sessionId)
+    }
+    val req = Request.Builder()
+        .url("$baseHttpUrl/git/diff")
+        .post(payload.toString().toRequestBody("application/json".toMediaType()))
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "git/diff HTTP ${resp.code}")
+        }
+        val body = resp.body?.string().orEmpty()
+        healthJson.parseToJsonElement(body).jsonObject["patch"]?.jsonPrimitive?.content.orEmpty()
+    }
+}
+
 private fun extractModels(el: JsonElement, out: MutableList<SessionModel> = mutableListOf()): List<SessionModel> {
     when (el) {
         is JsonObject -> {

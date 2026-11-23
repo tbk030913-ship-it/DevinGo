@@ -121,6 +121,42 @@ data class ChatItem(
 data class ToolDiff(val path: String, val oldText: String?, val newText: String)
 
 /**
+ * A file's merged change for the review sheet (N6.1): every tool diff of a
+ * path collapses to its first [oldText]/latest [newText]; counts are the
+ * multiset line stats the diff pills already show.
+ */
+@Immutable
+data class SessionFileDiff(
+    val path: String,
+    val oldText: String?,
+    val newText: String,
+    val additions: Int,
+    val deletions: Int,
+)
+
+/**
+ * All tool diffs of a session, aggregated for the review sheet. [files]
+ * merges every turn's diffs by path ("本会话工具变更"); [byTurn] keeps the
+ * same merge per turn ("本轮变更" entries).
+ */
+@Immutable
+data class SessionDiffs(
+    val files: List<SessionFileDiff> = emptyList(),
+    /** turnKey → that turn's merged files; only turns with diffs appear. */
+    val byTurn: Map<Long, List<SessionFileDiff>> = emptyMap(),
+    /** turnKeys with diffs, oldest → newest. */
+    val turnOrder: List<Long> = emptyList(),
+    val additions: Int = 0,
+    val deletions: Int = 0,
+) {
+    val latestTurnKey: Long? get() = turnOrder.lastOrNull()
+
+    companion object {
+        val EMPTY = SessionDiffs()
+    }
+}
+
+/**
  * A permission request the user (or a peer client) can still answer.
  * [requestId] is the wire id the gateway's `_devingo/permission_resolved`
  * broadcast references.

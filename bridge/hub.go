@@ -15,6 +15,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1700,13 +1702,9 @@ var (
 	errWriteFailed      = errors.New("write failed")
 )
 
-// writeSessionFile writes content at path inside the session's recorded
-// workspace. path must be relative and contained: a literal-clean check
-// kills "."-padded traversals, and the deepest existing ancestor is then
-// symlink-resolved so a mid-path symlink can't smuggle the target outside.
-// Both sides go through filepath.Rel — a prefix-shared sibling (/work2 vs
-// /work) never passes.
-func (h *Hub) writeSessionFile(sid, path, content string) error {
+// sessionCwd resolves the session's recorded workspace root — the lookup
+// shared by /fs/write and /git/diff.
+func (h *Hub) sessionCwd(sid string) (string, error) {
 	h.mu.Lock()
 	var cwd string
 	if s := h.sessions[sid]; s != nil {
@@ -1714,7 +1712,21 @@ func (h *Hub) writeSessionFile(sid, path, content string) error {
 	}
 	h.mu.Unlock()
 	if cwd == "" {
-		return errSessionNotHosted
+		return "", errSessionNotHosted
+	}
+	return cwd, nil
+}
+
+// writeSessionFile writes content at path inside the session's recorded
+// workspace. path must be relative and contained: a literal-clean check
+// kills "."-padded traversals, and the deepest existing ancestor is then
+// symlink-resolved so a mid-path symlink can't smuggle the target outside.
+// Both sides go through filepath.Rel — a prefix-shared sibling (/work2 vs
+// /work) never passes.
+func (h *Hub) writeSessionFile(sid, path, content string) error {
+	cwd, err := h.sessionCwd(sid)
+	if err != nil {
+		return err
 	}
 	root, err := filepath.Abs(cwd)
 	if err != nil {
@@ -1784,6 +1796,62 @@ func (h *Hub) writeSessionFile(sid, path, content string) error {
 		return errWriteFailed
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- git -----
+
+const (
+	// gitDiffTimeout bounds one `git diff` — the request goroutine must
+	// never park on a wedged repository.
+	gitDiffTimeout = 15 * time.Second
+	// gitDiffMaxOutput caps the patch returned to the app (~4 MiB).
+	gitDiffMaxOutput = 4 << 20
+)
+
+// sessionGitDiff returns the session workspace's uncommitted diff —
+// `git diff HEAD` (staged + unstaged), falling back to `git diff` when the
+// repo has no commits yet. Output past gitDiffMaxOutput is cut and flagged
+// truncated; the git process is killed rather than left blocked on a full
+// pipe.
+func (h *Hub) sessionGitDiff(sid string) (string, bool, error) {
+	cwd, err := h.sessionCwd(sid)
+	if err != nil {
+		return "", false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
+	defer cancel()
+
+	args := []string{"-C", cwd, "diff", "--no-color"}
+	if err := exec.CommandContext(ctx, "git", "-C", cwd,
+		"rev-parse", "--verify", "-q", "HEAD").Run(); err == nil {
+		args = append(args, "HEAD")
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", false, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", false, err
+	}
+	lr := &io.LimitedReader{R: stdout, N: gitDiffMaxOutput + 1}
+	out, _ := io.ReadAll(lr)
+	if lr.N <= 0 {
+		// Cap hit — git is parked on a full pipe; kill it and report the
+		// patch as truncated instead of draining unbounded output.
+		cancel()
+		_ = cmd.Wait()
+		return string(out[:gitDiffMaxOutput]), true, nil
+	}
+	if err := cmd.Wait(); err != nil {
+		if se := strings.TrimSpace(stderr.String()); se != "" {
+			return "", false, errors.New(se)
+		}
+		return "", false, err
+	}
+	return string(out), false, nil
 }
 
 // ---------------------------------------------------------------- rpc ----

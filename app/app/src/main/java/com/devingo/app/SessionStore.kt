@@ -73,6 +73,11 @@ class SessionStore(
      * Null when the bridge URL isn't known; 保存到工作区 reports a failure.
      */
     private val workspaceFileWriter: (suspend (String, String) -> Unit)? = null,
+    /**
+     * Bridge `/git/diff` bound to this session — returns the workspace's
+     * uncommitted patch. Null when the bridge URL isn't known (N6.1).
+     */
+    private val gitDiffFetcher: (suspend () -> String)? = null,
 ) {
 
     private companion object {
@@ -851,6 +856,13 @@ class SessionStore(
      */
     fun setDraftCitation(citation: CitationAttachment?) {
         _draftCitation.value = citation
+    }
+
+    /** The workspace's uncommitted `git diff` patch (Git 未提交变更 scope). */
+    suspend fun fetchGitDiff(): String {
+        val fetcher = gitDiffFetcher
+            ?: throw IllegalStateException("git diff unavailable without a bridge")
+        return fetcher()
     }
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {

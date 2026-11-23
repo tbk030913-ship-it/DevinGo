@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -85,6 +86,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronRight
+import me.rerere.hugeicons.stroke.Expand
 import me.rerere.hugeicons.stroke.File01
 
 // ---- expanded work log ---------------------------------------------------------
@@ -112,6 +114,8 @@ internal fun WorkLogColumn(
     entries: List<WorkEntry>,
     live: Boolean,
     modifier: Modifier = Modifier,
+    /** N6.1: DiffCard's 全屏审查 affordance — opens the review sheet. */
+    onReviewDiff: (String) -> Unit = {},
 ) {
     val cs = MaterialTheme.colorScheme
     // Row-detail expansion is lifted here so the container can relax its
@@ -222,12 +226,14 @@ internal fun WorkLogColumn(
                                 expandedDetails[entry.item.id] =
                                     expandedDetails[entry.item.id] != true
                             },
+                            onReviewDiff = onReviewDiff,
                         )
                         else -> Unit
                     }
                     is WorkEntry.ToolGroup -> ToolGroupRow(
                         group = entry,
                         expandedDetails = expandedDetails,
+                        onReviewDiff = onReviewDiff,
                     )
                 }
             }
@@ -376,6 +382,7 @@ private fun ToolLogRow(
     item: ChatItem,
     expanded: Boolean,
     onToggleExpand: () -> Unit,
+    onReviewDiff: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val running = item.status == "in_progress"
@@ -502,7 +509,11 @@ private fun ToolLogRow(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 item.diffs.forEach { diff ->
-                    DiffCard(diff = diff, memoKey = item.id)
+                    DiffCard(
+                        diff = diff,
+                        memoKey = item.id,
+                        onReview = { onReviewDiff(diff.path) },
+                    )
                 }
             }
         }
@@ -653,6 +664,7 @@ private fun toolGroupSummary(group: WorkEntry.ToolGroup): String =
 private fun ToolGroupRow(
     group: WorkEntry.ToolGroup,
     expandedDetails: SnapshotStateMap<Long, Boolean>,
+    onReviewDiff: (String) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     var expanded by remember(group.key) { mutableStateOf(false) }
@@ -716,6 +728,7 @@ private fun ToolGroupRow(
                             expandedDetails[member.id] =
                                 expandedDetails[member.id] != true
                         },
+                        onReviewDiff = onReviewDiff,
                     )
                 }
             }
@@ -751,7 +764,13 @@ private const val DIFF_CONTEXT = 2
  * (item id, path, old/new length); bodies over 4000 total lines hide.
  */
 @Composable
-internal fun DiffCard(diff: ToolDiff, memoKey: Long, modifier: Modifier = Modifier) {
+internal fun DiffCard(
+    diff: ToolDiff,
+    memoKey: Long,
+    modifier: Modifier = Modifier,
+    /** N6.1: 全屏审查 affordance — opens the review sheet on this file. */
+    onReview: () -> Unit = {},
+) {
     val cs = MaterialTheme.colorScheme
     val oldLines = diff.oldText?.lineSequence()?.count() ?: 0
     val newCount = remember(diff.newText) { diff.newText.lineSequence().count() }
@@ -810,6 +829,16 @@ internal fun DiffCard(diff: ToolDiff, memoKey: Long, modifier: Modifier = Modifi
                         maxLines = 1,
                     )
                 }
+                Icon(
+                    HugeIcons.Expand, "全屏审查",
+                    modifier = Modifier
+                        .padding(start = 4.dp)
+                        .size(30.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onReview)
+                        .padding(7.dp),
+                    tint = cs.onSurfaceVariant,
+                )
             }
             if (tooLarge) {
                 Text(

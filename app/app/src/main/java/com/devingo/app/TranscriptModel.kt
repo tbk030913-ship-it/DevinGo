@@ -153,6 +153,8 @@ data class TranscriptModel(
      * excluded so streaming stays bare markdown (U5.2).
      */
     val terminalAgentItemIds: Set<Long> = emptySet(),
+    /** Aggregated tool diffs — the review sheet's session/turn scopes. */
+    val diffs: SessionDiffs = SessionDiffs.EMPTY,
 ) {
     companion object {
         val EMPTY = TranscriptModel()
@@ -214,6 +216,7 @@ internal fun buildTranscriptModel(
                 null
             },
         terminalAgentItemIds = terminalAgentIds,
+        diffs = buildSessionDiffs(turns),
     )
 }
 
@@ -243,3 +246,49 @@ internal fun diffStatsOf(diffs: List<ToolDiff>): Pair<Int, Int> {
 /** Turn-level +A/−R shown on the WorkRow header. */
 internal fun workDiffStats(items: List<ChatItem>): Pair<Int, Int> =
     diffStatsOf(items.flatMap { it.diffs })
+
+/**
+ * Merge tool diffs by path — first reported [ToolDiff.oldText], latest
+ * [ToolDiff.newText], multiset +/− counts. Path order = first appearance.
+ */
+private fun mergeDiffsByPath(diffs: List<ToolDiff>): List<SessionFileDiff> {
+    val merged = LinkedHashMap<String, Pair<String?, String>>()
+    diffs.forEach { d ->
+        val prev = merged[d.path]
+        merged[d.path] = (prev?.first ?: d.oldText) to d.newText
+    }
+    return merged.map { (path, texts) ->
+        val (added, removed) = diffStatsOf(
+            listOf(ToolDiff(path, texts.first, texts.second)),
+        )
+        SessionFileDiff(
+            path = path,
+            oldText = texts.first,
+            newText = texts.second,
+            additions = added,
+            deletions = removed,
+        )
+    }
+}
+
+/**
+ * SessionDiffs for [turns]: session-wide merge ("本会话工具变更") plus a
+ * per-turn merge ("本轮变更") for every turn that produced diffs. Runs in
+ * [buildTranscriptModel] — off the main thread, only on structural change.
+ */
+internal fun buildSessionDiffs(turns: List<Turn>): SessionDiffs {
+    val byTurn = LinkedHashMap<Long, List<SessionFileDiff>>()
+    turns.forEach { turn ->
+        val diffs = turn.work.flatMap { it.diffs }
+        if (diffs.isNotEmpty()) byTurn[turn.key] = mergeDiffsByPath(diffs)
+    }
+    if (byTurn.isEmpty()) return SessionDiffs.EMPTY
+    val files = mergeDiffsByPath(turns.flatMap { it.work }.flatMap { it.diffs })
+    return SessionDiffs(
+        files = files,
+        byTurn = byTurn,
+        turnOrder = byTurn.keys.toList(),
+        additions = files.sumOf { it.additions },
+        deletions = files.sumOf { it.deletions },
+    )
+}

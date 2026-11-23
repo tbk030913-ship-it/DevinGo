@@ -312,4 +312,8 @@ class ChatViewModel(
     fun savePlanToWorkspace(markdown: String) {
         store?.savePlanToWorkspace(markdown)
     }
+
+    /** The workspace's uncommitted `git diff` patch via the bridge. */
+    suspend fun fetchGitDiff(): String =
+        store?.fetchGitDiff() ?: throw IllegalStateException("no bound session")
 }
