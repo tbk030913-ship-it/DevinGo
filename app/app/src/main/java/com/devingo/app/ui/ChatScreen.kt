@@ -2,6 +2,8 @@ package com.devingo.app.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
@@ -169,6 +171,17 @@ fun ChatScreen(
         // swaps the page back to a status screen (U6).
         ConnBanner(ui)
         Box(Modifier.weight(1f).fillMaxWidth()) {
+            // Mirrors FloatingWorkingControl's `hasCapsule || showScrollToEnd`
+            // — the running/scroll segments only appear while !atBottom, so a
+            // single `!atBottom` term covers them both.
+            val capsuleShown =
+                ui.reconnecting || ui.phase == Phase.Error ||
+                    queuedPrompts.isNotEmpty() || !atBottom
+            val capsuleInset by animateDpAsState(
+                targetValue = if (capsuleShown) 48.dp else 0.dp,
+                animationSpec = tween(240),
+                label = "capsuleInset",
+            )
             if (model.itemById.isEmpty() && queuedPrompts.isEmpty()) {
                 ChatEmptyState(hasCommands = ui.commands.isNotEmpty())
             } else {
@@ -196,6 +209,9 @@ fun ChatScreen(
                     onEditQueued = { vm.beginQueuedEdit(it) },
                     listState = listState,
                     modifier = Modifier.fillMaxSize(),
+                    // Keep the status line above the floating capsule — the
+                    // overlay covers ~48dp whenever it's showing (U5.4).
+                    bottomInset = capsuleInset,
                 )
             }
             // U5.4: the floating work capsule replaces the lone ↓ button —
@@ -204,6 +220,10 @@ fun ChatScreen(
             FloatingWorkingControl(
                 reconnecting = ui.reconnecting,
                 connectionFailed = ui.phase == Phase.Error,
+                // A live-socket error (attach/open failure) can't be retried
+                // via kickReconnect — only offer the tap when the socket's
+                // actually down or a backoff wait is parked.
+                retryEnabled = ui.reconnecting || !ui.connected,
                 reconnectRetryAtMs = ui.reconnectRetryAtMs,
                 statusText = ui.statusText.ifBlank { ui.error.orEmpty() },
                 running = ui.running && !atBottom,

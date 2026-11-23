@@ -153,9 +153,12 @@ private fun QueueRow(
     onRemove: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
-    // t3's right-side swipe action — full swipe commits the removal.
+    val scope = rememberCoroutineScope()
+    // t3's right-side swipe action — full swipe commits the removal. A
+    // commit landing inside the busy window gets dropped by act{} — snap
+    // the row back instead of leaving it visually dismissed.
     val dismissState = rememberSwipeToDismissBoxState(
-        confirmValueChange = { it == SwipeToDismissBoxValue.EndToStart },
+        confirmValueChange = { enabled && it == SwipeToDismissBoxValue.EndToStart },
     )
     SwipeToDismissBox(
         state = dismissState,
@@ -186,7 +189,9 @@ private fun QueueRow(
         },
         enableDismissFromStartToEnd = false,
         gesturesEnabled = enabled,
-        onDismiss = { onRemove() },
+        onDismiss = {
+            if (enabled) onRemove() else scope.launch { dismissState.reset() }
+        },
     ) {
         Row(
             Modifier

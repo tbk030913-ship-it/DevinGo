@@ -829,7 +829,16 @@ class SessionStore(
     }
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {
-        _draftAttachments.value = attachments
+        // Single enforcement point — keeps what fits under the send cap so
+        // the queue-edit path can't park an over-limit payload either.
+        var sum = 0L
+        val kept = attachments.filter { a ->
+            (sum + a.bytes.size <= MAX_ATTACHMENT_BYTES).also { if (it) sum += a.bytes.size }
+        }
+        if (kept.size < attachments.size) {
+            append(Kind.Error, "图片合计超过 3MB，超出的未添加")
+        }
+        _draftAttachments.value = kept
     }
 
     // ---- prompts ---------------------------------------------------------------

@@ -2,9 +2,12 @@ package com.devingo.app.ui
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -81,6 +84,7 @@ private enum class CapsuleStatus { Connection, Running }
 internal fun FloatingWorkingControl(
     reconnecting: Boolean,
     connectionFailed: Boolean,
+    retryEnabled: Boolean,
     reconnectRetryAtMs: Long?,
     statusText: String,
     running: Boolean,
@@ -97,6 +101,7 @@ internal fun FloatingWorkingControl(
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
+    val rm = isReducedMotion()
     val status = when {
         reconnecting || connectionFailed -> CapsuleStatus.Connection
         running -> CapsuleStatus.Running
@@ -105,15 +110,15 @@ internal fun FloatingWorkingControl(
     val hasCapsule = status != null || queuedCount > 0 || subagentCount > 0
     AnimatedVisibility(
         visible = hasCapsule || showScrollToEnd,
-        enter = CONTROL_ENTER,
-        exit = CONTROL_EXIT,
+        enter = if (rm) EnterTransition.None else CONTROL_ENTER,
+        exit = if (rm) ExitTransition.None else CONTROL_EXIT,
         modifier = modifier,
     ) {
         // t3's separationProgress: 1 = ↓ sits beside the pill, 0 = tucked
         // under its right edge. The pill shifts +SEP, the arrow −SEP.
         val p by animateFloatAsState(
             targetValue = if (showScrollToEnd) 1f else 0f,
-            animationSpec = CONTROL_TIMING,
+            animationSpec = if (rm) snap() else CONTROL_TIMING,
             label = "separation",
         )
         val sepPx = with(LocalDensity.current) { CONTROL_SEPARATION.toPx() }
@@ -134,20 +139,26 @@ internal fun FloatingWorkingControl(
                     Row(
                         Modifier
                             .height(CONTROL_HEIGHT)
-                            .animateContentSize(SIZE_TIMING),
+                            .animateContentSize(if (rm) snap() else SIZE_TIMING),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (status != null) {
                             AnimatedContent(
                                 targetState = status,
                                 transitionSpec = {
-                                    LABEL_ENTER togetherWith LABEL_EXIT
+                                    if (rm) {
+                                        EnterTransition.None togetherWith
+                                            ExitTransition.None
+                                    } else {
+                                        LABEL_ENTER togetherWith LABEL_EXIT
+                                    }
                                 },
                                 label = "capsuleStatus",
                             ) { s ->
                                 when (s) {
                                     CapsuleStatus.Connection -> ConnectionLabel(
                                         reconnecting = reconnecting,
+                                        retryEnabled = retryEnabled,
                                         retryAtMs = reconnectRetryAtMs,
                                         statusText = statusText,
                                         onClick = onReconnect,
@@ -272,6 +283,7 @@ private fun CapsuleText(text: String, modifier: Modifier = Modifier) {
 @Composable
 private fun ConnectionLabel(
     reconnecting: Boolean,
+    retryEnabled: Boolean,
     retryAtMs: Long?,
     statusText: String,
     onClick: () -> Unit,
@@ -291,17 +303,21 @@ private fun ConnectionLabel(
             delay(500)
         }
     }
+    // "点击重试" only when a retry can actually fire — a parked backoff or
+    // a dead socket; a live-socket error (attach/open failure) ignores the
+    // tap, so it doesn't get the affordance.
     val text = when {
         retryAtMs != null ->
             "重连中 (${remaining.coerceAtLeast(0)}s) · 点击立即重试"
         reconnecting -> "重连中 · 点击立即重试"
-        else -> statusText.ifBlank { "连接失败" } + " · 点击重试"
+        retryEnabled -> statusText.ifBlank { "连接失败" } + " · 点击重试"
+        else -> statusText.ifBlank { "连接失败" }
     }
     Row(
         Modifier
             .height(CONTROL_HEIGHT)
             .clip(CircleShape)
-            .clickable(onClick = onClick)
+            .let { if (retryEnabled || reconnecting || retryAtMs != null) it.clickable(onClick = onClick) else it }
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),

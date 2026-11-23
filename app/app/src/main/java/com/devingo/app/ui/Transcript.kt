@@ -63,6 +63,7 @@ import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatItem
 import com.devingo.app.Kind
@@ -172,6 +173,7 @@ internal fun Transcript(
     onEditQueued: (Long) -> Unit,
     listState: LazyListState,
     modifier: Modifier = Modifier,
+    bottomInset: Dp = 0.dp,
 ) {
     // The row model arrives prebuilt (SessionStore, off the main thread) —
     // a tail item still streaming text overrides the model's copy below.
@@ -186,8 +188,12 @@ internal fun Transcript(
         reverseLayout = true,
         modifier = modifier.fillMaxWidth(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(
-            horizontal = 18.dp,
-            vertical = 8.dp,
+            start = 18.dp,
+            top = 8.dp,
+            end = 18.dp,
+            // U5.4: keep the status line clear of the floating capsule —
+            // t3's FLOATING_WORKING_CONTROL_COVERAGE as a bottom inset.
+            bottom = 8.dp + bottomInset,
         ),
     ) {
         items(
