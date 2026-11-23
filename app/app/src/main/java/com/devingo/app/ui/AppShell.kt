@@ -37,7 +37,6 @@ import com.devingo.app.ChatViewModel
 import com.devingo.app.Page
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
-import com.devingo.app.tailnet.TailnetManager
 import kotlinx.coroutines.launch
 
 /**
@@ -69,7 +68,7 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     // `_devingo/sessions` cache immediately.
     LaunchedEffect(drawerState.targetValue) {
         if (drawerState.targetValue == DrawerValue.Open) {
-            vm.refreshSessions(resolvedHost(prefs), prefs.token.trim())
+            vm.refreshSessions(prefs.host.trim(), prefs.token.trim())
         }
     }
 
@@ -93,7 +92,7 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     fun pickSession(s: AcpSession) {
         scope.launch {
             drawerState.close()
-            vm.openSession(s.sessionId, s.cwd, resolvedHost(prefs), prefs.token.trim())
+            vm.openSession(s.sessionId, s.cwd, prefs.host.trim(), prefs.token.trim())
         }
     }
 
@@ -150,13 +149,13 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                                 onNewSession = {
                                     scope.launch {
                                         drawerState.close()
-                                        vm.newSession(null, resolvedHost(prefs), prefs.token.trim())
+                                        vm.newSession(null, prefs.host.trim(), prefs.token.trim())
                                     }
                                 },
                                 onNewSessionCwd = { cwd ->
                                     scope.launch {
                                         drawerState.close()
-                                        vm.newSession(cwd, resolvedHost(prefs), prefs.token.trim())
+                                        vm.newSession(cwd, prefs.host.trim(), prefs.token.trim())
                                     }
                                 },
                             )
@@ -204,8 +203,8 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     }
 }
 
-private suspend fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: AcpSession?) {
-    val host = resolvedHost(prefs)
+private fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: AcpSession?) {
+    val host = prefs.host.trim()
     if (host.isEmpty()) return
     vm.connect(
         host,
@@ -216,14 +215,9 @@ private suspend fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: Acp
     )
 }
 
-private suspend fun resolvedHost(prefs: Prefs): String {
-    val host = prefs.host.trim()
-    return runCatching { TailnetManager.resolveHost(host) }.getOrDefault(host)
-}
-
 /** Project-group "+": fresh session rooted at that group's cwd. */
-private suspend fun startConnectCwd(vm: ChatViewModel, prefs: Prefs, cwd: String?) {
-    val host = resolvedHost(prefs)
+private fun startConnectCwd(vm: ChatViewModel, prefs: Prefs, cwd: String?) {
+    val host = prefs.host.trim()
     if (host.isEmpty() || cwd.isNullOrBlank()) return
     vm.connect(
         host,

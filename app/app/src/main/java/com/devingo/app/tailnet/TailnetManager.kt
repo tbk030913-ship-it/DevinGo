@@ -218,7 +218,8 @@ object TailnetManager {
     /** True when the raw prefs host value is a tailnet destination. */
     fun hostNeedsTailnet(host: String): Boolean = isTailnetHost(hostPart(host))
 
-    private fun hostPart(host: String): String = host.substringBeforeLast(':')
+    private fun hostPart(host: String): String =
+        host.substringAfter("://").substringBeforeLast(':')
 
     /** Tailnet destinations only: CGNAT IPv4 or a MagicDNS *.ts.net name. */
     private fun isTailnetHost(h: String): Boolean {

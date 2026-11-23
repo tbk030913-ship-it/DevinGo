@@ -67,7 +67,8 @@ import com.devingo.app.OpenTarget
 import com.devingo.app.Phase
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
-import com.devingo.app.acp.fetchBridgeHealth
+import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
+import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
 import com.devingo.app.tailnet.TailnetState
 import com.devingo.app.ui.theme.DevinGoColors
@@ -145,7 +146,10 @@ internal fun HomeScreen(
     var showAllGroups by remember { mutableStateOf(setOf<String>()) }
     val snackbarHostState = remember { SnackbarHostState() }
 
-    val host = prefs.host.trim()
+    // hostFlow mirrors prefs.host writes from anywhere — a candidate
+    // switch during reconnect refreshes this screen on its own (C5).
+    val hostPref by prefs.hostFlow.collectAsState()
+    val host = hostPref.trim()
     val configured = host.isNotEmpty()
     val tailnetState by TailnetManager.state.collectAsState()
     val tailnetRouted = prefs.tailnetEnabled && TailnetManager.hostNeedsTailnet(host)
@@ -156,96 +160,58 @@ internal fun HomeScreen(
         Phase.StartingSession,
     )
 
-    /** resolveHost failed — tailnet host configured but the node isn't up. */
-    fun showTailnetError() {
-        scope.launch {
-            val result = snackbarHostState.showSnackbar(
-                message = "Tailscale 未连接",
-                actionLabel = "去设置",
-                duration = SnackbarDuration.Long,
-            )
-            if (result == SnackbarResult.ActionPerformed) settingsOpen = true
-        }
-    }
-
     fun startConnect(resumeId: String? = null, sessionCwd: String? = null) {
         if (host.isEmpty()) {
             settingsOpen = true
             return
         }
-        scope.launch {
-            val resolved = try {
-                TailnetManager.resolveHost(host)
-            } catch (e: IllegalStateException) {
-                showTailnetError()
-                return@launch
-            }
-            vm.connect(
-                resolved,
-                prefs.token.trim(),
-                (sessionCwd ?: prefs.cwd.trim()),
-                resumeSessionId = resumeId,
-                apiKey = prefs.apiKey,
-            )
-        }
+        // The manager probes candidates + resolves tailnet itself.
+        vm.connect(
+            host,
+            prefs.token.trim(),
+            (sessionCwd ?: prefs.cwd.trim()),
+            resumeSessionId = resumeId,
+            apiKey = prefs.apiKey,
+        )
     }
 
     fun loadSessions() {
         sessionsError = null
         sessionsLoading = true
         pullRefreshing = homeState.sessions != null
-        scope.launch {
-            if (host.isEmpty()) {
-                homeState.sessions = emptyList()
-                sessionsLoading = false
-                lastLoadOk = null
-                pullRefreshing = false
-                return@launch
-            }
-            val resolved = try {
-                TailnetManager.resolveHost(host)
-            } catch (e: IllegalStateException) {
-                sessionsError = "Tailscale 未连接"
-                sessionsLoading = false
-                pullRefreshing = false
-                lastLoadOk = false
-                showTailnetError()
-                return@launch
-            }
-            // The shared `_devingo/sessions` cache fills homeState.sessions
-            // via the collector below; failures land on the same flow.
-            vm.refreshSessions(resolved, prefs.token.trim())
+        if (host.isEmpty()) {
+            homeState.sessions = emptyList()
+            sessionsLoading = false
+            lastLoadOk = null
+            pullRefreshing = false
+            return
         }
+        // The shared `_devingo/sessions` cache fills homeState.sessions
+        // via the collector below; failures land on the same flow.
+        vm.refreshSessions(host, prefs.token.trim())
     }
 
     fun commitSessionDelete(s: AcpSession) {
         scope.launch {
-            val ok = runCatching {
-                try {
-                    TailnetManager.resolveHost(host)
-                } catch (e: IllegalStateException) {
-                    showTailnetError()
-                    return@runCatching false
-                }
-                vm.deleteSession(s.sessionId)
-            }.getOrDefault(false)
+            val ok = vm.deleteSession(s.sessionId)
             if (!ok) loadSessions()
         }
     }
 
-    /** QR result: probe all LAN candidates in parallel, fall back to tailnet. */
+    /** QR result: store every candidate, probe LAN in parallel, tail as fallback. */
     fun applyPair(info: PairInfo) {
         scope.launch {
-            val token = info.token.ifBlank { prefs.token }
             val busy = launch {
                 snackbarHostState.showSnackbar("正在连接 bridge…", duration = SnackbarDuration.Indefinite)
             }
             try {
-                // Parallel probes keep order preference: first candidate in
-                // payload order that answers healthz wins.
+                // Parallel /healthz probes keep payload order: first LAN
+                // candidate that answers wins; the tailnet address is the
+                // fallback — it routes through the embedded node at connect
+                // time, so it isn't probed here.
                 val reachable = info.hosts.map { h ->
                     async(Dispatchers.IO) {
-                        h to runCatching { fetchBridgeHealth("http://$h", token) }.isSuccess
+                        h to probeBridgeHealth("http://$h", BRIDGE_PROBE_TIMEOUT_MS)
                     }
                 }.awaitAll().firstOrNull { it.second }?.first
                 val chosen = reachable ?: info.tail.takeIf { it.isNotBlank() }
@@ -254,7 +220,18 @@ internal fun HomeScreen(
                     return@launch
                 }
                 if (info.token.isNotBlank()) prefs.token = info.token
-                if (TailnetManager.hostNeedsTailnet(chosen)) prefs.tailnetEnabled = true
+                // C5: persist every advertised address (LAN order first,
+                // tail last) plus any manually entered one.
+                prefs.hostCandidates = (info.hosts + info.tail + prefs.host)
+                    .filter { it.isNotBlank() }.distinct()
+                if (info.tail.isNotBlank()) {
+                    // Prewarm the node now — LAN failure later should fall
+                    // to a warm tailnet, not a cold start.
+                    prefs.tailnetEnabled = true
+                    TailnetManager.start()
+                }
+                // Setting the active host fires hostFlow → this screen
+                // refreshes against the new bridge by itself.
                 prefs.host = chosen
                 snackbarHostState.showSnackbar("已填入 $chosen")
             } finally {

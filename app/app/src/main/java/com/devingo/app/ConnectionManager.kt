@@ -14,16 +14,22 @@ import com.devingo.app.acp.AcpSession
 import com.devingo.app.acp.InboundEvent
 import com.devingo.app.acp.IncomingRequest
 import com.devingo.app.acp.JSONRPC_METHOD_NOT_FOUND
+import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
+import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
+import com.devingo.app.tailnet.TailnetState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -174,6 +180,10 @@ class ConnectionManager private constructor(private val app: Application) {
     private val connectivity = app.getSystemService(ConnectivityManager::class.java)
 
     private var lastHost = ""
+    /** Candidate-list snapshot adopted with [lastHost] — detects a re-pair. */
+    private var lastCandKey = ""
+    /** The address the live socket actually dials (loopback for tailnet). */
+    private var dialHost = ""
     private var lastToken: String? = null
     private var lastApiKey: String? = null
     private var pendingOpen: OpenTarget? = null
@@ -217,15 +227,30 @@ class ConnectionManager private constructor(private val app: Application) {
 
     // ---- connection -------------------------------------------------------
 
-    /** Point the manager at a different bridge: old epoch's stores die with it. */
+    /**
+     * Point the manager at a different bridge: old epoch's stores die with
+     * it. C5: another stored CANDIDATE of the same pairing (same token,
+     * unchanged candidate list) is a new address for the same bridge —
+     * adopted without an epoch drop so sessions survive a LAN↔tailnet
+     * switch driven by [probeActiveHost].
+     */
     private fun noteHost(host: String, token: String) {
-        if (host.isNotBlank() && host != lastHost) {
-            // The socket may already be dead (socketLive false) while stores
-            // still wait on a reconnect — the epoch must drop either way or
-            // the old bridge's sessions would leak into the new host.
-            client.disconnect()
-            socketLive = false
-            dropEpoch()
+        if (host.isNotBlank()) {
+            val cand = Prefs(app).hostCandidates
+            if (host != lastHost) {
+                val sameBridge = token.isNotBlank() && token == lastToken &&
+                    host in cand && cand.joinToString("|") == lastCandKey
+                if (!sameBridge) {
+                    // The socket may already be dead (socketLive false) while
+                    // stores still wait on a reconnect — the epoch must drop
+                    // either way or the old bridge's sessions would leak
+                    // into the new host.
+                    client.disconnect()
+                    socketLive = false
+                    dropEpoch()
+                }
+            }
+            lastCandKey = cand.joinToString("|")
         }
         lastHost = host
         lastToken = token.ifBlank { null }
@@ -250,20 +275,17 @@ class ConnectionManager private constructor(private val app: Application) {
         if (socketLive) return true
         if (lastHost.isBlank()) {
             // Cold-start entries (e.g. a notification tap as the app's first
-            // action) never passed host/token — fall back to persisted prefs
-            // through the same tailnet resolution the UI call sites use.
+            // action) never passed host/token — fall back to persisted prefs.
+            // The candidate probe below resolves routing (incl. tailnet).
             val prefs = Prefs(app)
             val raw = prefs.host.trim()
             if (raw.isNotBlank()) {
-                val resolved = runCatching { TailnetManager.resolveHost(raw) }
-                    .getOrDefault(raw)
-                noteHost(resolved, prefs.token.trim())
+                noteHost(raw, prefs.token.trim())
                 lastApiKey = prefs.apiKey.trim().ifBlank { null }
             }
         }
-        val host = lastHost
         val token = lastToken
-        if (host.isBlank()) {
+        if (lastHost.isBlank()) {
             _conn.update { it.copy(phase = Phase.Error, error = "未配置 bridge") }
             return false
         }
@@ -278,7 +300,20 @@ class ConnectionManager private constructor(private val app: Application) {
                     reconnecting = false,
                 )
             }
-            val health = runCatching { fetchBridgeHealth(healthUrl(host), token) }
+            // C5: race every stored candidate — the first reachable one in
+            // LAN-first order becomes the dial target (and active host).
+            val dial = probeActiveHost()
+            if (dial == null) {
+                _conn.update {
+                    it.copy(
+                        phase = Phase.Error,
+                        error = probeErrorText(),
+                        connected = false,
+                    )
+                }
+                return false
+            }
+            val health = runCatching { fetchBridgeHealth(healthUrl(dial), token) }
                 .getOrNull()
             if (health != null && !health.devinFound) {
                 _conn.update {
@@ -289,7 +324,7 @@ class ConnectionManager private constructor(private val app: Application) {
             defaultCwd = health?.defaultCwd.orEmpty()
             _conn.update { it.copy(phase = Phase.Connecting, statusText = "建立 WebSocket…") }
             intentionalDisconnect = false
-            client.connect(wsUrl(host), token)
+            client.connect(wsUrl(dial), token)
             _conn.update { it.copy(statusText = "ACP 握手…") }
             val init = client.initialize()
             // Introduce ourselves to the gateway (attach/journal/…); the
@@ -806,7 +841,12 @@ class ConnectionManager private constructor(private val app: Application) {
                     }
                 }
                 try {
-                    client.connect(wsUrl(lastHost), lastToken)
+                    // C5: re-probe candidates every attempt — a drop may
+                    // mean the network changed and another address now
+                    // answers first (LAN back, or only tailnet left).
+                    val dial = probeActiveHost()
+                        ?: throw AcpException("bridge 不可达")
+                    client.connect(wsUrl(dial), lastToken)
                     client.initialize()
                     runCatching { client.hello(clientId) }
                     // Live only once the handshake completed — a cancel
@@ -1075,12 +1115,81 @@ class ConnectionManager private constructor(private val app: Application) {
     // ---- misc ------------------------------------------------------------------
 
     private fun loadBridgeModels() {
-        val httpUrl = healthUrl(lastHost)
+        val httpUrl = healthUrl(dialHost)
         scope.launch {
             val models = runCatching { fetchBridgeModels(httpUrl, lastToken) }
                 .getOrNull().orEmpty()
             if (models.isNotEmpty()) _bridgeModels.value = models
         }
+    }
+
+    /**
+     * C5 multi-address: probe every stored candidate's /healthz in
+     * parallel, each within [BRIDGE_PROBE_TIMEOUT_MS]. A reachable LAN
+     * candidate wins in list order; tailnet only when no LAN answered —
+     * tailnet resolution rides the same 1.5s budget so a still-warming node
+     * never delays the LAN path (it prewarms at app start). The winner
+     * becomes both the dial target and the active prefs.host; the write is
+     * skipped when the configured host changed mid-probe.
+     */
+    private suspend fun probeActiveHost(): String? {
+        val prefs = Prefs(app)
+        val expected = prefs.host.trim()
+        // A cleared host means "no bridge" — don't resurrect it by probing.
+        if (expected.isEmpty()) return null
+        val stored = prefs.hostCandidates
+        val candidates = (stored + lastHost + expected)
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (candidates.isEmpty()) return null
+        val reachable = coroutineScope {
+            candidates.map { cand ->
+                async {
+                    resolveCandidate(prefs, cand)
+                        ?.takeIf {
+                            probeBridgeHealth(healthUrl(it), BRIDGE_PROBE_TIMEOUT_MS)
+                        }
+                        ?.let { cand to it }
+                }
+            }.awaitAll().filterNotNull()
+        }
+        val (cand, dial) = reachable
+            .firstOrNull { !TailnetManager.hostNeedsTailnet(it.first) }
+            ?: reachable.firstOrNull()
+            ?: return null
+        // The configured host changed while probing (re-pair, settings
+        // edit): this result belongs to the stale config — drop it rather
+        // than dial a bridge the user already moved away from.
+        if (prefs.host.trim() != expected) return null
+        // Same bridge, new address: adopt it as the host identity — no
+        // epoch drop, so live stores survive an address switch.
+        lastHost = cand
+        lastCandKey = stored.joinToString("|")
+        dialHost = dial
+        prefs.host = cand
+        return dial
+    }
+
+    /** A candidate's dial address — tailnet routes via the node loopback. */
+    private suspend fun resolveCandidate(prefs: Prefs, cand: String): String? =
+        if (!prefs.tailnetEnabled || !TailnetManager.hostNeedsTailnet(cand)) {
+            // Plain route — also covers an OS-level tailnet (Tailscale app).
+            cand
+        } else {
+            // Shares the probe budget: a cold node fails this one probe,
+            // never the whole pick.
+            withTimeoutOrNull(BRIDGE_PROBE_TIMEOUT_MS) {
+                runCatching { TailnetManager.resolveHost(cand) }.getOrNull()
+            }
+        }
+
+    /** Failure text when no candidate answered — names a missing tailnet. */
+    private fun probeErrorText(): String {
+        val prefs = Prefs(app)
+        val tailPending = prefs.tailnetEnabled &&
+            TailnetManager.state.value !is TailnetState.Running &&
+            prefs.hostCandidates.any { TailnetManager.hostNeedsTailnet(it) }
+        return if (tailPending) "局域网不通，Tailscale 未连接" else "bridge 不可达"
     }
 
     private fun wsUrl(host: String): String = when {

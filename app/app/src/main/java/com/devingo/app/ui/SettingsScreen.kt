@@ -180,9 +180,10 @@ fun SettingsScreen(
         ) {
             // ---- 连接 -------------------------------------------------------------
             SectionHeader("连接", Modifier.padding(start = 20.dp))
+            val activeHost by prefs.hostFlow.collectAsState()
             SettingRow(
                 "Bridge 地址",
-                subtitle = prefs.host.ifBlank { "未设置" },
+                subtitle = activeHost.ifBlank { "未设置" },
                 onClick = { editField = EditField.Host },
             )
             SettingRow(
@@ -569,7 +570,8 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
             text = "保存",
             onClick = {
                 when (field) {
-                    EditField.Host -> prefs.host = value.trim()
+                    // Manual entries join the candidate list (C5).
+                    EditField.Host -> prefs.noteHostCandidate(value.trim())
                     EditField.Token -> prefs.token = value.trim()
                     EditField.Cwd -> prefs.cwd = value.trim()
                     EditField.ApiKey -> prefs.apiKey = value.trim()

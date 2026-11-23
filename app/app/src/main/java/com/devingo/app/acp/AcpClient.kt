@@ -941,6 +941,24 @@ private fun extractModels(el: JsonElement, out: MutableList<SessionModel> = muta
     return out.distinctBy { it.modelId }.toMutableList()
 }
 
+/** Per-candidate /healthz budget for multi-address probing (C5). */
+const val BRIDGE_PROBE_TIMEOUT_MS = 1_500L
+
+/**
+ * Bare reachability check for a candidate bridge address: /healthz is
+ * unauthenticated by design, so any success response means a bridge lives
+ * at [baseHttpUrl]. Connect+read share one [timeoutMs] budget.
+ */
+suspend fun probeBridgeHealth(baseHttpUrl: String, timeoutMs: Long): Boolean =
+    withContext(Dispatchers.IO) {
+        val client = OkHttpClient.Builder()
+            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+        val req = Request.Builder().url("$baseHttpUrl/healthz").build()
+        runCatching { client.newCall(req).execute().use { it.isSuccessful } }
+            .getOrDefault(false)
+    }
+
 /** HTTP helper for the bridge's /healthz endpoint (pre-flight checks). */
 suspend fun fetchBridgeHealth(baseHttpUrl: String, token: String?): BridgeHealth =
     withContext(Dispatchers.IO) {

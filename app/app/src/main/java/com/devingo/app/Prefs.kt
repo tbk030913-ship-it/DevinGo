@@ -1,12 +1,14 @@
 package com.devingo.app
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -31,9 +33,53 @@ class Prefs(context: Context) {
         _settingsVersion.value += 1
     }
 
+    /**
+     * Live mirror of [host] — kept in sync by a preference listener so
+     * writes through ANY Prefs instance (e.g. the connection manager's
+     * candidate switch) reach collectors. The listener is held strongly:
+     * SharedPreferences only weakly references listeners.
+     */
+    private val _host = MutableStateFlow(host)
+    val hostFlow: StateFlow<String> = _host.asStateFlow()
+
+    private val hostListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "host") _host.value = host
+        }
+
+    init {
+        sp.registerOnSharedPreferenceChangeListener(hostListener)
+    }
+
     var host: String
         get() = sp.getString("host", "") ?: ""
         set(v) = sp.edit().putString("host", v).apply()
+
+    /**
+     * C5: every bridge address worth trying — QR LAN candidates first, the
+     * tailnet one last, plus manually entered ones. [host] is the member
+     * currently considered active. Falls back to [host] alone on installs
+     * that predate the list.
+     */
+    var hostCandidates: List<String>
+        get() {
+            val raw = sp.getString("hosts", null)
+                ?: return listOf(host).filter { it.isNotBlank() }
+            return runCatching {
+                val a = JSONArray(raw)
+                (0 until a.length()).map { a.optString(it) }
+            }.getOrDefault(emptyList()).filter { it.isNotBlank() }
+        }
+        set(v) = sp.edit()
+            .putString("hosts", JSONArray(v.filter { it.isNotBlank() }.distinct()).toString())
+            .apply()
+
+    /** Make [h] the active host; a new address joins the candidates first. */
+    fun noteHostCandidate(h: String) {
+        val cur = hostCandidates
+        if (h.isNotBlank() && h !in cur) hostCandidates = listOf(h) + cur
+        host = h
+    }
 
     var token: String
         get() = getSecret("token")
