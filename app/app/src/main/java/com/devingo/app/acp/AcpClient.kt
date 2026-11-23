@@ -29,8 +29,10 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -451,11 +453,16 @@ class AcpClient(
      * events past [afterSeq]. When the journal no longer reaches that far
      * the result's `needLoad` tells the caller to fall back to session/load.
      */
-    suspend fun attach(sessionId: String, afterSeq: Long): AttachResult = request(
+    suspend fun attach(sessionId: String, afterSeq: Long, cwd: String? = null): AttachResult = request(
         "_devingo/attach",
         buildJsonObject {
             put("sessionId", sessionId)
             put("afterSeq", afterSeq)
+            // Re-homing the workspace hint: a hub that lost the record (e.g.
+            // a lazily-recreated session entry) needs it before /fs/write
+            // can resolve paths. The bridge only fills a MISSING cwd —
+            // session/new|load stays authoritative.
+            if (!cwd.isNullOrBlank()) put("cwd", cwd)
         },
     ).let { json.decodeFromJsonElement((it["result"] as? JsonObject) ?: it) }
 
@@ -919,6 +926,46 @@ suspend fun fetchBridgeModels(baseHttpUrl: String, token: String?): List<Session
         }
         extractModels(healthJson.parseToJsonElement(body))
     }
+
+/**
+ * The bridge's `/fs/write`: write [content] to [path] inside the session's
+ * recorded workspace (token-authed, path containment enforced server-side).
+ * Throws [AcpException] on any non-2xx so the caller can surface the error.
+ */
+suspend fun postBridgeFile(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    path: String,
+    content: String,
+) = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .build()
+    val payload = buildJsonObject {
+        put("sessionId", sessionId)
+        put("path", path)
+        put("content", content)
+    }
+    val req = Request.Builder()
+        .url("$baseHttpUrl/fs/write")
+        .post(payload.toString().toRequestBody("application/json".toMediaType()))
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "fs/write HTTP ${resp.code}")
+        }
+    }
+}
 
 private fun extractModels(el: JsonElement, out: MutableList<SessionModel> = mutableListOf()): List<SessionModel> {
     when (el) {

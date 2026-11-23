@@ -32,6 +32,9 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import android.content.ClipData
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -58,7 +61,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.AppVisibility
 import com.devingo.app.ChatViewModel
+import com.devingo.app.CitationAttachment
 import com.devingo.app.Phase
+import com.devingo.app.RowKind
 import com.devingo.app.UiState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
@@ -89,6 +94,7 @@ fun ChatScreen(
     // switching away and back, which Compose-local state never did.
     val input by vm.draft.collectAsState()
     val attachments by vm.draftAttachments.collectAsState()
+    val citation by vm.draftCitation.collectAsState()
     val turnTimes by vm.turnTimes.collectAsState()
     // Keyed on the bound session — the page stays Page.Chat across a
     // session switch, so without the key scroll position and expansions
@@ -101,6 +107,7 @@ fun ChatScreen(
     var modelSheet by remember { mutableStateOf(false) }
     var infoSheet by remember { mutableStateOf(false) }
     var queueSheet by remember { mutableStateOf(false) }
+    var citationSheet by remember { mutableStateOf(false) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
 
@@ -108,7 +115,8 @@ fun ChatScreen(
     // streaming and its row shows running/unread badges. An open sheet
     // consumes back first (dismisses itself).
     BackHandler(
-        enabled = !modelSheet && !infoSheet && !queueSheet && revertSteps == null,
+        enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
+            revertSteps == null,
     ) {
         vm.leaveSession()
     }
@@ -211,6 +219,18 @@ fun ChatScreen(
                     },
                     onResend = { vm.resend(it) },
                     onEditQueued = { vm.beginQueuedEdit(it) },
+                    // Message-level quote: the whole markdown pins to the
+                    // draft and the sheet opens for trim/comment (U5.5).
+                    onQuote = { item ->
+                        vm.setDraftCitation(
+                            CitationAttachment(
+                                messageId = item.id,
+                                quotedText = item.text,
+                            ),
+                        )
+                        citationSheet = true
+                    },
+                    onSavePlan = { vm.savePlanToWorkspace(planMarkdown(it.planEntries)) },
                     listState = listState,
                     modifier = Modifier.fillMaxSize(),
                     // Keep the status line above the floating capsule — the
@@ -293,6 +313,7 @@ fun ChatScreen(
             ui = ui,
             input = input,
             attachments = attachments,
+            citation = citation,
             queueEditing = editingQueuedId != null,
             permissionPending = pendingPermission != null,
             onInputChange = vm::setDraft,
@@ -314,6 +335,10 @@ fun ChatScreen(
             },
             onAttach = { vm.setDraftAttachments(attachments + it) },
             onRemoveAttachment = { vm.setDraftAttachments(attachments - it) },
+            onCitationClick = { citationSheet = true },
+            onCitationRemove = { vm.setDraftCitation(null) },
+            onOpenModel = { modelSheet = true },
+            onSelectMode = vm::setMode,
             onCancelQueuedEdit = vm::cancelQueuedEdit,
             onStop = vm::cancelTurn,
         )
@@ -350,6 +375,44 @@ fun ChatScreen(
                 queueSheet = false
             },
             onRemove = vm::cancelQueued,
+        )
+    }
+    val clipboard = LocalClipboard.current
+    val reducedMotion = isReducedMotion()
+    val c = citation
+    if (citationSheet && c != null) {
+        CitationSheet(
+            citation = c,
+            sourceText = model.itemById[c.messageId]?.text,
+            locatable = model.rows.any { it is RowKind.Body && it.itemId == c.messageId },
+            onChange = vm::setDraftCitation,
+            onLocate = {
+                val idx = model.rows.indexOfFirst {
+                    it is RowKind.Body && it.itemId == c.messageId
+                }
+                citationSheet = false
+                if (idx >= 0) {
+                    scope.launch {
+                        if (reducedMotion) {
+                            listState.scrollToItem(idx)
+                        } else {
+                            listState.animateScrollToItem(idx)
+                        }
+                    }
+                }
+            },
+            onCopy = {
+                scope.launch {
+                    clipboard.setClipEntry(
+                        ClipEntry(ClipData.newPlainText("citation", c.quotedText)),
+                    )
+                }
+            },
+            onRemove = {
+                vm.setDraftCitation(null)
+                citationSheet = false
+            },
+            onDismiss = { citationSheet = false },
         )
     }
 }

@@ -86,6 +86,7 @@ import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.Brain
 import me.rerere.hugeicons.stroke.ChevronRight
 import me.rerere.hugeicons.stroke.Copy01
+import me.rerere.hugeicons.stroke.FloppyDisk
 import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
@@ -171,6 +172,10 @@ internal fun Transcript(
     onUserLongPress: (ChatItem) -> Unit,
     onResend: (ChatItem) -> Unit,
     onEditQueued: (Long) -> Unit,
+    /** Long-press 引用 on an agent message — pins it as a draft citation. */
+    onQuote: (ChatItem) -> Unit,
+    /** Plan card's 保存到工作区 — writes the plan as plan.md via the bridge. */
+    onSavePlan: (ChatItem) -> Unit,
     listState: LazyListState,
     modifier: Modifier = Modifier,
     bottomInset: Dp = 0.dp,
@@ -264,6 +269,8 @@ internal fun Transcript(
                                     BodyItem(
                                         m,
                                         streaming = streaming,
+                                        onQuote = { onQuote(m) },
+                                        onSavePlan = { onSavePlan(m) },
                                         meta = if (showMeta) {
                                             {
                                                 AssistantMetaBar(
@@ -287,7 +294,11 @@ internal fun Transcript(
                                     )
                                 }
                             } else {
-                                BodyItem(m)
+                                BodyItem(
+                                    m,
+                                    onQuote = { onQuote(m) },
+                                    onSavePlan = { onSavePlan(m) },
+                                )
                             }
                         }
                         is RowKind.Queue -> {
@@ -701,38 +712,85 @@ private fun FreshEntry(
 private fun BodyItem(
     m: ChatItem,
     streaming: Boolean = false,
+    onQuote: () -> Unit = {},
+    onSavePlan: () -> Unit = {},
     meta: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     when (m.kind) {
-        Kind.Agent -> AgentText(m, streaming, meta, modifier)
+        Kind.Agent -> AgentText(m, streaming, onQuote, meta, modifier)
         Kind.Error -> ErrorLine(m.text, modifier)
         Kind.System -> SystemLine(m.text, modifier)
-        Kind.Plan -> PlanCard(m, modifier)
+        Kind.Plan -> PlanCard(m, onSavePlan, modifier)
         else -> Unit // Thought/Tool never render inline.
     }
 }
 
+/**
+ * Agent markdown with the message-level citation gesture: a long-press on
+ * the message opens 复制/引用 — the renderer (BetterText MarkdownBlock)
+ * exposes no per-block selection callback, so quoting starts from the
+ * whole message and the citation sheet trims it.
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun AgentText(
     m: ChatItem,
     streaming: Boolean,
+    onQuote: () -> Unit = {},
     meta: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var actionMenu by remember { mutableStateOf(false) }
     Column(modifier.fillMaxWidth()) {
-        MarkdownBlock(
-            content = m.text,
-            // MarkdownBlock pads its content 4dp horizontally internally; pull
-            // the block back so agent text shares the transcript's left edge.
-            modifier = Modifier
-                .fillMaxWidth()
-                .offset(x = (-4).dp)
-                .padding(vertical = 4.dp),
-            style = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
-            streaming = streaming,
-        )
+        Box {
+            MarkdownBlock(
+                content = m.text,
+                // MarkdownBlock pads its content 4dp horizontally internally; pull
+                // the block back so agent text shares the transcript's left edge.
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .offset(x = (-4).dp)
+                    .padding(vertical = 4.dp)
+                    .combinedClickable(
+                        onClick = {},
+                        onLongClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            actionMenu = true
+                        },
+                    ),
+                style = MaterialTheme.typography.bodyLarge.copy(color = cs.onSurface),
+                streaming = streaming,
+            )
+            DevinMenu(
+                expanded = actionMenu,
+                onDismissRequest = { actionMenu = false },
+            ) {
+                DevinMenuItem(
+                    "引用",
+                    onClick = {
+                        actionMenu = false
+                        onQuote()
+                    },
+                )
+                DevinMenuItem(
+                    "复制",
+                    onClick = {
+                        actionMenu = false
+                        haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                        scope.launch {
+                            clipboard.setClipEntry(
+                                ClipEntry(ClipData.newPlainText("message", m.text)),
+                            )
+                        }
+                    },
+                )
+            }
+        }
         // The settled-turn bar fades in when the run ends; a row composed
         // already-settled renders it instantly (no replayed animation).
         AnimatedVisibility(
@@ -919,10 +977,38 @@ private fun SystemLine(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-/** Compact plan card: header + collapsible entry list. */
+/** The plan card's markdown export: a task checklist (done entries ticked). */
+internal fun planMarkdown(entries: List<com.devingo.app.acp.PlanEntry>): String =
+    buildString {
+        entries.forEach { e ->
+            val status = e.status.orEmpty().lowercase()
+            append(
+                if (status.contains("complete") || status.contains("done")) {
+                    "- [x] "
+                } else {
+                    "- [ ] "
+                },
+            )
+            appendLine(e.content)
+        }
+    }
+
+/**
+ * Compact plan card: header (count + copy + collapse chevron) and a
+ * collapsible entry list ending with 保存到工作区 — the plan lands as
+ * plan.md in the session workspace via the bridge's /fs/write (t3code's
+ * ProposedPlanCard copy/save pair).
+ */
 @Composable
-private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
+private fun PlanCard(
+    m: ChatItem,
+    onSavePlan: () -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
     val cs = MaterialTheme.colorScheme
+    val haptic = LocalHapticFeedback.current
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
     val entries = m.planEntries
     if (entries.isEmpty()) return
     val done = entries.count {
@@ -931,6 +1017,13 @@ private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
     }
     val allDone = done == entries.size
     var expanded by remember(m.id, allDone) { mutableStateOf(!allDone) }
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1_200)
+            copied = false
+        }
+    }
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -962,7 +1055,26 @@ private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.labelSmall,
                     color = cs.onSurfaceVariant,
                 )
-                Spacer(Modifier.width(6.dp))
+                MetaAction(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.Confirm)
+                        scope.launch {
+                            clipboard.setClipEntry(
+                                ClipEntry(
+                                    ClipData.newPlainText("plan", planMarkdown(entries)),
+                                ),
+                            )
+                        }
+                        copied = true
+                    },
+                ) {
+                    Icon(
+                        if (copied) Icons.Filled.Check else HugeIcons.Copy01,
+                        contentDescription = if (copied) "已复制" else "复制计划",
+                        modifier = Modifier.size(14.dp),
+                        tint = if (copied) DevinGoColors.diffAdd else cs.onSurfaceVariant,
+                    )
+                }
                 val rot by androidx.compose.animation.core.animateFloatAsState(
                     if (expanded) 90f else 0f,
                     label = "planChevron",
@@ -1023,6 +1135,34 @@ private fun PlanCard(m: ChatItem, modifier: Modifier = Modifier) {
                                 color = if (state == 2) cs.onSurfaceVariant
                                 else cs.onSurface,
                                 modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                    // Writes the checklist markdown as plan.md; the result
+                    // lands in the transcript as a System/Error line.
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onSavePlan)
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                HugeIcons.FloppyDisk, null,
+                                modifier = Modifier.size(14.dp),
+                                tint = DevinGoColors.link,
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "保存到工作区 plan.md",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = DevinGoColors.link,
                             )
                         }
                     }

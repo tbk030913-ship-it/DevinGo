@@ -137,6 +137,22 @@ data class PendingPermission(
 class ImageAttachment(val bytes: ByteArray, val mimeType: String)
 
 /**
+ * A quote lifted from an assistant message and pinned to the composer — the
+ * chat's counterpart of t3code's AssistantCitation. Carried with the draft;
+ * [SessionStore] merges it into the prompt text as a `>` block (plus the
+ * optional [comment]) at send/steer time, so a queued prompt keeps it.
+ */
+@Immutable
+data class CitationAttachment(
+    /** Transcript item id the quote came from — the sheet's 定位到原消息 target. */
+    val messageId: Long,
+    /** Raw markdown the user quoted (editable in the citation sheet). */
+    val quotedText: String,
+    /** User note appended after the quote on send. */
+    val comment: String = "",
+)
+
+/**
  * A prompt parked behind the running turn (B4 keeps its image bytes).
  * [id] is a store-local counter — it keys the queue sheet's lazy rows and
  * the edit-target slot; [createdAtMs] is the sheet's timestamp.

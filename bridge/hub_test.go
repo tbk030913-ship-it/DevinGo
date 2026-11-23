@@ -207,6 +207,7 @@ func setupHub(t *testing.T, bin string) string {
 func newTestServer(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/acp", acpHandler)
+	mux.HandleFunc("/fs/write", fsWriteHandler)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv

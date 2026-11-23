@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -133,6 +134,9 @@ func slimModels(raw []byte) ([]byte, error) {
 	if out == nil {
 		out = []map[string]string{}
 	}
+	// JSON objects decode to unordered maps, so discovery order varies —
+	// emit a stable ordering instead of leaking map-iteration randomness.
+	sort.Slice(out, func(i, j int) bool { return out[i]["id"] < out[j]["id"] })
 	return json.Marshal(out)
 }
 

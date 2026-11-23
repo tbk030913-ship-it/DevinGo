@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,8 +74,8 @@ type agentReq struct {
 	id      int64           // internal id the clients see
 	devinID json.RawMessage // id devin assigned
 	session *Session
-	target  *Client          // unscoped requests: the one routed client, the only answerer
-	seq     uint64           // journal seq of the request frame (0 when unscoped)
+	target  *Client         // unscoped requests: the one routed client, the only answerer
+	seq     uint64          // journal seq of the request frame (0 when unscoped)
 	frame   json.RawMessage // the request frame as forwarded (internal id)
 	timer   *time.Timer
 }
@@ -81,13 +83,14 @@ type agentReq struct {
 // clientReq tracks one in-flight client->agent (or gateway-internal)
 // request so the response can be routed and journaled.
 type clientReq struct {
-	proc   *devinProc
-	client *Client // nil once the client is gone; kept for journal state
-	origID json.RawMessage
-	method string
-	sid    string   // params.sessionId when session-scoped
-	session *Session // session marked in-flight at forward time (nil when unscoped)
-	waiter chan callResult // non-nil for the gateway's own calls
+	proc    *devinProc
+	client  *Client // nil once the client is gone; kept for journal state
+	origID  json.RawMessage
+	method  string
+	sid     string          // params.sessionId when session-scoped
+	cwd     string          // params.cwd on session/new|load — the workspace root
+	session *Session        // session marked in-flight at forward time (nil when unscoped)
+	waiter  chan callResult // non-nil for the gateway's own calls
 }
 
 type callResult struct {
@@ -100,19 +103,20 @@ type callResult struct {
 // sessionId'd traffic, and survives process death (devin persists sessions
 // agent-side — session/load re-hosts them).
 type Session struct {
-	id        string
-	running   int // in-flight session/prompt count (a turn per request)
-	inflight  int // in-flight session-scoped requests of any method
-	subs      map[*Client]bool
-	loaders   map[*Client]int  // in-flight session/load refcount per client; replay routes only to them
-	journal   []journalEntry   // ring: oldest at index 0
-	jBytes    int
-	nextSeq   uint64 // 1-based; entry seq == nextSeq-1 after append
-	pending   map[int64]*agentReq
-	lastInfo  json.RawMessage // last session/new|load result (configOptions etc.)
-	lastPrompter *Client      // preferred target for non-permission agent requests
-	idleSince  time.Time // when it last became idle (no subs/in-flight/pending)
-	idleTimer *time.Timer
+	id           string
+	running      int // in-flight session/prompt count (a turn per request)
+	inflight     int // in-flight session-scoped requests of any method
+	subs         map[*Client]bool
+	loaders      map[*Client]int // in-flight session/load refcount per client; replay routes only to them
+	cwd          string          // workspace root from session/new|load params — /fs/write resolves under it
+	journal      []journalEntry  // ring: oldest at index 0
+	jBytes       int
+	nextSeq      uint64 // 1-based; entry seq == nextSeq-1 after append
+	pending      map[int64]*agentReq
+	lastInfo     json.RawMessage // last session/new|load result (configOptions etc.)
+	lastPrompter *Client         // preferred target for non-permission agent requests
+	idleSince    time.Time       // when it last became idle (no subs/in-flight/pending)
+	idleTimer    *time.Timer
 }
 
 // devinProc is the resident `devin acp` process. ready closes once the
@@ -126,13 +130,13 @@ type devinProc struct {
 	writeMu sync.Mutex
 	// atomic: writeLine must read it without hub.mu (it already holds
 	// writeMu; taking hub.mu there would invert the lock order).
-	alive   atomic.Bool
-	ready   chan struct{}
-	draining bool            // hub.mu: post-ready queue drain in progress
-	initErr error            // hub.mu; valid once ready is closed
+	alive      atomic.Bool
+	ready      chan struct{}
+	draining   bool            // hub.mu: post-ready queue drain in progress
+	initErr    error           // hub.mu; valid once ready is closed
 	initResult json.RawMessage // cached `initialize` result for client handoffs
-	authed  bool            // gateway (or a client) authenticated successfully
-	queue   []queuedOp      // client frames waiting for ready/drain
+	authed     bool            // gateway (or a client) authenticated successfully
+	queue      []queuedOp      // client frames waiting for ready/drain
 }
 
 type queuedOp struct {
@@ -530,7 +534,7 @@ func (h *Hub) forwardToDevin(c *Client, p *devinProc, head rpcHead, data []byte)
 	h.mu.Lock()
 	internal := h.nextID + 1
 	h.nextID = internal
-	cr := &clientReq{proc: p, client: c, origID: head.ID, method: head.Method, sid: head.Params.SessionID}
+	cr := &clientReq{proc: p, client: c, origID: head.ID, method: head.Method, sid: head.Params.SessionID, cwd: head.Params.Cwd}
 	h.pendingClient[internal] = cr
 	var s *Session
 	if cr.sid != "" {
@@ -751,6 +755,9 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 	case "session/new":
 		if !failed {
 			h.subscribeLocked(cr.client, s)
+			if cr.cwd != "" {
+				s.cwd = cr.cwd
+			}
 			s.lastInfo = append(json.RawMessage(nil), head.Result...)
 		}
 	case "session/load":
@@ -766,6 +773,9 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 				// A client that detached (or died) mid-load forfeited the
 				// subscription — re-adding it would resurrect a detach.
 				h.subscribeLocked(cr.client, s)
+			}
+			if cr.cwd != "" {
+				s.cwd = cr.cwd
 			}
 			s.lastInfo = append(json.RawMessage(nil), head.Result...)
 		}
@@ -1032,7 +1042,7 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 		h.mu.Unlock()
 		go h.devingoSessions(c, head.ID, params.Cwd)
 	case "_devingo/attach":
-		h.attach(c, head.ID, params.SessionID, params.AfterSeq)
+		h.attach(c, head.ID, params.SessionID, params.AfterSeq, params.Cwd)
 	case "_devingo/detach":
 		h.detach(c, head.ID, params.SessionID)
 	default:
@@ -1101,7 +1111,7 @@ func (h *Hub) devingoSessions(c *Client, id json.RawMessage, cwd string) {
 // attach subscribes the client and replays journal events past afterSeq,
 // then re-sends still-pending approvals the replay didn't already cover.
 // needLoad tells the client to fall back to session/load.
-func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64) {
+func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64, cwd string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	s := h.sessions[sid]
@@ -1127,6 +1137,12 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64)
 		return
 	}
 	h.subscribeLocked(c, s)
+	// A session the hub re-created lazily (journal eviction, proc restart)
+	// lost its recorded workspace — the client's hint re-homes /fs/write.
+	// A recorded cwd stays authoritative; the hint only fills a gap.
+	if s.cwd == "" && cwd != "" {
+		s.cwd = cwd
+	}
 	res := map[string]any{
 		"sessionId":         sid,
 		"needLoad":          false,
@@ -1671,6 +1687,76 @@ func truncStr(s string, n int) string {
 	return s
 }
 
+// ---------------------------------------------------------------- fs -----
+
+// Sentinel errors for /fs/write — the handler maps them to status codes.
+var (
+	errSessionNotHosted = errors.New("session has no hosted workspace")
+	errPathOutside      = errors.New("path escapes the session workspace")
+)
+
+// writeSessionFile writes content at path inside the session's recorded
+// workspace. path must be relative and contained: a literal-clean check
+// kills "."-padded traversals, and the deepest existing ancestor is then
+// symlink-resolved so a mid-path symlink can't smuggle the target outside.
+// Both sides go through filepath.Rel — a prefix-shared sibling (/work2 vs
+// /work) never passes.
+func (h *Hub) writeSessionFile(sid, path, content string) error {
+	h.mu.Lock()
+	var cwd string
+	if s := h.sessions[sid]; s != nil {
+		cwd = s.cwd
+	}
+	h.mu.Unlock()
+	if cwd == "" {
+		return errSessionNotHosted
+	}
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return errSessionNotHosted
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return err // workspace no longer exists
+	}
+	clean := filepath.Clean(path)
+	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" ||
+		clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return errPathOutside
+	}
+	target := filepath.Join(root, clean)
+	if rel, err := filepath.Rel(root, target); err != nil ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errPathOutside
+	}
+	// Resolve the deepest existing ancestor: a symlink anywhere along the
+	// remaining path would already have made the literal Rel check lie, and
+	// MkdirAll itself must not create directories outside the workspace.
+	ancestor := filepath.Dir(target)
+	for {
+		if _, err := os.Lstat(ancestor); err == nil {
+			break
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor { // reached the volume root without an existing parent
+			return errPathOutside
+		}
+		ancestor = parent
+	}
+	resolved, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return errPathOutside
+	}
+	if rel, err := filepath.Rel(root, resolved); err != nil ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errPathOutside
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(target, []byte(content), 0o644)
+}
+
 // ---------------------------------------------------------------- rpc ----
 
 // rpcHead pulls the envelope fields the hub needs: id, method,
@@ -1680,6 +1766,7 @@ type rpcHead struct {
 	Method string          `json:"method"`
 	Params struct {
 		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"` // session/new|load workspace root
 	} `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  json.RawMessage `json:"error"`

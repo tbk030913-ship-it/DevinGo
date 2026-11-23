@@ -130,6 +130,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/acp", acpHandler)
 	mux.HandleFunc("/models", modelsHandler)
+	mux.HandleFunc("/fs/write", fsWriteHandler)
 	mux.HandleFunc("/pair", pairHandler)
 	mux.HandleFunc("/pair/qr.png", pairQRHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +138,7 @@ func main() {
 		fmt.Fprintln(w, "DevinGo bridge")
 		fmt.Fprintln(w, "  GET /healthz   - bridge + devin status")
 		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
+		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
 		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
 
@@ -502,6 +504,60 @@ func modelsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(out)
+}
+
+// fsWriteMaxBody bounds the JSON payload — plans are small text files.
+const fsWriteMaxBody = 1 << 20
+
+// fsWriteHandler writes a file inside a hosted session's workspace:
+// {sessionId, path, content}. path must be relative — the hub resolves it
+// against the cwd the session was created/loaded with and enforces
+// containment (absolute paths and ".." traversal are 403s).
+func fsWriteHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req struct {
+		SessionID string `json:"sessionId"`
+		Path      string `json:"path"`
+		Content   string `json:"content"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, fsWriteMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if req.SessionID == "" || req.Path == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId and path are required"}`))
+		return
+	}
+	if err := bridgeHub.writeSessionFile(req.SessionID, req.Path, req.Content); err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, errSessionNotHosted):
+			status = http.StatusNotFound
+		case errors.Is(err, errPathOutside):
+			status = http.StatusForbidden
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "path": req.Path})
 }
 
 // runDevinOutput runs `devin <args...>` and returns its stdout. Output goes

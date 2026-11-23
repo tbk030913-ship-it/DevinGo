@@ -68,6 +68,11 @@ class SessionStore(
      * Connection-level capability; the owner hides the menu entry.
      */
     private val onRevertUnsupported: (() -> Unit)? = null,
+    /**
+     * Bridge `/fs/write` bound to this session — (relativePath, content).
+     * Null when the bridge URL isn't known; 保存到工作区 reports a failure.
+     */
+    private val workspaceFileWriter: (suspend (String, String) -> Unit)? = null,
 ) {
 
     private companion object {
@@ -102,6 +107,8 @@ class SessionStore(
         const val MAX_DRAFT_CHARS = 64_000
         /** Per-tool detail cap; exec output keeps its tail within this. */
         const val TOOL_DETAIL_CAP = 4_000
+        /** Default workspace path the plan card's 保存到工作区 writes. */
+        const val PLAN_FILE_NAME = "plan.md"
         /** ACP `tool_call.kind` values — the vocabulary toolKind is normalized to. */
         val ACP_TOOL_KINDS = setOf(
             "read", "edit", "delete", "move", "search",
@@ -174,7 +181,7 @@ class SessionStore(
      */
     private val _editingQueuedId = MutableStateFlow<Long?>(null)
     val editingQueuedId = _editingQueuedId.asStateFlow()
-    private var queuedEditStash: Pair<String, List<ImageAttachment>>? = null
+    private var queuedEditStash: Triple<String, List<ImageAttachment>, CitationAttachment?>? = null
     private val nextQueuedId = java.util.concurrent.atomic.AtomicLong(0)
 
     /** Steps offered by the revert sheet; null until [loadRevertSteps] runs. */
@@ -190,6 +197,14 @@ class SessionStore(
     val draft = _draft.asStateFlow()
     private val _draftAttachments = MutableStateFlow<List<ImageAttachment>>(emptyList())
     val draftAttachments = _draftAttachments.asStateFlow()
+
+    /**
+     * The quote pinned to the composer — merged into the prompt text as a
+     * `>` block (plus its comment) on send/steer, so it survives queueing
+     * without the queued prompt needing a separate field.
+     */
+    private val _draftCitation = MutableStateFlow<CitationAttachment?>(null)
+    val draftCitation = _draftCitation.asStateFlow()
 
     /** Output arrived while another session was on screen (drawer badge). */
     val unread = MutableStateFlow(false)
@@ -828,6 +843,11 @@ class SessionStore(
         _draft.value = text.take(MAX_DRAFT_CHARS)
     }
 
+    /** Pin/replace/clear the composer's quote (null clears). */
+    fun setDraftCitation(citation: CitationAttachment?) {
+        _draftCitation.value = citation?.takeIf { it.quotedText.isNotBlank() }
+    }
+
     fun setDraftAttachments(attachments: List<ImageAttachment>) {
         // Single enforcement point — keeps what fits under the send cap so
         // the queue-edit path can't park an over-limit payload either.
@@ -852,34 +872,63 @@ class SessionStore(
      * and attachments so the user doesn't lose them.
      */
     fun send(text: String, attachments: List<ImageAttachment> = emptyList()): Boolean {
+        val citation = _draftCitation.value
         val trimmed = text.trimEnd()
-        if (trimmed.isBlank() && attachments.isEmpty()) return false
+        if (trimmed.isBlank() && attachments.isEmpty() && citation == null) return false
         val total = attachments.sumOf { it.bytes.size.toLong() }
         if (total > MAX_ATTACHMENT_BYTES) {
             append(Kind.Error, "图片合计超过 3MB，未发送")
             return false
         }
+        _draftCitation.value = null
+        val merged = mergedWithCitation(trimmed, citation)
         if (_ui.value.running || promptJob?.isActive == true) {
             // Queued prompts carry the attachments themselves — the bytes go
             // out when the queue drains, nothing is dropped.
             _queuedPrompts.update {
-                it + QueuedPrompt(nextQueuedId.getAndIncrement(), trimmed, attachments)
+                it + QueuedPrompt(nextQueuedId.getAndIncrement(), merged, attachments)
             }
             return true
         }
-        launchPrompt(trimmed, attachments)
+        launchPrompt(merged, attachments)
         return true
+    }
+
+    /**
+     * Render a draft citation as a leading markdown quote block — the same
+     * text-only form t3code's citation sends, readable to the agent without
+     * any new content-block type. Comment sits under the quote, then the
+     * user's own text.
+     */
+    private fun mergedWithCitation(text: String, citation: CitationAttachment?): String {
+        val quote = citation?.quotedText?.trim().orEmpty()
+        if (quote.isEmpty()) return text
+        return buildString(quote.length + text.length) {
+            quote.lines().forEach { line -> append("> ").appendLine(line.trimEnd()) }
+            if (citation != null && citation.comment.isNotBlank()) {
+                append(">\n> ").appendLine(citation.comment.trim())
+            }
+            if (text.isNotEmpty()) appendLine() // blank line ends the quote block
+            append(text)
+        }
     }
 
     /** Interrupt the running turn with a new instruction right now. */
     fun steer(text: String) {
         val trimmed = text.trimEnd()
-        if (trimmed.isBlank()) return
-        append(Kind.User, trimmed, steered = true)
+        if (trimmed.isBlank() && _draftCitation.value == null) return
+        val merged = mergedWithCitation(trimmed, _draftCitation.value).trimEnd()
+        _draftCitation.value = null
+        steerMerged(merged)
+    }
+
+    /** Send an already-merged steer — a queued item's text carries its own quote block. */
+    private fun steerMerged(merged: String) {
+        append(Kind.User, merged, steered = true)
         promptAcked = true // the turn is live; a steer failure isn't a lost echo
         steerJob = scope.launch {
             try {
-                reportStopReason(client.promptMidTurn(sessionId, trimmed).stopReason)
+                reportStopReason(client.promptMidTurn(sessionId, merged).stopReason)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -906,7 +955,7 @@ class SessionStore(
         // typed text" rather than resurrecting the stashed draft.
         if (_editingQueuedId.value == q.id) endQueuedEdit(keepDraft = true)
         if (q.attachments.isEmpty()) {
-            steer(q.text)
+            steerMerged(q.text)
             return
         }
         runCatching { client.cancel(sessionId) }
@@ -949,11 +998,14 @@ class SessionStore(
         // the restored draft then becomes this edit's stash.
         if (_editingQueuedId.value != null) saveQueuedEdit()
         if (_editingQueuedId.value == null) {
-            queuedEditStash = _draft.value to _draftAttachments.value
+            queuedEditStash = Triple(
+                _draft.value, _draftAttachments.value, _draftCitation.value,
+            )
         }
         _editingQueuedId.value = q.id
         _draft.value = q.text
         _draftAttachments.value = q.attachments
+        _draftCitation.value = null // the item's quote is already in its text
     }
 
     fun cancelQueuedEdit() = endQueuedEdit(keepDraft = false)
@@ -966,7 +1018,10 @@ class SessionStore(
      */
     fun saveQueuedEdit() {
         val id = _editingQueuedId.value ?: return
-        val text = _draft.value.trimEnd()
+        // A citation added during the edit merges into the item's text —
+        // its chip belongs to the edit session, not the stashed draft.
+        val text = mergedWithCitation(_draft.value.trimEnd(), _draftCitation.value)
+        _draftCitation.value = null
         val attachments = _draftAttachments.value
         var stillQueued = true
         _queuedPrompts.update { q ->
@@ -1000,6 +1055,7 @@ class SessionStore(
         if (!keepDraft && stash != null) {
             _draft.value = stash.first
             _draftAttachments.value = stash.second
+            _draftCitation.value = stash.third
         }
     }
 
@@ -1023,6 +1079,26 @@ class SessionStore(
         }
         if (!send(item.text, item.attachments)) return
         mutateMessages { list -> list.filterNot { it.id == item.id } }
+    }
+
+    /**
+     * Write the plan card's markdown into the session workspace as
+     * [PLAN_FILE_NAME] via the bridge's `/fs/write`. Feedback lands in the
+     * transcript as a System/Error line — the card itself stays stateless.
+     */
+    fun savePlanToWorkspace(markdown: String) {
+        val writer = workspaceFileWriter
+        scope.launch {
+            try {
+                if (writer == null) throw AcpException("bridge 不支持文件写入")
+                writer(PLAN_FILE_NAME, markdown.trimEnd() + "\n")
+                append(Kind.System, "计划已保存到 $PLAN_FILE_NAME")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                append(Kind.Error, "计划保存失败: ${e.display()}")
+            }
+        }
     }
 
     private fun drainQueue() {

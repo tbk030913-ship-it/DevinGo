@@ -113,6 +113,8 @@ class ChatViewModel(
     val turnTimes: StateFlow<Map<Long, TurnTiming>> = bound({ turnTimes }, emptyMap())
     val draft: StateFlow<String> = bound({ draft }, "")
     val draftAttachments: StateFlow<List<ImageAttachment>> = bound({ draftAttachments }, emptyList())
+    /** The quote pinned to the composer (U5.5 citation workflow). */
+    val draftCitation: StateFlow<CitationAttachment?> = bound({ draftCitation }, null)
 
     // ---- shared (connection-level) flows -------------------------------------
 
@@ -294,5 +296,15 @@ class ChatViewModel(
 
     fun setDraftAttachments(attachments: List<ImageAttachment>) {
         store?.setDraftAttachments(attachments)
+    }
+
+    /** Pin/replace/clear the composer's quote (null clears). */
+    fun setDraftCitation(citation: CitationAttachment?) {
+        store?.setDraftCitation(citation)
+    }
+
+    /** Write the plan card's markdown as plan.md in the session workspace. */
+    fun savePlanToWorkspace(markdown: String) {
+        store?.savePlanToWorkspace(markdown)
     }
 }

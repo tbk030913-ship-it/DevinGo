@@ -18,6 +18,7 @@ import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
+import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
 import com.devingo.app.tailnet.TailnetState
@@ -562,7 +563,7 @@ class ConnectionManager private constructor(private val app: Application) {
         store.attachMutex.withLock {
             store.beginReplay()
             try {
-                val r = client.attach(store.sessionId, store.lastSeq)
+                val r = client.attach(store.sessionId, store.lastSeq, store.cwd)
                 if (r.needLoad) {
                     loadInto(store, r.running)
                 } else {
@@ -605,6 +606,10 @@ class ConnectionManager private constructor(private val app: Application) {
             onSessionReady = { sid, c -> onSessionReady?.invoke(sid, c) },
             onRevertUnsupported = {
                 _conn.update { it.copy(revertSupported = false) }
+            },
+            // Read at call time so a re-dialed host/token is picked up.
+            workspaceFileWriter = { path, content ->
+                postBridgeFile(healthUrl(dialHost), lastToken, sessionId, path, content)
             },
         )
         // U7: show the last cached transcript right away — the attach replay
