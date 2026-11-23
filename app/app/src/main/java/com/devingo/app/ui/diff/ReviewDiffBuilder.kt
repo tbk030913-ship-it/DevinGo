@@ -193,7 +193,6 @@ internal fun buildNativeReviewData(files: List<ReviewDiffFile>): NativeReviewDat
             commentSectionTitle = "",
         )
 
-        val fileRowStart = rows.size
         val lineRows = ArrayList<ReviewLineInfo>()
         // deletion native-row index → addition native-row index (word pairing).
         val pairs = LinkedHashMap<Int, Int>()
@@ -844,9 +843,9 @@ internal fun parseGitPatch(patch: String): List<ReviewDiffFile> {
             i++
         }
         if (!seenPlusPlusPlus && prevPath == null && minusPath == null) {
-            // Only a binary/unsupported entry reaches here with a notice —
-            // surface it under the header's paths instead of dropping it.
-            if (notice == null || hdr == null) continue
+            // Binary and mode-only entries carry their paths solely in the
+            // diff --git header — surface them instead of dropping the file.
+            if (hdr == null) continue
             minusPath = stripPatchPrefix(hdr.groupValues[1])
             newPath = stripPatchPrefix(hdr.groupValues[2])
         }

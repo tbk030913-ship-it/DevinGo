@@ -183,7 +183,12 @@ fun ReviewSheet(
                 }
                 val filtered =
                     if (hideTests) files.filter { !isTestChangedFile(it.path) } else files
-                ReviewContent.Ready(buildNativeReviewData(filtered), gitTruncated)
+                ReviewContent.Ready(
+                    buildNativeReviewData(filtered),
+                    // The flag belongs to the Git fetch — don't carry it
+                    // over when the user switches back to a tool scope.
+                    truncated = reviewScope == ReviewScope.Git && gitTruncated,
+                )
             } catch (e: Exception) {
                 ReviewContent.Failed(e.message ?: "无法读取变更")
             }
