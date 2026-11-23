@@ -47,6 +47,8 @@ class TranscriptCache(context: Context, private val json: Json) {
         val toolCallId: String? = null,
         val toolKind: String? = null,
         val detail: String? = null,
+        val detailTruncated: Boolean = false,
+        val exitCode: Int? = null,
         val diffs: List<CachedDiff> = emptyList(),
         val planEntries: List<CachedPlanEntry> = emptyList(),
         val failed: Boolean = false,

@@ -38,6 +38,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -99,6 +100,13 @@ class SessionStore(
          * DataStore, so a paste-bomb must be bounded before it fans out.
          */
         const val MAX_DRAFT_CHARS = 64_000
+        /** Per-tool detail cap; exec output keeps its tail within this. */
+        const val TOOL_DETAIL_CAP = 4_000
+        /** ACP `tool_call.kind` values — the vocabulary toolKind is normalized to. */
+        val ACP_TOOL_KINDS = setOf(
+            "read", "edit", "delete", "move", "search",
+            "execute", "think", "fetch", "switch_mode", "other",
+        )
     }
 
     /**
@@ -636,12 +644,16 @@ class SessionStore(
             is AcpEvent.ToolCall -> {
                 promptAcked = true
                 if (isLive(seq)) remoteTurnActivity()
+                val detail = toolDetailOf(ev.call)
                 append(
                     Kind.Tool,
-                    ev.call.title ?: ev.call.kind ?: "tool call",
+                    toolTitleOf(ev.call) ?: ev.call.kind ?: "tool call",
                     status = ev.call.status ?: "pending",
                     toolCallId = ev.call.toolCallId,
-                    detail = toolDetailOf(ev.call),
+                    toolKind = toolKindOf(ev.call),
+                    detail = detail?.text,
+                    detailTruncated = detail?.headTruncated == true,
+                    exitCode = exitCodeOf(ev.call),
                 )
             }
             is AcpEvent.ToolCallUpdate -> {
@@ -1336,13 +1348,18 @@ class SessionStore(
         text: String,
         status: String? = null,
         toolCallId: String? = null,
+        toolKind: String? = null,
         detail: String? = null,
+        detailTruncated: Boolean = false,
+        exitCode: Int? = null,
         attachments: List<ImageAttachment> = emptyList(),
     ): ChatItem {
         flushStreaming()
         val item = ChatItem(
             nextItemId++, kind, text, status, toolCallId,
-            detail = detail, attachments = attachments,
+            toolKind = toolKind,
+            detail = detail, detailTruncated = detailTruncated,
+            exitCode = exitCode, attachments = attachments,
             attachmentCount = attachments.size,
         )
         streamingId = null
@@ -1363,25 +1380,31 @@ class SessionStore(
         mutateMessages { list ->
             val idx = list.indexOfLast { it.toolCallId == call.toolCallId }
             if (idx < 0) {
+                val detail = toolDetailOf(call)
                 capMessages(
                     list + ChatItem(
                         nextItemId++, Kind.Tool,
-                        call.title ?: call.kind ?: "tool call",
+                        toolTitleOf(call) ?: call.kind ?: "tool call",
                         call.status, call.toolCallId,
-                        toolKind = call.kind,
-                        detail = toolDetailOf(call),
+                        toolKind = toolKindOf(call),
+                        detail = detail?.text,
+                        detailTruncated = detail?.headTruncated == true,
+                        exitCode = exitCodeOf(call),
                         diffs = toolDiffsOf(call),
                     ),
                 )
             } else {
                 val old = list[idx]
                 val diffs = toolDiffsOf(call)
+                val detail = toolDetailOf(call)
                 list.toMutableList().apply {
                     set(idx, old.copy(
-                        text = call.title ?: old.text,
+                        text = toolTitleOf(call) ?: old.text,
                         status = call.status ?: old.status,
-                        toolKind = call.kind ?: old.toolKind,
-                        detail = toolDetailOf(call) ?: old.detail,
+                        toolKind = toolKindOf(call) ?: old.toolKind,
+                        detail = detail?.text ?: old.detail,
+                        detailTruncated = detail?.headTruncated ?: old.detailTruncated,
+                        exitCode = exitCodeOf(call) ?: old.exitCode,
                         diffs = if (diffs.isEmpty()) old.diffs else diffs,
                     ))
                 }
@@ -1404,8 +1427,16 @@ class SessionStore(
             }
             .orEmpty()
 
-    /** Extract a human-readable preview from a tool call's content/locations. */
-    private fun toolDetailOf(call: ToolCallInfo): String? {
+    /** Detail text + whether its head was dropped (command output tail-keep). */
+    private data class ToolDetail(val text: String, val headTruncated: Boolean)
+
+    /**
+     * Extract a human-readable preview from a tool call's content/locations.
+     * Exec output keeps the TAIL (the newest lines matter — the transcript
+     * flags the dropped head à la t3code's "Earlier output not shown");
+     * everything else keeps the head.
+     */
+    private fun toolDetailOf(call: ToolCallInfo): ToolDetail? {
         val parts = mutableListOf<String>()
         (call.locations as? JsonArray)?.forEach { loc ->
             (loc as? JsonObject)
@@ -1419,11 +1450,56 @@ class SessionStore(
                     ?.get("text").strOrNull()?.let { parts.add(it) }
                 "diff" -> o["path"].strOrNull()?.let { parts.add("diff: $it") }
                 "terminal" -> (o["output"] ?: o["terminal"]).strOrNull()
-                    ?.let { parts.add(it.take(1500)) }
+                    ?.let { parts.add(it) }
             }
         }
-        return parts.joinToString("\n").takeIf { it.isNotBlank() }?.take(4000)
+        val joined = parts.joinToString("\n").takeIf { it.isNotBlank() }
+            ?: return null
+        return if (toolKindOf(call) == "execute") {
+            ToolDetail(joined.takeLast(TOOL_DETAIL_CAP), joined.length > TOOL_DETAIL_CAP)
+        } else {
+            ToolDetail(joined.take(TOOL_DETAIL_CAP), headTruncated = false)
+        }
     }
+
+    /** `_meta.terminal_exit.exit_code` — present once an exec call finishes. */
+    private fun exitCodeOf(call: ToolCallInfo): Int? =
+        ((call._meta?.get("terminal_exit") as? JsonObject)
+            ?.get("exit_code") as? JsonPrimitive)
+            ?.intOrNull
+
+    /**
+     * ACP `kind` normalized onto our vocabulary. Devin's agent omits `kind`
+     * and instead sends `_meta.cognition.ai/inferenceToolName` ("exec",
+     * "kill_shell", …) — map the observed shell tools onto "execute" and
+     * pass through any name already in the ACP set.
+     */
+    private fun toolKindOf(call: ToolCallInfo): String? {
+        call.kind?.let { return it }
+        val name = (call._meta?.get("cognition.ai/inferenceToolName")
+            as? JsonPrimitive)?.strOrNull()
+        return when {
+            name == null -> null
+            // Devin's shell tools — all emit terminal output (ANSI, exit).
+            name == "exec" || name == "get_output" || name == "kill_shell" ->
+                "execute"
+            name in ACP_TOOL_KINDS -> name
+            else -> null
+        }
+    }
+
+    /**
+     * Row label: exec prefers the literal command from `rawInput.command`
+     * (Devin's title is a summary like "Ran seq"); else the title. Null when
+     * the call carries neither, so update paths keep the old text.
+     */
+    private fun toolTitleOf(call: ToolCallInfo): String? =
+        if (toolKindOf(call) == "execute") {
+            (call.rawInput as? JsonObject)?.get("command").strOrNull()
+                ?: call.title
+        } else {
+            call.title
+        }
 
     private fun kotlinx.serialization.json.JsonElement?.strOrNull(): String? =
         (this as? JsonPrimitive)
@@ -1479,7 +1555,15 @@ class SessionStore(
         status = m.status,
         toolCallId = m.toolCallId,
         toolKind = m.toolKind,
-        detail = m.detail?.take(TranscriptCache.DETAIL_CAP),
+        // Exec output keeps its tail in the cache too — the newest lines.
+        detail = if (m.toolKind == "execute") {
+            m.detail?.takeLast(TranscriptCache.DETAIL_CAP)
+        } else {
+            m.detail?.take(TranscriptCache.DETAIL_CAP)
+        },
+        detailTruncated = m.detailTruncated ||
+            (m.toolKind == "execute" && (m.detail?.length ?: 0) > TranscriptCache.DETAIL_CAP),
+        exitCode = m.exitCode,
         diffs = m.diffs.map {
             TranscriptCache.CachedDiff(
                 it.path,
@@ -1499,6 +1583,7 @@ class SessionStore(
         return ChatItem(
             id = c.id, kind = kind, text = c.text, status = c.status,
             toolCallId = c.toolCallId, toolKind = c.toolKind, detail = c.detail,
+            detailTruncated = c.detailTruncated, exitCode = c.exitCode,
             diffs = c.diffs.map { ToolDiff(it.path, it.oldText, it.newText) },
             planEntries = c.planEntries.map {
                 PlanEntry(it.content, it.status, it.priority)

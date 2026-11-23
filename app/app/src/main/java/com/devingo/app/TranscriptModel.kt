@@ -18,11 +18,69 @@ data class Turn(
     val body: List<ChatItem>,
     /** Thought/Tool items collapsed under the WorkRow — never render inline. */
     val work: List<ChatItem>,
+    /** [work] as displayed: consecutive same-kind read-only tools grouped. */
+    val workEntries: List<WorkEntry>,
     /** Failed tool calls — the WorkRow's "· N 个失败" badge. */
     val failed: Int,
 ) {
     /** Turn-level +A/−R over all work diffs; computed once on first render. */
     val diffStats: Pair<Int, Int> by lazy { workDiffStats(work) }
+}
+
+/**
+ * One row of the expanded work log. [Step] is a single thought/tool call;
+ * [ToolGroup] is ≥2 consecutive same-kind read-only tool calls collapsed
+ * into one summary row (t3code's ThreadWorkGroupToggle — U5.3). Built in
+ * [buildTurns] on the Default dispatcher, never in composition.
+ */
+@Immutable
+sealed interface WorkEntry {
+    @Immutable
+    data class Step(val item: ChatItem) : WorkEntry
+
+    @Immutable
+    data class ToolGroup(
+        /** Stable across rebuilds — anchored on the first member's id. */
+        val key: String,
+        val toolKind: String,
+        val items: List<ChatItem>,
+    ) : WorkEntry
+}
+
+/** ACP kinds that auto-group — read-only probes only (read/search/fetch). */
+private val GROUPABLE_TOOL_KINDS = setOf("read", "search", "fetch")
+
+/**
+ * Collapse runs of ≥2 same-[GROUPABLE_TOOL_KINDS] tool calls into a
+ * [WorkEntry.ToolGroup]; everything else stays a [WorkEntry.Step]. Pure O(n).
+ */
+internal fun groupWorkEntries(work: List<ChatItem>): List<WorkEntry> {
+    val out = ArrayList<WorkEntry>(work.size)
+    var i = 0
+    while (i < work.size) {
+        val item = work[i]
+        val kind = item.toolKind
+        if (item.kind == Kind.Tool && kind != null && kind in GROUPABLE_TOOL_KINDS) {
+            var end = i + 1
+            while (end < work.size && work[end].kind == Kind.Tool &&
+                work[end].toolKind == kind
+            ) {
+                end++
+            }
+            if (end - i >= 2) {
+                out += WorkEntry.ToolGroup(
+                    key = "g${item.id}",
+                    toolKind = kind,
+                    items = work.subList(i, end).toList(),
+                )
+                i = end
+                continue
+            }
+        }
+        out += WorkEntry.Step(item)
+        i++
+    }
+    return out
 }
 
 /** Pure O(n) turn split at every Kind.User boundary. */
@@ -39,6 +97,7 @@ internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
                 user,
                 body.toList(),
                 work,
+                groupWorkEntries(work),
                 failedCount(work),
             )
         }

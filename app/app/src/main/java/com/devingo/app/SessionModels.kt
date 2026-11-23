@@ -85,6 +85,10 @@ data class ChatItem(
     val toolKind: String? = null,
     /** Expandable detail for tool calls: output text, diff paths, etc. */
     val detail: String? = null,
+    /** The head of [detail] was dropped (command output keeps its tail). */
+    val detailTruncated: Boolean = false,
+    /** `_meta.terminal_exit.exit_code` on exec tool updates — non-zero fails. */
+    val exitCode: Int? = null,
     /** File diffs reported inside the tool call's content blocks. */
     val diffs: List<ToolDiff> = emptyList(),
     val planEntries: List<PlanEntry> = emptyList(),

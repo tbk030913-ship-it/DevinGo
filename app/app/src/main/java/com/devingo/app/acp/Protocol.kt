@@ -296,6 +296,8 @@ data class ToolCallInfo(
     val rawInput: JsonElement? = null,
     val content: JsonElement? = null,
     val locations: JsonElement? = null,
+    /** Devin extras — `terminal_exit.exit_code` on exec updates. */
+    val _meta: JsonObject? = null,
 )
 
 /** A slash command advertised via `available_commands_update`. */

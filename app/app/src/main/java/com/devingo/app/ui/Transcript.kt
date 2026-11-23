@@ -68,6 +68,7 @@ import com.devingo.app.TranscriptModel
 import com.devingo.app.Turn
 import com.devingo.app.TurnTiming
 import com.devingo.app.UiState
+import com.devingo.app.WorkEntry
 import com.devingo.app.ui.theme.DevinGoColors
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -283,6 +284,9 @@ internal fun Transcript(
                                 timing = timing,
                                 expanded = expandedWork[turn.key] == true,
                                 onToggle = { onToggleWork(turn.key) },
+                                // No diff sheet yet (N6.1) — the pill opens
+                                // the turn's WorkRow where DiffCards render.
+                                onShowDiff = { onExpandWork(turn.key) },
                             )
                         }
                     }
@@ -357,6 +361,7 @@ private fun WorkRow(
     timing: TurnTiming?,
     expanded: Boolean,
     onToggle: () -> Unit,
+    onShowDiff: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -364,6 +369,28 @@ private fun WorkRow(
     // is only refreshed on structural changes.
     val items = remember(turn.work, tail) {
         turn.work.map { if (it.id == tail?.id) tail else it }
+    }
+    // Same overlay for the grouped render list.
+    val entries = remember(turn.workEntries, tail) {
+        if (tail == null) {
+            turn.workEntries
+        } else {
+            turn.workEntries.map { e ->
+                when (e) {
+                    is WorkEntry.Step ->
+                        if (e.item.id == tail.id) WorkEntry.Step(tail) else e
+                    is WorkEntry.ToolGroup ->
+                        if (e.items.none { it.id == tail.id }) {
+                            e
+                        } else {
+                            WorkEntry.ToolGroup(
+                                e.key, e.toolKind,
+                                e.items.map { if (it.id == tail.id) tail else it },
+                            )
+                        }
+                }
+            }
+        }
     }
     val failed = turn.failed
     val (diffAdd, diffDel) = turn.diffStats
@@ -413,7 +440,6 @@ private fun WorkRow(
     Column(
         modifier
             .fillMaxWidth()
-            .then(if (awaitingFirst) Modifier else Modifier.clickable(onClick = onToggle))
             .heightIn(min = 48.dp)
             .padding(vertical = 4.dp),
     ) {
@@ -441,8 +467,13 @@ private fun WorkRow(
             return@Column
         }
         if (thought != null && (live || !expanded)) {
+            // t3code ThreadWorkGroupToggle: the thought line toggles too.
             Row(
-                Modifier.padding(bottom = 2.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onToggle)
+                    .padding(bottom = 2.dp),
                 verticalAlignment = Alignment.Top,
             ) {
                 Icon(
@@ -462,65 +493,63 @@ private fun WorkRow(
                 )
             }
         }
+        // t3code run-fold: the row splits into a toggle area (left) and the
+        // TurnDiffStat pill (right) — separate hit targets.
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                HugeIcons.ChevronRight, null,
-                modifier = Modifier
-                    .size(14.dp)
-                    .rotate(chevronRot),
-                tint = cs.onSurfaceVariant,
-            )
-            Spacer(Modifier.width(6.dp))
-            if (live) {
-                Text(
-                    // No turn start (e.g. a remote turn we never saw the
-                    // prompt for) → no elapsed; "0:00" would just freeze.
-                    if (startedAt > 0L) {
-                        "工作中 · ${elapsed / 60}:" +
-                            (elapsed % 60).toString().padStart(2, '0')
-                    } else {
-                        "工作中"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = cs.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false).steppedShimmer(),
+            Row(
+                Modifier
+                    .weight(1f)
+                    .heightIn(min = 40.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onToggle),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    HugeIcons.ChevronRight, null,
+                    modifier = Modifier
+                        .size(14.dp)
+                        .rotate(chevronRot),
+                    tint = cs.onSurfaceVariant,
                 )
-            } else {
-                Text(
-                    timing?.durationSec?.let { workDurationLabel(it) }
-                        ?: "查看过程 · ${items.size} 步",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = cs.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
+                Spacer(Modifier.width(6.dp))
+                if (live) {
+                    Text(
+                        // No turn start (e.g. a remote turn we never saw the
+                        // prompt for) → no elapsed; "0:00" would just freeze.
+                        if (startedAt > 0L) {
+                            "工作中 · ${elapsed / 60}:" +
+                                (elapsed % 60).toString().padStart(2, '0')
+                        } else {
+                            "工作中"
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = cs.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false).steppedShimmer(),
+                    )
+                } else {
+                    Text(
+                        timing?.durationSec?.let { workDurationLabel(it) }
+                            ?: "查看过程 · ${items.size} 步",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = cs.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                }
+                if (failed > 0) {
+                    Text(
+                        " · $failed 个失败",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = cs.error,
+                        maxLines = 1,
+                    )
+                }
             }
-            if (failed > 0) {
-                Text(
-                    " · $failed 个失败",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = cs.error,
-                    maxLines = 1,
-                )
-            }
-            if (diffAdd > 0) {
-                Text(
-                    " +$diffAdd",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = DevinGoColors.diffAdd,
-                    maxLines = 1,
-                )
-            }
-            if (diffDel > 0) {
-                Text(
-                    " −$diffDel",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = DevinGoColors.diffRemove,
-                    maxLines = 1,
-                )
+            if (diffAdd > 0 || diffDel > 0) {
+                TurnDiffStatPill(diffAdd = diffAdd, diffDel = diffDel, onClick = onShowDiff)
             }
         }
         if (live && currentStep != null) {
@@ -550,8 +579,56 @@ private fun WorkRow(
             enter = expandVertically() + fadeIn(),
             exit = shrinkVertically() + fadeOut(),
         ) {
-            WorkLogColumn(items = items, live = live)
+            WorkLogColumn(entries = entries, live = live)
         }
+    }
+}
+
+/**
+ * t3code TurnDiffStat (run-fold trailing): "+A −R ›" — its own hit target
+ * (min 40dp), separate from the row's expand toggle.
+ */
+@Composable
+private fun TurnDiffStatPill(
+    diffAdd: Int,
+    diffDel: Int,
+    onClick: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        Modifier
+            .heightIn(min = 40.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (diffAdd > 0) {
+            Text(
+                "+$diffAdd",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFeatureSettings = "tnum",
+                ),
+                color = DevinGoColors.diffAdd,
+                maxLines = 1,
+            )
+        }
+        if (diffDel > 0) {
+            Text(
+                " −$diffDel",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFeatureSettings = "tnum",
+                ),
+                color = DevinGoColors.diffRemove,
+                maxLines = 1,
+            )
+        }
+        Icon(
+            HugeIcons.ChevronRight,
+            contentDescription = "查看本轮改动",
+            modifier = Modifier.size(12.dp),
+            tint = cs.onSurfaceVariant,
+        )
     }
 }
 
