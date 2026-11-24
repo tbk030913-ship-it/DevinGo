@@ -80,7 +80,7 @@ import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 fun PendingUserInputCard(
     pending: PendingElicitation?,
     running: Boolean,
-    onResolve: (ElicitationReply?) -> Unit,
+    onResolve: (PendingElicitation, ElicitationReply?) -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -100,7 +100,11 @@ fun PendingUserInputCard(
         ) { it } + fadeIn(),
         exit = slideOutVertically { it } + fadeOut(),
     ) {
-        lastPending?.let { PendingUserInputCardContent(it, running, onResolve, onStop) }
+        // Resolve with the rendered card's identity — the exit-animation
+        // ghost must not answer a newly pushed head.
+        lastPending?.let { p ->
+            PendingUserInputCardContent(p, running, { onResolve(p, it) }, onStop)
+        }
     }
 }
 

@@ -192,6 +192,12 @@ data class ContentBlock(
     /** resource_link blocks. */
     val uri: String? = null,
     val name: String? = null,
+    /**
+     * Mention metadata on resource_link blocks — devin reads
+     * `cognition.ai/resource-link-type` / `mention-path` / `mention-text`
+     * here to resolve `@kind:ref` tokens (A7.3).
+     */
+    val _meta: JsonObject? = null,
 )
 
 @Serializable
@@ -315,6 +321,13 @@ data class ToolCallInfo(
     val _meta: JsonObject? = null,
 )
 
+/** One entry of `_cognition.ai/{rules,skills,plans}/list` (loose decode, A7.3). */
+data class MentionResource(
+    val id: String,
+    val name: String,
+    val description: String? = null,
+)
+
 /** A slash command advertised via `available_commands_update`. */
 data class AvailableCommand(
     val name: String,
@@ -354,6 +367,13 @@ object AcpMethods {
     const val ELICITATION_CREATE = "elicitation/create"
     const val SESSION_ELICITATION = "session/elicitation"
     const val ELICITATION_COMPLETE = "elicitation/complete"
+    const val SESSION_ELICITATION_COMPLETE = "session/elicitation/complete"
+
+    // Devin @-mention resource lists (A7.3): rules/skills/plans feed the
+    // composer's non-file mention categories.
+    const val RULES_LIST = "_cognition.ai/rules/list"
+    const val SKILLS_LIST = "_cognition.ai/skills/list"
+    const val PLANS_LIST = "_cognition.ai/plans/list"
 
     // Devin revert extension (negotiated via clientCapabilities._meta).
     const val REVERT_LIST_STEPS = "_cognition.ai/revert/listSteps"

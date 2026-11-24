@@ -346,6 +346,7 @@ object ElicitationParser {
                 // Unreachable — boolean questions never get a text field.
                 ElicitationFieldType.Boolean -> null
                 ElicitationFieldType.Number -> custom.toDoubleOrNull()
+                    ?.takeIf { it.isFinite() } // NaN/Infinity aren't valid JSON
                     ?.let { ResolvedAnswer(q.companionId ?: q.id, JsonPrimitive(it), custom) }
                 ElicitationFieldType.Integer -> custom.toLongOrNull()
                     ?.let { ResolvedAnswer(q.companionId ?: q.id, JsonPrimitive(it), custom) }

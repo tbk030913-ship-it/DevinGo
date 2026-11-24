@@ -850,6 +850,30 @@ class ConnectionManager private constructor(private val app: Application) {
                 }
             }
             launch {
+                // A needs-user card on an off-screen session alerts once per
+                // pending→present transition — unparseable forms never push,
+                // attach re-deliveries keep the state true and don't re-fire.
+                combine(
+                    store.pendingPermission,
+                    store.pendingElicitation,
+                ) { p, e -> (p != null) to (e != null) }
+                    .distinctUntilChanged()
+                    .collect { (hasP, hasE) ->
+                        if (!hasP && !hasE) return@collect
+                        if (store === _currentStore.value) return@collect
+                        val needsUser =
+                            if (hasP) "需要你的授权" else "有问题需要你回答"
+                        val title =
+                            store.ui.value.sessionTitle?.takeIf { it.isNotBlank() }
+                                ?: store.cwd
+                                    .substringAfterLast('/')
+                                    .substringAfterLast('\\')
+                        _alerts.tryEmit(
+                            SessionAlert(store.sessionId, "「$title」$needsUser"),
+                        )
+                    }
+            }
+            launch {
                 combine(
                     store.pendingPermissionCount,
                     store.pendingElicitationCount,
@@ -1315,20 +1339,6 @@ class ConnectionManager private constructor(private val app: Application) {
         if (store == null) {
             req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
             return
-        }
-        // A needs-user request for a session that isn't on screen gets a
-        // heads-up — the same heads-up for permissions and elicitations.
-        val needsUser = when (req.method) {
-            AcpMethods.SESSION_REQUEST_PERMISSION -> "需要你的授权"
-            AcpMethods.ELICITATION_CREATE, AcpMethods.SESSION_ELICITATION ->
-                "有问题需要你回答"
-            else -> null
-        }
-        if (needsUser != null && store !== _currentStore.value) {
-            val title = store.ui.value.sessionTitle?.takeIf { it.isNotBlank() }
-                ?: stores[sid]?.cwd?.substringAfterLast('/')?.substringAfterLast('\\')
-                ?: sid.orEmpty()
-            _alerts.tryEmit(SessionAlert(store.sessionId, "「$title」$needsUser"))
         }
         store.handleAgentRequest(req)
     }

@@ -38,10 +38,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
@@ -760,7 +762,10 @@ class SessionStore(
                     append(Kind.System, "[${ev.channel}] ${ev.message}")
                 }
             }
-            is AcpEvent.ElicitationComplete -> dismissElicitation()
+            is AcpEvent.ElicitationComplete -> {
+                // A journaled complete must not resolve a live pending card.
+                if (isLive(seq)) dismissElicitation(ev.elicitationId)
+            }
             is AcpEvent.Failure -> append(Kind.Error, ev.message)
             else -> Unit // forward-compat with updates added alongside acp/ changes
         }
@@ -1415,8 +1420,9 @@ class SessionStore(
             AcpMethods.SESSION_ELICITATION -> handleElicitation(req)
             // The agent closed a pending elicitation itself — drop the card,
             // don't answer the still-open create request.
-            AcpMethods.ELICITATION_COMPLETE -> {
-                dismissElicitation()
+            AcpMethods.ELICITATION_COMPLETE,
+            AcpMethods.SESSION_ELICITATION_COMPLETE -> {
+                dismissElicitation(elicitationIdFrom(req.params))
                 req.respond(buildJsonObject {})
             }
             else -> req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
@@ -1441,8 +1447,14 @@ class SessionStore(
         val choice = CompletableDeferred<String?>()
         val pending = PendingPermission(params.toolCall, params.options, choice, requestId)
         val entry = PermEntry(req, pending)
-        synchronized(requestLock) { openRequests[requestId] = entry }
-        pushPermission(pending)
+        // One lock covers map + queue — a teardown between them would
+        // orphan the card.
+        synchronized(requestLock) {
+            openRequests[requestId] = entry
+            permissionQueue.addLast(pending)
+            _pendingPermission.value = permissionQueue.firstOrNull()
+            _pendingPermissionCount.value = permissionQueue.size
+        }
         notifier.notifyPermissionPending(
             params.toolCall.title ?: params.toolCall.kind ?: "工具调用",
             sessionId,
@@ -1515,11 +1527,18 @@ class SessionStore(
             requestId = requestId,
         )
         val entry = ElicEntry(req, pending)
-        synchronized(requestLock) { openElicitations[requestId] = entry }
-        pushElicitation(pending)
+        // One lock covers map + queue — a teardown between them would
+        // orphan the card.
+        synchronized(requestLock) {
+            openElicitations[requestId] = entry
+            elicitationQueue.addLast(pending)
+            _pendingElicitation.value = elicitationQueue.firstOrNull()
+            _pendingElicitationCount.value = elicitationQueue.size
+        }
         notifier.notifyPermissionPending(
             "Devin 有问题需要你回答",
             sessionId,
+            id = Notifier.ID_ELICITATION,
             headline = "DevinGo 需要回答",
         )
         val reply = choice.await()
@@ -1555,11 +1574,14 @@ class SessionStore(
         }
     }
 
-    private fun pushElicitation(p: PendingElicitation) = synchronized(requestLock) {
-        elicitationQueue.addLast(p)
-        _pendingElicitation.value = elicitationQueue.firstOrNull()
-        _pendingElicitationCount.value = elicitationQueue.size
-    }
+    /** `elicitationId` / `requestId` / `id` — devin's complete params. */
+    private fun elicitationIdFrom(params: JsonElement?): Long? =
+        (params as? JsonObject)?.let { o ->
+            listOf("elicitationId", "requestId", "id").firstNotNullOfOrNull { k ->
+                (o[k] as? JsonPrimitive)
+                    ?.let { it.longOrNull ?: it.content.toLongOrNull() }
+            }
+        }
 
     private fun popElicitation(p: PendingElicitation) = synchronized(requestLock) {
         elicitationQueue.remove(p)
@@ -1580,30 +1602,33 @@ class SessionStore(
         _pendingElicitationCount.value = 0
     }
 
-    /** The card's submit/dismiss; null = declined without answers. */
-    fun resolveElicitation(reply: ElicitationReply?) {
-        _pendingElicitation.value?.choice?.complete(reply)
+    /**
+     * The card's submit/dismiss; null = declined without answers. The
+     * rendered card's identity is passed in — the exit-animation ghost
+     * must not resolve a newly pushed head.
+     */
+    fun resolveElicitation(p: PendingElicitation, reply: ElicitationReply?) {
+        if (_pendingElicitation.value === p) p.choice.complete(reply)
     }
 
     /**
      * `elicitation/complete` — the agent withdrew the elicitation (answered
      * elsewhere or dropped). Treated like a peer resolution: the create
-     * request gets no response from us.
+     * request gets no response from us. An [elicitationId] that doesn't
+     * match an open request is stale — dismiss nothing.
      */
-    fun dismissElicitation() {
+    fun dismissElicitation(elicitationId: Long? = null) {
         synchronized(requestLock) {
-            val p = _pendingElicitation.value ?: return
-            openElicitations[p.requestId]?.let {
+            val target = if (elicitationId != null) {
+                openElicitations[elicitationId]?.pending ?: return
+            } else {
+                _pendingElicitation.value ?: return
+            }
+            openElicitations[target.requestId]?.let {
                 it.resolvedByPeer = true
                 it.pending.choice.complete(null)
             }
         }
-    }
-
-    private fun pushPermission(p: PendingPermission) = synchronized(requestLock) {
-        permissionQueue.addLast(p)
-        _pendingPermission.value = permissionQueue.firstOrNull()
-        _pendingPermissionCount.value = permissionQueue.size
     }
 
     private fun popPermission(p: PendingPermission) = synchronized(requestLock) {

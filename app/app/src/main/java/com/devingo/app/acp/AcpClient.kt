@@ -31,6 +31,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -109,7 +110,7 @@ interface AcpEvent {
      * `elicitation/complete` as a notification — the agent closed the
      * pending question card on its own; drop it without answering.
      */
-    data object ElicitationComplete : AcpEvent
+    data class ElicitationComplete(val elicitationId: Long? = null) : AcpEvent
 }
 
 /**
@@ -544,6 +545,49 @@ class AcpClient(
         json.encodeToJsonElement(RenameSessionParams(sessionId, title)),
     )
 
+    // ---- @-mention resource lists (A7.3) -------------------------------------
+    // Devin advertises rule/skill/plan mention types; these feed the picker's
+    // non-file categories. The response shape isn't documented, so decoding
+    // is deliberately loose (see mentionList).
+
+    /** `_cognition.ai/rules/list` — rules the workspace exposes to @. */
+    suspend fun listRules(sessionId: String): List<MentionResource> =
+        mentionList(AcpMethods.RULES_LIST, sessionId)
+
+    /** `_cognition.ai/skills/list` — skills mentionable from the composer. */
+    suspend fun listSkills(sessionId: String): List<MentionResource> =
+        mentionList(AcpMethods.SKILLS_LIST, sessionId)
+
+    /** `_cognition.ai/plans/list` — plans mentionable from the composer. */
+    suspend fun listPlans(sessionId: String): List<MentionResource> =
+        mentionList(AcpMethods.PLANS_LIST, sessionId)
+
+    /**
+     * Tolerant list decode: the result may be a bare array or an object
+     * wrapping one under rules/skills/plans/items/…; each entry is an
+     * object whose display name sits under name|title|id|key|…
+     */
+    private suspend fun mentionList(method: String, sessionId: String): List<MentionResource> {
+        val result = request(
+            method,
+            buildJsonObject { put("sessionId", sessionId) },
+        ).let { (it["result"] as? JsonObject) ?: it }
+        val arr = listOf("rules", "skills", "plans", "items", "entries", "results")
+            .firstNotNullOfOrNull { result[it] as? JsonArray }
+            ?: result.values.firstOrNull { it is JsonArray } as? JsonArray
+            ?: return emptyList()
+        return arr.mapNotNull { el ->
+            val o = el as? JsonObject ?: return@mapNotNull null
+            val name = o.strField("name", "title", "id", "key", "displayName", "label")
+                ?: return@mapNotNull null
+            MentionResource(
+                id = o.strField("id", "key", "name", "title") ?: name,
+                name = name,
+                description = o.strField("description", "summary", "subtitle"),
+            )
+        }
+    }
+
     private fun notify(method: String, params: JsonElement) {
         send(
             buildJsonObject {
@@ -703,8 +747,14 @@ class AcpClient(
                         ?: "devin 进程已退出",
                 ),
             )
-            AcpMethods.ELICITATION_COMPLETE ->
-                emit(sessionId, seq, AcpEvent.ElicitationComplete)
+            AcpMethods.ELICITATION_COMPLETE, AcpMethods.SESSION_ELICITATION_COMPLETE -> {
+                val eid = listOf("elicitationId", "requestId", "id")
+                    .firstNotNullOfOrNull { k ->
+                        (p[k] as? JsonPrimitive)
+                            ?.let { it.longOrNull ?: it.textOrNull?.toLongOrNull() }
+                    }
+                emit(sessionId, seq, AcpEvent.ElicitationComplete(eid))
+            }
             "_devingo/permission_resolved" -> {
                 val requestId = (p["requestId"] as? JsonPrimitive)?.longOrNull ?: return
                 emit(
@@ -1083,6 +1133,56 @@ suspend fun postBridgeFsList(
         val arr = healthJson.parseToJsonElement(body).jsonObject["files"]
         (arr as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.content }
             ?: emptyList()
+    }
+}
+
+/** One /fs/search hit — a file or directory inside the session workspace. */
+data class FsSearchItem(val relPath: String, val isDir: Boolean)
+
+/**
+ * The bridge's `/fs/search` (GET): fuzzy-matches files AND directories
+ * under the session's recorded workspace — the @-picker's typed-query
+ * feed, backed by a real filesystem walk rather than `git ls-files`
+ * (untracked dirs included; A7.3). Throws [AcpException] on non-2xx.
+ */
+suspend fun getBridgeFsSearch(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    query: String,
+    limit: Int = 50,
+): List<FsSearchItem> = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+    val url = "$baseHttpUrl/fs/search".toHttpUrl().newBuilder()
+        .addQueryParameter("sessionId", sessionId)
+        .addQueryParameter("q", query)
+        .addQueryParameter("limit", limit.toString())
+        .build()
+    val req = Request.Builder()
+        .url(url)
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "fs/search HTTP ${resp.code}")
+        }
+        val body = resp.body?.string().orEmpty()
+        val arr = healthJson.parseToJsonElement(body).jsonObject["items"]
+        (arr as? JsonArray)?.mapNotNull { el ->
+            val o = el as? JsonObject ?: return@mapNotNull null
+            val rel = o.strField("relPath", "path") ?: return@mapNotNull null
+            FsSearchItem(rel, o.strField("kind", "type") == "directory")
+        } ?: emptyList()
     }
 }
 

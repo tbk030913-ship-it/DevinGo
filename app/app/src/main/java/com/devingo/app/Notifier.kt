@@ -78,12 +78,13 @@ class Notifier(context: Context) {
     fun notifyPermissionPending(
         title: String,
         sessionId: String? = null,
+        id: Int = ID_PERMISSION,
         headline: String = "DevinGo 需要授权",
     ) {
         if (!prefs.notifyPermission || !shouldPost(sessionId)) return
         post(
             channelId = CHANNEL_PERMISSION,
-            id = ID_PERMISSION,
+            id = id,
             title = headline,
             text = title.ifBlank { "Devin 请求执行操作" },
             priority = NotificationCompat.PRIORITY_HIGH,
@@ -156,5 +157,6 @@ class Notifier(context: Context) {
         const val REQ_POST_NOTIFICATIONS = 4201
         private const val ID_PERMISSION = 1001
         private const val ID_TURN_DONE = 1002
+        const val ID_ELICITATION = 1003
     }
 }

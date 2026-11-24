@@ -285,8 +285,8 @@ class ChatViewModel(
     }
 
     /** Question card submit/dismiss; null = declined without answers. */
-    fun resolveElicitation(reply: ElicitationReply?) {
-        store?.resolveElicitation(reply)
+    fun resolveElicitation(p: PendingElicitation, reply: ElicitationReply?) {
+        store?.resolveElicitation(p, reply)
     }
 
     fun loadRevertSteps() {
