@@ -162,6 +162,8 @@ internal fun Composer(
     onSearchWorkspace: suspend (String) -> List<FsSearchItem>,
     /** `_cognition.ai/{rules,skills,plans}/list` by kind (A7.3). */
     onMentionResources: suspend (String) -> List<MentionResource>,
+    /** A picked `@{kind}:{ref}` — registered verbatim for send-scan (A7.3). */
+    onMentionInsert: (String) -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -328,8 +330,11 @@ internal fun Composer(
             }
         }
         // Keep the last trigger through the exit animation so the card
-        // doesn't render empty for its final ~100ms.
-        var lastTrigger by remember { mutableStateOf<ComposerTrigger?>(null) }
+        // doesn't render empty for its final ~100ms — session-keyed so a
+        // switch can't replay another session's trigger mid-exit.
+        var lastTrigger by remember(ui.sessionId) {
+            mutableStateOf<ComposerTrigger?>(null)
+        }
         LaunchedEffect(trigger) { if (trigger != null) lastTrigger = trigger }
         AnimatedVisibility(
             visible = trigger != null && !permissionPending,
@@ -355,6 +360,13 @@ internal fun Composer(
                                 end,
                                 insert,
                             )
+                            // A picked ref can hold spaces — register it
+                            // verbatim; the send scan can't re-derive it.
+                            if (insert.startsWith("@")) {
+                                insert.trimEnd().substringAfter(':', "")
+                                    .takeIf { it.isNotEmpty() }
+                                    ?.let(onMentionInsert)
+                            }
                         }
                     }
                 }
@@ -479,7 +491,19 @@ internal fun Composer(
                             ToolbarIconButton(
                                 icon = HugeIcons.AtSign,
                                 description = "@ 引用文件",
-                                onClick = { insertAtCaret("@") },
+                                onClick = {
+                                    val e = editor.text
+                                    if (e != null) {
+                                        val pos = editor.selectionEnd
+                                            .coerceIn(0, e.length)
+                                        // `@` only triggers at a word
+                                        // boundary — pad mid-word carets.
+                                        val pad = pos > 0 &&
+                                            input.getOrNull(pos - 1)
+                                                ?.isWhitespace() == false
+                                        e.insert(pos, if (pad) " @" else "@")
+                                    }
+                                },
                             )
                             ToolbarIconButton(
                                 icon = HugeIcons.CommandLine,

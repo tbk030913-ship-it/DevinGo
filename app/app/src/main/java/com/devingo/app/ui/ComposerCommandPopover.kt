@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -594,10 +595,11 @@ private fun PickerList(
                     )
                 }
             }
-            items(
+            itemsIndexed(
                 section.rows,
-                key = { "${section.header}:${it.insert}" },
-            ) { row ->
+                // Agent-supplied names can repeat — index keeps keys unique.
+                key = { i, it -> "${section.header}:${it.insert}#$i" },
+            ) { _, row ->
                 PickerRow(row, query, onPick)
             }
         }

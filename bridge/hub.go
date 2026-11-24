@@ -1893,6 +1893,9 @@ func (h *Hub) sessionFsSearch(sid, query string, limit int) ([]fsSearchItem, boo
 	var items []fsSearchItem
 	visited := 0
 	truncated := false
+	// A stalled filesystem mustn't park the request goroutine — same
+	// discipline as gitDiffTimeout, checked sparsely.
+	deadline := time.Now().Add(5 * time.Second)
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if path == root {
@@ -1910,7 +1913,8 @@ func (h *Hub) sessionFsSearch(sid, query string, limit int) ([]fsSearchItem, boo
 			return filepath.SkipDir
 		}
 		visited++
-		if visited > fsSearchMaxEntries {
+		if visited > fsSearchMaxEntries ||
+			(visited&0x3FF == 0 && time.Now().After(deadline)) {
 			truncated = true
 			return fs.SkipAll
 		}
