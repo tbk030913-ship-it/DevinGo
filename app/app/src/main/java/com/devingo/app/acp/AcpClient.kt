@@ -1538,10 +1538,11 @@ private val healthJson = Json { ignoreUnknownKeys = true }
 /**
  * One shared client for the bridge's HTTP helpers — a fresh OkHttpClient
  * per call would abandon the connection pool (every tree expand used to
- * pay a TCP handshake). Functions needing other timeouts clone via
- * `newBuilder()` — the pool is still shared.
+ * pay a TCP handshake). Functions needing other timeouts or redirect
+ * policies clone via `newBuilder()` — the pool is still shared. Also backs
+ * the update checker's GitHub calls (update/AppUpdate.kt).
  */
-private val bridgeHttpClient = OkHttpClient.Builder()
+internal val bridgeHttpClient = OkHttpClient.Builder()
     .connectTimeout(8, TimeUnit.SECONDS)
     .readTimeout(25, TimeUnit.SECONDS)
     .build()
@@ -1622,43 +1623,25 @@ suspend fun postBridgeFile(
 data class GitDiffResult(val patch: String, val truncated: Boolean)
 
 /**
- * The bridge's `/git/diff`: the session workspace's uncommitted `git diff`
- * patch (token-authed; server caps it ~4 MiB). Throws [AcpException] on any
- * non-2xx so the review sheet can surface the error.
+ * The bridge's `/git/diff` GET form: [mode] `uncommitted` (default) matches
+ * the POST body mode; `branch` diffs the default-branch merge-base against
+ * the worktree — everything the branch introduces, committed or not (W8.2).
+ * Throws [AcpException] on any non-2xx so the review sheet can surface the
+ * error (non-repo, no merge base).
  */
-suspend fun postBridgeGitDiff(
+suspend fun getBridgeGitDiff(
     baseHttpUrl: String,
     token: String?,
     sessionId: String,
-): GitDiffResult = withContext(Dispatchers.IO) {
-    val client = bridgeHttpClient
-    val payload = buildJsonObject {
-        put("sessionId", sessionId)
-    }
-    val req = Request.Builder()
-        .url("$baseHttpUrl/git/diff")
-        .post(payload.toString().toRequestBody("application/json".toMediaType()))
-        .apply {
-            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
-        }
-        .build()
-    client.newCall(req).execute().use { resp ->
-        if (!resp.isSuccessful) {
-            val detail = runCatching {
-                resp.body?.string()
-                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
-                    ?.jsonPrimitive?.content
-            }.getOrNull()
-            throw AcpException(detail ?: "git/diff HTTP ${resp.code}")
-        }
-        val body = resp.body?.string().orEmpty()
-        val obj = healthJson.parseToJsonElement(body).jsonObject
-        GitDiffResult(
-            patch = obj["patch"]?.jsonPrimitive?.content.orEmpty(),
-            truncated = (obj["truncated"] as? JsonPrimitive)
-                ?.booleanOrNull == true,
-        )
-    }
+    cwd: String,
+    mode: String,
+): GitDiffResult {
+    val obj = bridgeJson(baseHttpUrl, token, "GET", "/git/diff",
+        listOf("sessionId" to sessionId, "cwd" to cwd, "mode" to mode))
+    return GitDiffResult(
+        patch = obj.strField("patch").orEmpty(),
+        truncated = (obj["truncated"] as? JsonPrimitive)?.booleanOrNull == true,
+    )
 }
 
 /**

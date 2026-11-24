@@ -71,6 +71,30 @@ func previewAuthHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/preview/"+strconv.Itoa(port)+"/", http.StatusFound)
 }
 
+// stripPreviewCookie drops the bridge's preview cookie from an outbound
+// request while keeping the target app's own cookies — forwarding
+// devingo_prev would hand the raw bridge token to whatever happens to
+// listen on the port.
+func stripPreviewCookie(req *http.Request) {
+	raw := req.Header.Get("Cookie")
+	if raw == "" {
+		return
+	}
+	var kept []string
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		name, _, _ := strings.Cut(part, "=")
+		if name != "" && name != previewCookieName {
+			kept = append(kept, part)
+		}
+	}
+	if len(kept) == 0 {
+		req.Header.Del("Cookie")
+	} else {
+		req.Header.Set("Cookie", strings.Join(kept, "; "))
+	}
+}
+
 // previewProxyHandler forwards /preview/{port}/rest to
 // http://localhost:{port}/rest, preserving the query string.
 func previewProxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +116,16 @@ func previewProxyHandler(w http.ResponseWriter, r *http.Request) {
 			req.URL.Path = "/" + rest
 			req.URL.RawPath = ""
 			req.Host = target
+			// The bridge's credentials are for the bridge only — the
+			// dev server on the port must never see the bearer token,
+			// the devingo_prev cookie (it IS the token), or the
+			// ?token= query credential (it would land in the dev
+			// server's access log and window.location.search).
+			q := req.URL.Query()
+			q.Del("token")
+			req.URL.RawQuery = q.Encode()
+			req.Header.Del("Authorization")
+			stripPreviewCookie(req)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "preview target unreachable", http.StatusBadGateway)

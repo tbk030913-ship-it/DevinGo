@@ -488,9 +488,12 @@ class ChatViewModel(
         store?.savePlanToWorkspace(markdown)
     }
 
-    /** The workspace's uncommitted `git diff` patch via the bridge. */
-    suspend fun fetchGitDiff(): GitDiffResult =
-        store?.fetchGitDiff() ?: throw IllegalStateException("no bound session")
+    /**
+     * The workspace's `git diff` patch via the bridge — [mode]
+     * `uncommitted` (worktree) or `branch` (default-branch merge-base).
+     */
+    suspend fun fetchGitDiff(mode: String): GitDiffResult =
+        store?.fetchGitDiff(mode) ?: throw IllegalStateException("no bound session")
 
     /** The workspace's file paths for the composer's @file picker (N6.2). */
     suspend fun fetchWorkspaceFiles(): List<String> =

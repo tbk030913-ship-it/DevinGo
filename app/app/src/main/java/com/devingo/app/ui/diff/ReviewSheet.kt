@@ -1,10 +1,10 @@
 // Full-height native diff review sheet (N6.1) — Kotlin port of t3code's
 // ReviewSheet.tsx + reviewFileVisibility.ts (MIT): a scope menu (本轮变更 /
-// 本会话工具变更 / Git 未提交变更), 隐藏测试文件 toggle, file quick-jump,
-// per-file Viewed checkboxes, and the Canvas diff view underneath. Line
-// taps open the comment composer; long-press + tap selects a range.
-// "分支对比" is intentionally absent: it needs a merge base and lands with
-// the W8.2 git plumbing.
+// 本会话工具变更 / Git 未提交变更 / 分支对比), 隐藏测试文件 toggle, file
+// quick-jump, per-file Viewed checkboxes, and the Canvas diff view
+// underneath. Line taps open the comment composer; long-press + tap
+// selects a range. 分支对比 diffs the default-branch merge-base against
+// the worktree via GET /git/diff?mode=branch (W8.2).
 
 package com.devingo.app.ui.diff
 
@@ -71,6 +71,7 @@ sealed interface ReviewRequest {
 private sealed interface ReviewScope {
     data object Session : ReviewScope
     data object Git : ReviewScope
+    data object Branch : ReviewScope
     data class Turn(val turnKey: Long) : ReviewScope
 }
 
@@ -83,6 +84,7 @@ private sealed interface ReviewContent {
 private fun ReviewScope.label(diffs: SessionDiffs): String = when (this) {
     ReviewScope.Session -> "本会话工具变更"
     ReviewScope.Git -> "Git 未提交变更"
+    ReviewScope.Branch -> "分支对比"
     is ReviewScope.Turn -> {
         val idx = diffs.turnOrder.indexOf(turnKey)
         if (turnKey == diffs.latestTurnKey || idx < 0) "本轮变更" else "第 ${idx + 1} 轮变更"
@@ -114,7 +116,7 @@ private fun toggle(set: Set<String>, id: String): Set<String> =
 fun ReviewSheet(
     diffs: SessionDiffs,
     request: ReviewRequest,
-    fetchGitDiff: suspend () -> GitDiffResult,
+    fetchGitDiff: suspend (mode: String) -> GitDiffResult,
     onSubmitComment: (ReviewSelection, String) -> Unit,
     /** W8.2: the control-bar Git icon — opens the commit sheet (null hides it). */
     onOpenCommit: (() -> Unit)? = null,
@@ -183,8 +185,13 @@ fun ReviewSheet(
                         diffs.byTurn[s.turnKey].orEmpty()
                             .map { ToolDiff(it.path, it.oldText, it.newText) },
                     )
-                    ReviewScope.Git -> {
-                        val res = fetchGitDiff()
+                    ReviewScope.Git, ReviewScope.Branch -> {
+                        val mode = if (reviewScope == ReviewScope.Branch) {
+                            "branch"
+                        } else {
+                            "uncommitted"
+                        }
+                        val res = fetchGitDiff(mode)
                         gitTruncated = res.truncated
                         parseGitPatch(res.patch)
                     }
@@ -195,10 +202,19 @@ fun ReviewSheet(
                     buildNativeReviewData(filtered),
                     // The flag belongs to the Git fetch — don't carry it
                     // over when the user switches back to a tool scope.
-                    truncated = reviewScope == ReviewScope.Git && gitTruncated,
+                    truncated = (reviewScope == ReviewScope.Git ||
+                        reviewScope == ReviewScope.Branch) && gitTruncated,
                 )
             } catch (e: Exception) {
-                ReviewContent.Failed(e.message ?: "无法读取变更")
+                ReviewContent.Failed(
+                    when {
+                        e.message?.contains("not a git repository") == true ->
+                            "当前工作区不是 Git 仓库"
+                        e.message?.contains("no merge base") == true ->
+                            "找不到与默认分支的 merge base"
+                        else -> e.message ?: "无法读取变更"
+                    },
+                )
             }
         }
     }
@@ -306,6 +322,14 @@ fun ReviewSheet(
                             onClick = {
                                 scopeMenuOpen = false
                                 setScope(ReviewScope.Git)
+                            },
+                        )
+                        DevinMenuCheckItem(
+                            "分支对比",
+                            checked = reviewScope == ReviewScope.Branch,
+                            onClick = {
+                                scopeMenuOpen = false
+                                setScope(ReviewScope.Branch)
                             },
                         )
                     }
@@ -443,7 +467,11 @@ fun ReviewSheet(
                         if (c.data.rows.isEmpty()) {
                             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Text(
-                                    "没有变更",
+                                    if (reviewScope == ReviewScope.Branch) {
+                                        "与默认分支没有差异"
+                                    } else {
+                                        "没有变更"
+                                    },
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = cs.onSurfaceVariant,
                                 )

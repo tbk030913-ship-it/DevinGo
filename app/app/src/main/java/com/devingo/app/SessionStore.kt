@@ -96,10 +96,11 @@ class SessionStore(
      */
     private val workspaceFileWriter: (suspend (String, String) -> Unit)? = null,
     /**
-     * Bridge `/git/diff` bound to this session — returns the workspace's
-     * uncommitted patch. Null when the bridge URL isn't known (N6.1).
+     * Bridge `/git/diff` bound to this session — (mode) → patch:
+     * `uncommitted` for the worktree diff, `branch` for the default-branch
+     * merge-base diff. Null when the bridge URL isn't known (N6.1).
      */
-    private val gitDiffFetcher: (suspend () -> GitDiffResult)? = null,
+    private val gitDiffFetcher: (suspend (String) -> GitDiffResult)? = null,
     /**
      * Bridge `/fs/list` bound to this session — the workspace's file paths
      * for the composer's @file picker. Null without a bridge URL (N6.2).
@@ -1339,11 +1340,15 @@ class SessionStore(
             .plus(block).take(MAX_DRAFT_CHARS)
     }
 
-    /** The workspace's uncommitted `git diff` result (Git 未提交变更 scope). */
-    suspend fun fetchGitDiff(): GitDiffResult {
+    /**
+     * The workspace's `git diff` result — [mode] `uncommitted` for the
+     * Git 未提交变更 scope, `branch` for the 分支对比 scope (merge-base
+     * against the default branch).
+     */
+    suspend fun fetchGitDiff(mode: String): GitDiffResult {
         val fetcher = gitDiffFetcher
             ?: throw IllegalStateException("git diff unavailable without a bridge")
-        return fetcher()
+        return fetcher(mode)
     }
 
     /** The workspace's file paths for the composer's @file picker (N6.2). */

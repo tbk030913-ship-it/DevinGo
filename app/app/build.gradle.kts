@@ -157,4 +157,6 @@ dependencies {
     // Installs the packaged baseline-prof.txt on first launch / update.
     implementation(libs.androidx.profileinstaller)
     baselineProfile(project(":baselineprofile"))
+
+    testImplementation(libs.junit)
 }

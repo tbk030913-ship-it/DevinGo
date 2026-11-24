@@ -173,6 +173,7 @@ fun ChatScreen(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
             !backgroundSheet && !filesSheet && viewerTarget == null &&
             !subagentListOpen && detailSubagent == null && gitSheet == null &&
+            !terminalOpen && !previewOpen && !renameSheet &&
             reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()

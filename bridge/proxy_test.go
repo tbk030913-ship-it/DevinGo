@@ -4,18 +4,22 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
 // The backend records what the proxy forwarded.
 type backendRec struct {
 	host, path, rawQuery string
+	auth, cookie         string
 }
 
 func startBackend(t *testing.T) (*httptest.Server, *backendRec) {
 	rec := &backendRec{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec.host, rec.path, rec.rawQuery = r.Host, r.URL.Path, r.URL.RawQuery
+		rec.auth = r.Header.Get("Authorization")
+		rec.cookie = r.Header.Get("Cookie")
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, "hello from dev server")
 	}))
@@ -81,6 +85,59 @@ func TestPreviewProxyAuth(t *testing.T) {
 	res := proxyGet(t, "/preview/9/", "", "sekrit")
 	if res.Code == http.StatusUnauthorized {
 		t.Fatalf("cookie auth rejected")
+	}
+}
+
+// The bridge's own credentials must not ride into the previewed app:
+// Authorization and the devingo_prev cookie are stripped upstream,
+// while the target's own cookies pass through.
+func TestPreviewProxyStripsBridgeCredentials(t *testing.T) {
+	backend, rec := startBackend(t)
+	port := backend.Listener.Addr().String()[len("127.0.0.1:"):]
+
+	oldToken := *token
+	defer func() { *token = oldToken }()
+	*token = "sekrit"
+
+	req := httptest.NewRequest(http.MethodGet, "/preview/"+port+"/", nil)
+	req.Header.Set("Authorization", "Bearer sekrit")
+	req.Header.Set("Cookie", previewCookieName+"=sekrit; session=abc; theme=dark")
+	recorder := httptest.NewRecorder()
+	previewProxyHandler(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status %d body %q", recorder.Code, recorder.Body.String())
+	}
+	if rec.auth != "" {
+		t.Fatalf("backend saw Authorization %q", rec.auth)
+	}
+	if strings.Contains(rec.cookie, previewCookieName) {
+		t.Fatalf("backend saw the bridge cookie: %q", rec.cookie)
+	}
+	if !strings.Contains(rec.cookie, "session=abc") ||
+		!strings.Contains(rec.cookie, "theme=dark") {
+		t.Fatalf("target's own cookies dropped: %q", rec.cookie)
+	}
+}
+
+// ?token= is a third credential channel: it passes the auth gate yet must
+// not reach the dev server (access logs, window.location.search).
+func TestPreviewProxyStripsQueryToken(t *testing.T) {
+	backend, rec := startBackend(t)
+	port := backend.Listener.Addr().String()[len("127.0.0.1:"):]
+
+	oldToken := *token
+	defer func() { *token = oldToken }()
+	*token = "sekrit"
+
+	res := proxyGet(t, "/preview/"+port+"/app/?token=sekrit&x=1", "", "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d body %q", res.Code, res.Body.String())
+	}
+	if strings.Contains(rec.rawQuery, "token") {
+		t.Fatalf("backend saw the token query: %q", rec.rawQuery)
+	}
+	if !strings.Contains(rec.rawQuery, "x=1") {
+		t.Fatalf("app's own query params dropped: %q", rec.rawQuery)
 	}
 }
 

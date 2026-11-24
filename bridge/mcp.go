@@ -92,7 +92,8 @@ func writeCliError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, errSessionNotHosted):
 		status = http.StatusNotFound
-	case errors.Is(err, errPathOutside), errors.Is(err, errCliArg):
+	case errors.Is(err, errPathOutside), errors.Is(err, errCliArg),
+		errors.Is(err, errOAuthEscaped):
 		status = http.StatusBadRequest
 	}
 	w.WriteHeader(status)
@@ -564,6 +565,28 @@ func loopbackOAuthURL(u *url.URL) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// mcpOAuthMaxRedirects caps the callback fetch's redirect chain.
+const mcpOAuthMaxRedirects = 5
+
+// errOAuthEscaped fires when a redirect would carry the callback fetch
+// off loopback — the pasted URL's own gate must hold at every hop.
+var errOAuthEscaped = errors.New("redirect left loopback")
+
+// oauthCallbackClient fetches pasted OAuth callbacks: each redirect hop
+// is re-checked against the loopback gate so a pasted URL can't bounce
+// the relay into the LAN, and the chain is capped.
+var oauthCallbackClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= mcpOAuthMaxRedirects {
+			return errCliArg
+		}
+		if !loopbackOAuthURL(req.URL) {
+			return errOAuthEscaped
+		}
+		return nil
+	},
+}
+
 // mcpAuthCallbackHandler is POST /mcp/authCallback — {name, url}: the
 // pasted OAuth redirect lands here because the phone's browser can never
 // reach the PC's 127.0.0.1 listener. Two deliveries:
@@ -592,8 +615,10 @@ func mcpAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The manual flow reads one line — a multi-line paste must not smuggle
-	// extra input lines into the parked login's stdin.
+	// extra input lines into the parked login's stdin. Windows clipboards
+	// land CRLF: a \r tail would corrupt both stdin and url.Parse.
 	pasted, _, _ = strings.Cut(pasted, "\n")
+	pasted = strings.TrimRight(pasted, " \r\t")
 	// Manual-token flow first: a pending login for this server owns stdin.
 	mcpLoginsMu.Lock()
 	l := mcpLogins[req.Name]
@@ -620,7 +645,7 @@ func mcpAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		writeCliError(w, err)
 		return
 	}
-	resp, err := http.DefaultClient.Do(req2)
+	resp, err := oauthCallbackClient.Do(req2)
 	if err != nil {
 		writeCliError(w, err)
 		return

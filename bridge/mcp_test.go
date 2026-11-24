@@ -147,3 +147,65 @@ func TestMcpAuthCallbackRejectsRemote(t *testing.T) {
 		t.Fatalf("status = %d", st)
 	}
 }
+
+// A CRLF paste (Windows clipboard) keeps only the first line, \r tail
+// trimmed — the surviving URL must still parse and fetch.
+func TestMcpAuthCallbackTrimsCRLF(t *testing.T) {
+	oldToken := *token
+	defer func() { *token = oldToken }()
+	*token = ""
+	var hit bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.Write([]byte("done"))
+	}))
+	defer target.Close()
+	srv := httptest.NewServer(http.HandlerFunc(mcpAuthCallbackHandler))
+	defer srv.Close()
+
+	st, m := mcpPost(t, srv, "/mcp/authCallback",
+		`{"name":"none","url":"`+target.URL+"/cb\\r\\nhttp://192.168.9.9/x"+`"}`)
+	if st != http.StatusOK || !hit {
+		t.Fatalf("CRLF paste: status = %d, hit = %v, body %v", st, hit, m)
+	}
+	if ok, _ := m["ok"].(bool); !ok {
+		t.Fatalf("CRLF paste not ok: %v", m)
+	}
+}
+
+// A pasted loopback URL may redirect — but only to another loopback URL.
+// A 302 off loopback is refused before the hop is followed.
+func TestMcpAuthCallbackRedirectsStayLoopback(t *testing.T) {
+	oldToken := *token
+	defer func() { *token = oldToken }()
+	*token = ""
+	landed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("landed"))
+	}))
+	defer landed.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/to-lan" {
+			http.Redirect(w, r, "http://192.168.9.9/x", http.StatusFound)
+			return
+		}
+		http.Redirect(w, r, landed.URL+"/cb", http.StatusFound)
+	}))
+	defer redirector.Close()
+	srv := httptest.NewServer(http.HandlerFunc(mcpAuthCallbackHandler))
+	defer srv.Close()
+
+	st, m := mcpPost(t, srv, "/mcp/authCallback",
+		`{"name":"none","url":"`+redirector.URL+"/to-loop"+`"}`)
+	if st != http.StatusOK {
+		t.Fatalf("loopback redirect status = %d, %v", st, m)
+	}
+	if ok, _ := m["ok"].(bool); !ok {
+		t.Fatalf("loopback redirect not ok: %v", m)
+	}
+
+	st, _ = mcpPost(t, srv, "/mcp/authCallback",
+		`{"name":"none","url":"`+redirector.URL+"/to-lan"+`"}`)
+	if st != http.StatusBadRequest {
+		t.Fatalf("LAN redirect status = %d, want 400", st)
+	}
+}

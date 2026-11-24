@@ -335,11 +335,12 @@ fun McpSignInSheet(
                                     st = vm.mcpLoginStatus(serverName)
                                     waited++
                                 }
-                                if (res.ok || st?.done == true) {
+                                if (res.ok || (st?.done == true && st.error == null)) {
                                     state = SignInState.Done
                                 } else {
                                     state = SignInState.Failed(
-                                        res.body.ifBlank { "回调未被接受" }
+                                        (st?.error ?: res.body)
+                                            .ifBlank { "回调未被接受" }
                                             .take(300),
                                     )
                                 }
@@ -355,7 +356,7 @@ fun McpSignInSheet(
                         }
                     },
                     loading = submitting,
-                    enabled = pasted.startsWith("http") && !submitting,
+                    enabled = pasted.trim().startsWith("http") && !submitting,
                     modifier = Modifier.padding(top = 12.dp),
                 )
             }

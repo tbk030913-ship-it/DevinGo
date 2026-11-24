@@ -76,8 +76,15 @@ POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容�
 - `GET /models`  → 缓存的模型列表（启动后异步 + 每 6h 跑一次 `devin models list`，只留 id/name）
 - `GET /pair`    → 配对二维码网页（只有本机打开才带 token）
 - `POST /fs/write` → 在会话工作区内写文件（`{sessionId,path,content}`，≤1MiB，越界 403）
+- `POST /fs/list` → 工作区文件平铺列表（`{sessionId}`，@ 选择器 feed，git 跟踪 + 未忽略未跟踪）
+- `GET /fs/list|read|search?sessionId|cwd` → 目录懒树（`path=` 一级）、文件内容（≤1MiB，
+  二进制回 `{binary,mime}`）、模糊文件/目录搜索
 - `POST /git/diff` → 会话工作区未提交变更 patch（`--relative`+`-- .` 限定子树、
-  含未跟踪文件合成段，15s/4MiB 上限，`truncated` 标记截断）
+  含未跟踪文件合成段，15s/4MiB 上限，`truncated` 标记截断）；
+  `GET /git/diff?sessionId|cwd&mode=uncommitted|branch&path=` 为查询式，
+  `mode=branch` 输出默认分支 merge-base 对工作区的 diff
+- `GET /git/status|branches?sessionId|cwd` → 分支/ahead/behind/改动文件、本地分支列表；
+  `POST /git/checkout|commit|push|pull` → 工作区 Git 变更操作（均限会话工作区内）
 - `WS  /pty`     → 终端控制台：会话工作区里的 ConPTY shell（vt10x 渲染服务端屏幕，
   广播 t3 TerminalFrame 二进制帧；`attach/input/resize/copyall` JSON 控制，每个会话
   一个 shell、零挂载 15min 自动回收，hub 丢会话即杀）
@@ -104,6 +111,11 @@ hub 广播 `_devingo/agent_dead` 并按需懒重拉进程，会话本体在 devi
 cd app
 ./gradlew :app:installDebug          # USB 连接手机，或先 assembleDebug 再手动装
 ```
+
+Release 产物按 ABI 分包（`splits.abi`）：`app-*-arm64-v8a.apk`、
+`app-*-x86_64.apk` 与 `app-*-universal.apk`，文件名需包含对应 ABI 名——
+「设置 → 检查更新」按本机 `SUPPORTED_ABIS` 顺序自动选择，无匹配时回退
+universal。
 
 打开 App 左侧二维码图标，扫 bridge 启动时终端打印的配对码（或在电脑浏览器开
 `http://localhost:8790/pair`）。配对码自带候选地址列表和 token，App 探测到第一个

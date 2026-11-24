@@ -38,7 +38,7 @@ import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitCheckout
 import com.devingo.app.acp.postBridgeGitCommit
-import com.devingo.app.acp.postBridgeGitDiff
+import com.devingo.app.acp.getBridgeGitDiff
 import com.devingo.app.acp.postBridgeGitPull
 import com.devingo.app.acp.postBridgeGitPush
 import com.devingo.app.acp.postBridgeMcpAuthCallback
@@ -751,8 +751,8 @@ class ConnectionManager private constructor(private val app: Application) {
             workspaceFileWriter = { path, content ->
                 postBridgeFile(healthUrl(dialHost), lastToken, sessionId, path, content)
             },
-            gitDiffFetcher = {
-                postBridgeGitDiff(healthUrl(dialHost), lastToken, sessionId)
+            gitDiffFetcher = { mode ->
+                getBridgeGitDiff(healthUrl(dialHost), lastToken, sessionId, cwd, mode)
             },
             workspaceFileLister = {
                 postBridgeFsList(healthUrl(dialHost), lastToken, sessionId)

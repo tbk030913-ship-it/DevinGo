@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- M9.1: transcript Markdown exports live under cacheDir/shared/ and are
-     handed to other apps via ACTION_SEND + FLAG_GRANT_READ_URI_PERMISSION. -->
+     handed to other apps via ACTION_SEND + FLAG_GRANT_READ_URI_PERMISSION.
+     M10: downloaded update APKs live under cacheDir/updates/ and are handed
+     to the system installer via ACTION_VIEW + FLAG_GRANT_READ_URI_PERMISSION. -->
 <paths>
     <cache-path name="shared" path="shared/" />
+    <cache-path name="updates" path="updates/" />
 </paths>

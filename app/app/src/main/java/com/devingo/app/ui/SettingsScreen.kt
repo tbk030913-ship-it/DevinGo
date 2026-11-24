@@ -101,6 +101,7 @@ fun SettingsScreen(
     val cs = MaterialTheme.colorScheme
     var editField by remember { mutableStateOf<EditField?>(null) }
     var ecoSheet by remember { mutableStateOf<EcoSheet?>(null) }
+    var updateSheet by remember { mutableStateOf(false) }
     var logoutConfirm by remember { mutableStateOf(false) }
 
     // System states re-read on every resume.
@@ -510,7 +511,15 @@ fun SettingsScreen(
                 }.getOrNull() ?: "—"
             }
             SettingRow("版本", subtitle = versionName, onClick = null)
+            SettingRow(
+                "检查更新",
+                onClick = { updateSheet = true },
+            )
         }
+    }
+
+    if (updateSheet) {
+        UpdateSheet(onDismiss = { updateSheet = false })
     }
 
     editField?.let { field ->

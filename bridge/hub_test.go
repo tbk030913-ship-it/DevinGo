@@ -770,8 +770,11 @@ func TestAttachNeedLoadOnJournalEpochReset(t *testing.T) {
 
 	// A fresh journal epoch: the session is hosted but its journal only
 	// just restarted — the client's cursor of 7 belongs to the dead one.
+	// lastInfo marks the session as hub-hosted; without it attach's
+	// foreign-session guard would answer needLoad on the fresh attach too.
 	bridgeHub.mu.Lock()
-	bridgeHub.getSessionLocked("EPOCH-SID", "")
+	s := bridgeHub.getSessionLocked("EPOCH-SID", "")
+	s.lastInfo = json.RawMessage(`{"sessionId":"EPOCH-SID"}`)
 	bridgeHub.mu.Unlock()
 
 	c := dialClient(t, srv)
