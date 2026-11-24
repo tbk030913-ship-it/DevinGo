@@ -21,10 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1841,6 +1843,162 @@ func (h *Hub) sessionFsList(sid string) ([]string, bool, error) {
 		names = []string{}
 	}
 	return names, truncated, nil
+}
+
+// ------------------------------------------------------------ fs/search ---
+
+// fsSearchMaxEntries caps the filesystem walk behind /fs/search — a huge
+// workspace must not pin the request goroutine on an unbounded scan.
+const fsSearchMaxEntries = 50000
+
+// fsSearchSkipDirs holds directory basenames the search never descends
+// into: VCS/IDE metadata and dependency/build trees that bury a
+// workspace's own files (A7.3).
+var fsSearchSkipDirs = map[string]bool{
+	".git": true, ".hg": true, ".svn": true,
+	".idea": true, ".vscode": true, ".gradle": true,
+	".next": true, ".cache": true,
+	"node_modules": true, "build": true, "dist": true, "out": true,
+	"target": true, "vendor": true, "coverage": true, "__pycache__": true,
+}
+
+// fsSearchItem is one /fs/search result. Score is unexported — it only
+// orders the list server-side.
+type fsSearchItem struct {
+	RelPath string `json:"relPath"`
+	Kind    string `json:"kind"` // "file" | "directory"
+	score   int
+}
+
+// sessionFsSearch fuzzy-matches files AND directories under the session's
+// recorded workspace (the @-picker backs /fs/list's tracked-files-only
+// view with this full walk). WalkDir never follows symlinks, so a linked
+// dir can't escape the root; the filepath.Rel check is belt and braces
+// for the returned relPaths. Ranking: exact > basename prefix > path
+// prefix > basename/path contains > subsequence, then shorter wins.
+func (h *Hub) sessionFsSearch(sid, query string, limit int) ([]fsSearchItem, bool, error) {
+	cwd, err := h.sessionCwd(sid)
+	if err != nil {
+		return nil, false, err
+	}
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return nil, false, errSessionNotHosted
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, false, errSessionNotHosted // workspace no longer exists
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	var items []fsSearchItem
+	visited := 0
+	truncated := false
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if path == root {
+				return fs.SkipAll // unreadable root — nothing to report
+			}
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+		if d.IsDir() && fsSearchSkipDirs[d.Name()] {
+			return filepath.SkipDir
+		}
+		visited++
+		if visited > fsSearchMaxEntries {
+			truncated = true
+			return fs.SkipAll
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil || rel == ".." ||
+			strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		kind := "file"
+		if d.IsDir() {
+			kind = "directory"
+		}
+		score := fsSearchScore(rel, q)
+		if score >= 0 {
+			items = append(items, fsSearchItem{RelPath: rel, Kind: kind, score: score})
+		}
+		return nil
+	})
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.score != b.score {
+			return a.score < b.score
+		}
+		if len(a.RelPath) != len(b.RelPath) {
+			return len(a.RelPath) < len(b.RelPath)
+		}
+		return a.RelPath < b.RelPath
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+		truncated = true
+	}
+	if items == nil {
+		items = []fsSearchItem{}
+	}
+	return items, truncated, nil
+}
+
+// fsSearchScore ranks rel against the lowercase query: -1 means no match,
+// lower is better. Basename hits outrank deeper path hits; a subsequence
+// ("fuzzy") match trails all literal ones.
+func fsSearchScore(rel, q string) int {
+	if q == "" {
+		return 0
+	}
+	low := strings.ToLower(rel)
+	base := low
+	if i := strings.LastIndexByte(low, '/'); i >= 0 {
+		base = low[i+1:]
+	}
+	switch {
+	case base == q:
+		return 0
+	case low == q:
+		return 1
+	case strings.HasPrefix(base, q):
+		return 2
+	case strings.HasPrefix(low, q):
+		return 3
+	case strings.Contains(base, q):
+		return 4
+	case strings.Contains(low, q):
+		return 5
+	case isSubsequence(q, base):
+		return 6
+	case isSubsequence(q, low):
+		return 7
+	}
+	return -1
+}
+
+// isSubsequence reports whether needle's bytes appear in haystack in
+// order — the cheap fuzzy-match behind /fs/search.
+func isSubsequence(needle, haystack string) bool {
+	if needle == "" {
+		return true
+	}
+	i := 0
+	for j := 0; j < len(haystack) && i < len(needle); j++ {
+		if haystack[j] == needle[i] {
+			i++
+		}
+	}
+	return i == len(needle)
 }
 
 // ---------------------------------------------------------------- git -----

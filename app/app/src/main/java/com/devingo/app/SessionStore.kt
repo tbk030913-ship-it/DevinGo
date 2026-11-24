@@ -9,10 +9,12 @@ import com.devingo.app.acp.AttachResult
 import com.devingo.app.acp.ConfigOption
 import com.devingo.app.acp.ContentBlock
 import com.devingo.app.acp.ElicitationParser
+import com.devingo.app.acp.FsSearchItem
 import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.InboundEvent
 import com.devingo.app.acp.IncomingRequest
 import com.devingo.app.acp.JSONRPC_METHOD_NOT_FOUND
+import com.devingo.app.acp.MentionResource
 import com.devingo.app.acp.PermissionOption
 import com.devingo.app.acp.PlanEntry
 import com.devingo.app.acp.RequestPermissionParams
@@ -88,6 +90,11 @@ class SessionStore(
      * for the composer's @file picker. Null without a bridge URL (N6.2).
      */
     private val workspaceFileLister: (suspend () -> List<String>)? = null,
+    /**
+     * Bridge `/fs/search` bound to this session — fuzzy file+dir matches
+     * for the @-picker's typed query (A7.3). Null without a bridge URL.
+     */
+    private val workspaceSearcher: (suspend (String) -> List<FsSearchItem>)? = null,
 ) {
 
     private companion object {
@@ -124,6 +131,15 @@ class SessionStore(
         const val TOOL_DETAIL_CAP = 4_000
         /** Default workspace path the plan card's 保存到工作区 writes. */
         const val PLAN_FILE_NAME = "plan.md"
+        /**
+         * `@{kind}:{ref}` send-time scanner — the same kind vocabulary as
+         * the UI chip regex in ContextChips (A7.3).
+         */
+        val SEND_MENTION_TOKEN = Regex(
+            "@(file|folder|directory|rule|skill|plan|session|conversation|git|" +
+                "codemap|url|image|doc|symbol|task|terminal|web|issue|" +
+                "pull-request|review-comment):\\S*",
+        )
         /** ACP `tool_call.kind` values — the vocabulary toolKind is normalized to. */
         val ACP_TOOL_KINDS = setOf(
             "read", "edit", "delete", "move", "search",
@@ -922,6 +938,26 @@ class SessionStore(
         return lister()
     }
 
+    /**
+     * The bridge's fuzzy workspace search — the @-picker's typed-query
+     * feed of files AND directories (A7.3). No bridge → empty.
+     */
+    suspend fun searchWorkspace(query: String): List<FsSearchItem> =
+        workspaceSearcher?.invoke(query) ?: emptyList()
+
+    /**
+     * The agent's mentionable resources — devin's
+     * `_cognition.ai/{rules,skills,plans}/list` behind one call so the
+     * picker can fan out per kind. An agent without the surface answers
+     * method_not_found; the caller treats that as an empty category (A7.3).
+     */
+    suspend fun mentionResources(kind: String): List<MentionResource> = when (kind) {
+        "rule" -> client.listRules(sessionId)
+        "skill" -> client.listSkills(sessionId)
+        "plan" -> client.listPlans(sessionId)
+        else -> emptyList()
+    }
+
     fun setDraftAttachments(attachments: List<ImageAttachment>) {
         // Single enforcement point — keeps what fits under the send cap so
         // the queue-edit path can't park an over-limit payload either.
@@ -1257,8 +1293,10 @@ class SessionStore(
 
     /**
      * Compose the prompt's content blocks: image attachments first, then
-     * the text with `@path` tokens lifted into `resource_link` blocks —
-     * Devin advertises file/directory mention types plus embeddedContext.
+     * the text — `@{kind}:{ref}` mention tokens lift into `resource_link`
+     * blocks carrying devin's `cognition.ai` mention `_meta` (the agent
+     * resolves mention-path against the session's advertised mentionTypes;
+     * A7.3), while bare `@path` tokens keep their N6.2 file link.
      */
     private fun buildBlocks(text: String, attachments: List<ImageAttachment>): List<ContentBlock> {
         val blocks = mutableListOf<ContentBlock>()
@@ -1276,20 +1314,77 @@ class SessionStore(
                 buf.clear()
             }
         }
-        text.split(Regex("\\s+")).filter { it.isNotEmpty() }.forEach { tok ->
-            val m = tok.removePrefix("@")
-            val looksLikePath = tok.startsWith("@") &&
-                (m.contains('/') || m.contains('\\') || m.contains('.'))
-            if (looksLikePath) {
-                flushText()
-                blocks += ContentBlock(type = "resource_link", uri = fileUri(m), name = m)
-            } else {
-                buf.append(tok).append(' ')
+        // Bare-@path pass over one text segment (N6.2): a post-whitespace
+        // `@token` that looks path-ish becomes a file resource_link.
+        fun bareMentions(seg: String) {
+            seg.split(Regex("\\s+")).filter { it.isNotEmpty() }.forEach { tok ->
+                val m = tok.removePrefix("@")
+                val looksLikePath = tok.startsWith("@") && !m.contains(':') &&
+                    (m.contains('/') || m.contains('\\') || m.contains('.'))
+                if (looksLikePath) {
+                    flushText()
+                    blocks += ContentBlock(type = "resource_link", uri = fileUri(m), name = m)
+                } else {
+                    buf.append(tok).append(' ')
+                }
             }
         }
+        var cursor = 0
+        for (match in SEND_MENTION_TOKEN.findAll(text)) {
+            // A mid-word `@` (emails, handles) is not a mention token.
+            if (match.range.first > 0 && !text[match.range.first - 1].isWhitespace()) continue
+            val kind = match.groupValues[1]
+            val ref = match.value.substring(kind.length + 2)
+            if (ref.isEmpty()) continue
+            bareMentions(text.substring(cursor, match.range.first))
+            blocks += mentionBlock(kind, ref, match.value)
+            cursor = match.range.last + 1
+        }
+        bareMentions(text.substring(cursor))
         flushText()
         if (blocks.isEmpty()) blocks += ContentBlock(type = "text", text = text)
         return blocks
+    }
+
+    /**
+     * `@{kind}:{ref}` → the resource_link devin reads: file-ish kinds
+     * resolve to file:// URIs, `url`/`web` carry their own URL, and the
+     * rest ride a `cognition://<type>/<ref>` URI — the real payload is the
+     * `_meta` mention record (resource-link-type / mention-path /
+     * mention-text, plus the kind's id field; key names verified in the
+     * agent binary, A7.3).
+     */
+    private fun mentionBlock(kind: String, ref: String, source: String): ContentBlock {
+        val linkType = when (kind) {
+            "folder" -> "directory"
+            "session" -> "conversation"
+            "image" -> "file"
+            else -> kind
+        }
+        val uri = when (linkType) {
+            "file", "directory" -> fileUri(ref)
+            "url", "web" -> ref
+            else -> "cognition://$linkType/$ref"
+        }
+        val meta = buildJsonObject {
+            put("cognition.ai/resource-link-type", linkType)
+            put("cognition.ai/mention-path", ref)
+            put("cognition.ai/mention-text", source)
+            when (linkType) {
+                "conversation" -> put("cognition.ai/session-id", ref)
+                "codemap" -> put("cognition.ai/codemap-id", ref)
+            }
+        }
+        return ContentBlock(
+            type = "resource_link",
+            uri = uri,
+            name = if (linkType == "file" || linkType == "directory") {
+                ref.substringAfterLast('/').substringAfterLast('\\').ifEmpty { ref }
+            } else {
+                ref
+            },
+            _meta = meta,
+        )
     }
 
     private fun fileUri(rel: String): String {

@@ -44,9 +44,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -92,6 +90,10 @@ import coil3.compose.AsyncImage
 import com.devingo.app.CitationAttachment
 import com.devingo.app.ImageAttachment
 import com.devingo.app.UiState
+import com.devingo.app.acp.AcpSession
+import com.devingo.app.acp.AgentCaps
+import com.devingo.app.acp.FsSearchItem
+import com.devingo.app.acp.MentionResource
 import com.devingo.app.acp.SessionMode
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
@@ -105,7 +107,6 @@ import me.rerere.hugeicons.stroke.AtSign
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.CommandLine
-import me.rerere.hugeicons.stroke.File01
 import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.hugeicons.stroke.Quotes
 import me.rerere.hugeicons.stroke.Shield01
@@ -125,8 +126,8 @@ import me.rerere.hugeicons.stroke.Shield01
  * paste. The view never leaves the tree between layers, so focus/IME survive
  * the pill↔expanded swap.
  *
- * All v1 behaviors kept — image attachments, @ file picker + hint,
- * slash-command strip, queue/steer menu (queue keeps images; steer is
+ * All v1 behaviors kept — image attachments, the unified `/`+`@` popover
+ * (A7.3's ComposerCommandPopover), queue/steer menu (queue keeps images; steer is
  * text-only and disables when attachments exist). U5.4: while a queued
  * prompt is being edited, the top slot shows the 取消/保存 banner and the
  * send button becomes 保存 ([onSend] routes). U5.5: [citation] pins a quote
@@ -151,8 +152,16 @@ internal fun Composer(
     onSelectMode: (String) -> Unit,
     onCancelQueuedEdit: () -> Unit,
     onStop: () -> Unit,
-    /** Bridge /fs/list for the @file picker — throws when the bridge is gone. */
+    /** Bridge /fs/list — the chip scanner's known-path bounds (N6.2). */
     onFetchFiles: suspend () -> List<String>,
+    /** Negotiated caps — the @-picker's kind gating (A7.3). */
+    agentCaps: AgentCaps,
+    /** `_devingo/sessions` cache — the @-picker's 会话 category. */
+    sessions: List<AcpSession>,
+    /** Bridge /fs/search — the @-picker's file+dir feed (A7.3). */
+    onSearchWorkspace: suspend (String) -> List<FsSearchItem>,
+    /** `_cognition.ai/{rules,skills,plans}/list` by kind (A7.3). */
+    onMentionResources: suspend (String) -> List<MentionResource>,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -187,9 +196,9 @@ internal fun Composer(
     var selectionEnd by remember { mutableIntStateOf(0) }
     var chipSheet by remember { mutableStateOf<ChipToken?>(null) }
 
-    val caretToken = remember(input, selectionEnd) {
-        val before = input.substring(0, selectionEnd.coerceIn(0, input.length))
-        caretMentionRegex.find(before)?.groups?.get(2)?.value
+    // The `@`/`/` trigger under the caret — drives the unified popover (A7.3).
+    val trigger = remember(input, selectionEnd) {
+        detectComposerTrigger(input, selectionEnd)
     }
     val insertAtCaret: (String) -> Unit = { token ->
         val e = editor.text
@@ -198,16 +207,13 @@ internal fun Composer(
             e.insert(pos, token)
         }
     }
-    // @file picker: the partial `@query` before the caret opens it; a `kind:`
-    // prefix means the user is typing a full token, not filtering files.
-    val mentionQuery = caretToken?.removePrefix("@")?.takeUnless { it.contains(':') }
     var workspaceFiles by remember(ui.sessionId) {
         mutableStateOf<List<String>?>(null)
     }
     var filesFailed by remember(ui.sessionId) { mutableStateOf(false) }
-    // knownFiles feeds the space-in-path match for file + folder tokens.
-    val needFiles = mentionQuery != null ||
-        input.contains("@file:") || input.contains("@folder:")
+    // knownFiles feeds the space-in-path match for file/dir chip tokens.
+    val needFiles = input.contains("@file:") || input.contains("@folder:") ||
+        input.contains("@directory:")
     LaunchedEffect(needFiles, ui.sessionId) {
         if (needFiles && workspaceFiles == null && !filesFailed) {
             try {
@@ -235,17 +241,6 @@ internal fun Composer(
             }
         }
     }
-    val insertFileToken: (String) -> Unit = { path ->
-        val e = editor.text
-        if (e != null) {
-            val caret = editor.selectionEnd.coerceIn(0, e.length)
-            val before = e.substring(0, caret)
-            val m = caretMentionRegex.find(before)
-            val start = if (m != null) caret - m.groupValues[2].length else caret
-            e.replace(start, caret, "@file:$path ")
-        }
-    }
-
     val cs = MaterialTheme.colorScheme
     val sendState = when {
         // Editing a queued prompt: the button is 保存, never the turn's
@@ -316,10 +311,9 @@ internal fun Composer(
             .imePadding(),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // Popup slot above the pill: queue-edit banner, then the @file
-        // picker. (Slash-command suggestions render above the whole composer —
-        // ChatScreen owns that slot; the queue itself moved to U5.4's
-        // floating capsule + ThreadQueueSheet.)
+        // Popup slot above the pill: queue-edit banner, then the unified
+        // `/`+`@` picker (A7.3 — one surface for both triggers; the queue
+        // itself lives in U5.4's floating capsule + ThreadQueueSheet).
         AnimatedVisibility(
             visible = queueEditing && !permissionPending,
             enter = fadeIn(tween(150)) + slideInVertically { it / 2 },
@@ -333,18 +327,37 @@ internal fun Composer(
                 )
             }
         }
+        // Keep the last trigger through the exit animation so the card
+        // doesn't render empty for its final ~100ms.
+        var lastTrigger by remember { mutableStateOf<ComposerTrigger?>(null) }
+        LaunchedEffect(trigger) { if (trigger != null) lastTrigger = trigger }
         AnimatedVisibility(
-            visible = mentionQuery != null && !permissionPending,
+            visible = trigger != null && !permissionPending,
             enter = fadeIn(tween(150)) + slideInVertically { it / 2 },
             exit = fadeOut(tween(100)) + shrinkVertically(),
         ) {
             ComposerPopup(Modifier.padding(horizontal = 16.dp)) {
-                FileMentionList(
-                    query = mentionQuery.orEmpty(),
-                    files = workspaceFiles,
-                    failed = filesFailed,
-                    onPick = insertFileToken,
-                )
+                (trigger ?: lastTrigger)?.let { t ->
+                    ComposerCommandPopover(
+                        trigger = t,
+                        sessionId = ui.sessionId,
+                        commands = ui.commands,
+                        caps = agentCaps,
+                        sessions = sessions,
+                        onSearch = onSearchWorkspace,
+                        onMentionResources = onMentionResources,
+                    ) { insert, rangeStart ->
+                        val e = editor.text
+                        if (e != null) {
+                            val end = editor.selectionEnd.coerceIn(0, e.length)
+                            e.replace(
+                                rangeStart.coerceIn(0, end),
+                                end,
+                                insert,
+                            )
+                        }
+                    }
+                }
             }
         }
         Surface(
@@ -969,18 +982,6 @@ internal fun ComposerPopup(
     }
 }
 
-/** Slash-command matches for [input]; shared by the strip and its visibility. */
-internal fun commandMatches(
-    ui: UiState,
-    input: String,
-): List<com.devingo.app.acp.AvailableCommand> {
-    if (ui.commands.isEmpty() || !input.startsWith("/")) return emptyList()
-    val query = input.substring(1).takeWhile { it != ' ' }
-    return ui.commands.filter { cmd ->
-        cmd.name.removePrefix("/").startsWith(query, ignoreCase = true)
-    }.take(6)
-}
-
 /**
  * U5.4's composer-top banner while a queued prompt is being edited —
  * t3code's ComposerQueuedEditBanner plus the spec's 保存 action (saving
@@ -1090,94 +1091,6 @@ private fun AttachmentStrip(
     }
 }
 
-// ---- @file picker --------------------------------------------------------------
-
-/** The partial `@token` before the caret (start-of-text or post-whitespace). */
-private val caretMentionRegex = Regex("(^|\\s)(@\\S*)$")
-
-/** Rows the picker can show at once — type-ahead stays snappy over it. */
-private const val FILE_PICKER_MAX_ROWS = 60
-
-/**
- * N6.2's @file picker — the old MentionHint upgraded to a real list: the
- * workspace files from /fs/list filtered by the typed query; a pick rewrites
- * the partial token as `@file:{path} `.
- */
-@Composable
-private fun FileMentionList(
-    query: String,
-    files: List<String>?,
-    failed: Boolean,
-    onPick: (String) -> Unit,
-) {
-    val cs = MaterialTheme.colorScheme
-    val matches = remember(files, query) {
-        files.orEmpty()
-            .filter { query.isEmpty() || it.contains(query, ignoreCase = true) }
-            .take(FILE_PICKER_MAX_ROWS)
-    }
-    when {
-        failed -> FileMentionHintRow("无法获取工作区文件列表")
-        files == null -> FileMentionHintRow("正在加载工作区文件…")
-        matches.isEmpty() -> FileMentionHintRow("没有匹配的文件")
-        else -> LazyColumn(Modifier.heightIn(max = 288.dp)) {
-            items(matches) { path ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 44.dp)
-                        .clickable { onPick(path) }
-                        .padding(horizontal = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        HugeIcons.File01, null,
-                        modifier = Modifier.size(14.dp),
-                        tint = cs.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        path,
-                        style = monoText(MaterialTheme.typography.labelSmall),
-                        color = cs.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-    }
-}
-
-/** The picker's single hint row (loading / failed / empty states). */
-@Composable
-private fun FileMentionHintRow(text: String) {
-    val cs = MaterialTheme.colorScheme
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .heightIn(min = 40.dp)
-            .padding(horizontal = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            HugeIcons.AtSign, null,
-            modifier = Modifier.size(14.dp),
-            tint = cs.onSurfaceVariant,
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            text,
-            style = MaterialTheme.typography.labelSmall,
-            color = cs.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-    }
-}
-
 // ---- image attachments ------------------------------------------------------
 
 private const val MAX_IMAGE_EDGE = 2048
@@ -1257,50 +1170,4 @@ private fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
     return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
 }
 
-/** Slash-command strip inside the popup card while input starts with "/". */
-@Composable
-internal fun CommandSuggestions(ui: UiState, input: String, onPick: (String) -> Unit) {
-    val matches = commandMatches(ui, input)
-    if (matches.isEmpty()) return
-    val cs = MaterialTheme.colorScheme
-    Column {
-        matches.forEach { cmd ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp)
-                    .clickable {
-                        val name = cmd.name.removePrefix("/")
-                        onPick("/$name ")
-                    }
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "/${cmd.name.removePrefix("/")}",
-                    style = monoText(MaterialTheme.typography.bodySmall),
-                    color = DevinGoColors.link,
-                )
-                cmd.description?.let {
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = cs.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                cmd.inputHint?.let {
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        it,
-                        style = monoText(MaterialTheme.typography.labelSmall),
-                        color = cs.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-    }
-}
+

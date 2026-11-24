@@ -6,8 +6,6 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -106,6 +104,9 @@ fun ChatScreen(
     val attachments by vm.draftAttachments.collectAsState()
     val citation by vm.draftCitation.collectAsState()
     val turnTimes by vm.turnTimes.collectAsState()
+    // A7.3: the @-picker's capability gating + 会话 source.
+    val agentCaps by vm.agentCaps.collectAsState()
+    val sessions by vm.sessions.collectAsState()
     // Keyed on the bound session — the page stays Page.Chat across a
     // session switch, so without the key scroll position and expansions
     // would leak into the next session's transcript.
@@ -313,25 +314,7 @@ fun ChatScreen(
                     .padding(bottom = 6.dp),
             )
         }
-        // Slash-command popup above the composer pill — hidden while a
-        // pending card is up (it owns the popup slot).
-        val showCommands = remember(ui.commands, input, pendingPermission, pendingElicitation) {
-            pendingPermission == null && pendingElicitation == null &&
-                commandMatches(ui, input).isNotEmpty()
-        }
-        AnimatedVisibility(
-            visible = showCommands,
-            modifier = Modifier
-                .align(Alignment.CenterHorizontally)
-                .widthIn(max = 720.dp)
-                .padding(horizontal = 16.dp),
-            enter = fadeIn() + androidx.compose.animation.slideInVertically { it / 2 },
-            exit = fadeOut() + androidx.compose.animation.shrinkVertically(),
-        ) {
-            ComposerPopup {
-                CommandSuggestions(ui, input) { vm.setDraft(it) }
-            }
-        }
+        // The `/`+`@` popover moved inside the composer's popup slot (A7.3).
         // Inline permission card takes the popup slot above the composer.
         PermissionCard(
             pending = pendingPermission,
@@ -388,6 +371,10 @@ fun ChatScreen(
             onCancelQueuedEdit = vm::cancelQueuedEdit,
             onStop = vm::cancelTurn,
             onFetchFiles = vm::fetchWorkspaceFiles,
+            agentCaps = agentCaps,
+            sessions = sessions.orEmpty(),
+            onSearchWorkspace = vm::searchWorkspace,
+            onMentionResources = vm::mentionResources,
         )
     }
     if (modelSheet) {

@@ -19,6 +19,7 @@ import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
+import com.devingo.app.acp.getBridgeFsSearch
 import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitDiff
@@ -668,6 +669,9 @@ class ConnectionManager private constructor(private val app: Application) {
             },
             workspaceFileLister = {
                 postBridgeFsList(healthUrl(dialHost), lastToken, sessionId)
+            },
+            workspaceSearcher = { query ->
+                getBridgeFsSearch(healthUrl(dialHost), lastToken, sessionId, query)
             },
         )
         // U7: show the last cached transcript right away — the attach replay

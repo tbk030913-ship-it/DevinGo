@@ -132,6 +132,7 @@ func main() {
 	mux.HandleFunc("/models", modelsHandler)
 	mux.HandleFunc("/fs/write", fsWriteHandler)
 	mux.HandleFunc("/fs/list", fsListHandler)
+	mux.HandleFunc("/fs/search", fsSearchHandler)
 	mux.HandleFunc("/git/diff", gitDiffHandler)
 	mux.HandleFunc("/pty", ptyHandler)
 	mux.HandleFunc("/preview/", previewProxyHandler)
@@ -145,6 +146,7 @@ func main() {
 		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
 		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
 		fmt.Fprintln(w, "  POST /fs/list  - list files inside a session workspace")
+		fmt.Fprintln(w, "  GET  /fs/search?sessionId&q&limit - fuzzy file/dir search of a session workspace")
 		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
 		fmt.Fprintln(w, "  WS  /pty       - terminal console (ConPTY shell in a session workspace)")
 		fmt.Fprintln(w, "  GET /preview/{port}/ - reverse proxy to a localhost dev server (WebView preview)")
@@ -673,6 +675,64 @@ func fsListHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"files":     files,
+		"truncated": truncated,
+	})
+}
+
+// fsSearchDefaultLimit/fsSearchMaxLimit bound the ?limit= query param.
+const (
+	fsSearchDefaultLimit = 50
+	fsSearchMaxLimit     = 200
+)
+
+// fsSearchHandler serves the composer @-picker's fuzzy path search:
+// GET /fs/search?sessionId=<id>&q=<query>&limit=<n> →
+// {items: [{relPath, kind}], truncated} — files AND directories. The cwd
+// resolves server-side from the hosted session (never client-supplied —
+// a raw path param would let any bearer holder enumerate the server's
+// filesystem). Same auth/origin gates as /fs/list (A7.3).
+func fsSearchHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	q := r.URL.Query()
+	sid := q.Get("sessionId")
+	if sid == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId is required"}`))
+		return
+	}
+	limit := fsSearchDefaultLimit
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		limit = n
+	}
+	if limit > fsSearchMaxLimit {
+		limit = fsSearchMaxLimit
+	}
+	items, truncated, err := bridgeHub.sessionFsSearch(sid, q.Get("q"), limit)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSessionNotHosted) {
+			status = http.StatusNotFound
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"items":     items,
 		"truncated": truncated,
 	})
 }

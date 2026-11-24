@@ -2,7 +2,10 @@ package com.devingo.app
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import com.devingo.app.acp.AgentCaps
+import com.devingo.app.acp.FsSearchItem
 import com.devingo.app.acp.GitDiffResult
+import com.devingo.app.acp.MentionResource
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -126,6 +129,8 @@ class ChatViewModel(
     val sessionsLoading: StateFlow<Boolean> = cm.sessionsLoading
     val sessionsError: StateFlow<String?> = cm.sessionsError
     val badges: StateFlow<Map<String, SessionBadge>> = cm.badges
+    /** The negotiated capability set — the @-picker's kind gating (A7.3). */
+    val agentCaps: StateFlow<AgentCaps> = cm.agentCaps
     /** Pending approvals across all sessions — the notification's count. */
     val pendingApprovals: StateFlow<Int> = cm.pendingApprovals
     val openTarget: StateFlow<OpenTarget?> = cm.openTarget
@@ -337,4 +342,21 @@ class ChatViewModel(
     /** The workspace's file paths for the composer's @file picker (N6.2). */
     suspend fun fetchWorkspaceFiles(): List<String> =
         store?.fetchWorkspaceFiles() ?: emptyList()
+
+    /** The bridge's fuzzy file+dir search — the @-picker's typed feed (A7.3). */
+    suspend fun searchWorkspace(query: String): List<FsSearchItem> =
+        store?.searchWorkspace(query) ?: emptyList()
+
+    /**
+     * Rules/skills/plans the agent lists for @-mentions. Failures (agent
+     * without the `_cognition.ai` list surface, or a dead socket) fold
+     * to an empty category rather than an error — it's a picker (A7.3).
+     */
+    suspend fun mentionResources(kind: String): List<MentionResource> = try {
+        store?.mentionResources(kind) ?: emptyList()
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        emptyList()
+    }
 }

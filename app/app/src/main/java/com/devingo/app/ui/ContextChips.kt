@@ -4,10 +4,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.AtSign
 import me.rerere.hugeicons.stroke.File01
+import me.rerere.hugeicons.stroke.FileText
 import me.rerere.hugeicons.stroke.Folder01
+import me.rerere.hugeicons.stroke.GitBranch
 import me.rerere.hugeicons.stroke.Globe02
 import me.rerere.hugeicons.stroke.Image01
 import me.rerere.hugeicons.stroke.Link01
+import me.rerere.hugeicons.stroke.Map
 import me.rerere.hugeicons.stroke.MessagesSquare
 import me.rerere.hugeicons.stroke.Scroll01
 import me.rerere.hugeicons.stroke.Sparkles
@@ -37,21 +40,30 @@ internal data class ChipToken(
 /** kind → accent (t3code's CONTEXT_CHIP_PRESENTATIONS sRGB set) + HugeIcons glyph. */
 internal fun chipPresentation(kind: String): Pair<Int, ImageVector> = when (kind) {
     "file" -> 0xFF0090CD.toInt() to HugeIcons.File01
-    "folder" -> 0xFF0090CD.toInt() to HugeIcons.Folder01
+    "folder", "directory" -> 0xFF0090CD.toInt() to HugeIcons.Folder01
     "image" -> 0xFF0090CD.toInt() to HugeIcons.Image01
     "rule", "doc" -> 0xFFB87501.toInt() to HugeIcons.Scroll01
     "skill" -> 0xFFB261BE.toInt() to HugeIcons.Sparkles
+    "plan" -> 0xFF3D8BFD.toInt() to HugeIcons.FileText
+    "git" -> 0xFFF05033.toInt() to HugeIcons.GitBranch
+    "codemap" -> 0xFF009F6E.toInt() to HugeIcons.Map
     "url" -> 0xFF009C96.toInt() to HugeIcons.Link01
     "web" -> 0xFF009C96.toInt() to HugeIcons.Globe02
-    "session" -> 0xFF7079E4.toInt() to HugeIcons.MessagesSquare
+    "session", "conversation" -> 0xFF7079E4.toInt() to HugeIcons.MessagesSquare
     "terminal" -> 0xFF009F6E.toInt() to HugeIcons.Terminal
     else -> 0xFF7F8793.toInt() to HugeIcons.AtSign
 }
 
-/** `@{kind}:` token start — the ref runs to the next whitespace (or a known path). */
-private val kindedTokenStart = Regex(
-    "@(file|folder|rule|skill|session|url|image|doc|symbol|task|terminal|" +
-        "web|issue|pull-request|review-comment):",
+/**
+ * `@{kind}:` token start — the ref runs to the next whitespace (or a known
+ * path). The kind vocabulary covers devin's advertised mentionTypes
+ * (file/directory/git/rule/skill/plan/conversation/terminal/codemap —
+ * A7.3) plus the generic link-ish kinds.
+ */
+internal val kindedTokenStart = Regex(
+    "@(file|folder|directory|rule|skill|plan|session|conversation|git|" +
+        "codemap|url|image|doc|symbol|task|terminal|web|issue|" +
+        "pull-request|review-comment):",
 )
 
 /**
@@ -89,7 +101,9 @@ internal fun scanContextTokens(
         val kind = m.groupValues[1]
         val refStart = m.range.last + 1
         var end = nonWhitespaceEnd(text, refStart)
-        if ((kind == "file" || kind == "folder") && knownFiles.isNotEmpty()) {
+        if ((kind == "file" || kind == "folder" || kind == "directory") &&
+            knownFiles.isNotEmpty()
+        ) {
             var best = -1
             for (f in knownFiles) {
                 val fe = refStart + f.length
@@ -107,7 +121,9 @@ internal fun scanContextTokens(
         out += ChipToken(
             kind = kind,
             source = text.substring(m.range.first, end),
-            label = if (kind == "file" || kind == "folder" || kind == "image") {
+            label = if (kind == "file" || kind == "folder" ||
+                kind == "directory" || kind == "image"
+            ) {
                 basename(ref)
             } else {
                 ref
