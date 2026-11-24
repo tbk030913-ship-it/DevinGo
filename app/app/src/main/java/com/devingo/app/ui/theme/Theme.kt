@@ -73,6 +73,11 @@ object DevinGoColors {
     val diffAdd = Color(0xFF1A7F37)
     val diffRemove = Color(0xFFD1242F)
 
+    /** Subagent status accents (A7.4): running sky, failed rose, done emerald. */
+    val statusSky = Color(0xFF0284C7)
+    val statusRose = Color(0xFFE11D48)
+    val statusEmerald = Color(0xFF059669)
+
     /** Sheet/menu backdrop: black at 12% (reference dims #FCFCFC → ~#DDDDDD). */
     val sheetScrim = Color(0x1F000000)
 

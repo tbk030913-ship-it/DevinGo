@@ -191,6 +191,38 @@ data class ElicitationReply(
     val lines: List<String>,
 )
 
+/**
+ * A Devin subagent spawned via a task/subagent tool call (A7.4), tracked
+ * live off the wire. [status] is normalized at ingestion onto
+ * pending/working/background/completed/failed/stopped.
+ */
+@Immutable
+data class Subagent(
+    /** `sharedSubagentId` when the wire carries one, else the toolCallId. */
+    val id: String,
+    val toolCallId: String,
+    val title: String,
+    val status: String,
+    /** The instruction the parent handed the agent (rawInput), when sent. */
+    val prompt: String? = null,
+    /** Latest progress/output text from the call's content blocks. */
+    val detail: String? = null,
+    /** Final output — frozen copy of [detail] at the terminal update. */
+    val result: String? = null,
+    val startedAt: Long = 0L,
+    /** Wall-clock the agent reached a terminal status; 0 while it runs. */
+    val endedAt: Long = 0L,
+    /** Child session id — `cognition.ai/childSessionId` or the URL tail. */
+    val childSessionId: String? = null,
+    val childSessionUrl: String? = null,
+    /** Owning turn's key (its user item id); 0 when no turn exists yet. */
+    val turnId: Long = 0L,
+) {
+    /** Still doing work — includes `background` (running, just unfocused). */
+    val live: Boolean
+        get() = status == "pending" || status == "working" || status == "background"
+}
+
 /** A photo/screenshot picked on-device, sent as an ACP `image` block. */
 class ImageAttachment(val bytes: ByteArray, val mimeType: String)
 

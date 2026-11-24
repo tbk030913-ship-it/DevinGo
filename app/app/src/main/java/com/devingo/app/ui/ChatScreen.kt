@@ -107,6 +107,9 @@ fun ChatScreen(
     // A7.3: the @-picker's capability gating + 会话 source.
     val agentCaps by vm.agentCaps.collectAsState()
     val sessions by vm.sessions.collectAsState()
+    // A7.4: the session's subagents — capsule count, work-log cards, sheets.
+    val subagents by vm.subagents.collectAsState()
+    val numLiveSubagents by vm.numLiveSubagents.collectAsState()
     // Keyed on the bound session — the page stays Page.Chat across a
     // session switch, so without the key scroll position and expansions
     // would leak into the next session's transcript.
@@ -130,12 +133,18 @@ fun ChatScreen(
     var previewPort by remember(ui.sessionId) { mutableStateOf<Int?>(null) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
+    // A7.4: the capsule opens the list sheet; a work-log/capsule row opens
+    // the agent's detail sheet. Both keyed by session — a switch drops them.
+    var subagentListOpen by remember(ui.sessionId) { mutableStateOf(false) }
+    var detailSubagentId by remember(ui.sessionId) { mutableStateOf<String?>(null) }
+    val detailSubagent = subagents.firstOrNull { it.id == detailSubagentId }
 
     // Back returns to Home WITHOUT disconnecting — the session's store keeps
     // streaming and its row shows running/unread badges. An open sheet
     // consumes back first (dismisses itself).
     BackHandler(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
+            !subagentListOpen && detailSubagent == null &&
             reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()
@@ -208,9 +217,13 @@ fun ChatScreen(
         // swaps the page back to a status screen (U6).
         ConnBanner(ui)
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            // A7.3 stub — when the real subagent count lands it feeds both
-            // the capsule and this inset mirror through the same value.
-            val subagentCount = 0
+            // A7.4: the wire's numLiveSubagents wins once reported (it sees
+            // agents the local list never parsed); else the list's live count.
+            val subagentCount = if (numLiveSubagents >= 0) {
+                numLiveSubagents
+            } else {
+                subagents.count { it.live }
+            }
             // Mirrors FloatingWorkingControl's `hasCapsule || showScrollToEnd`
             // — the running/scroll segments only appear while !atBottom, so a
             // single `!atBottom` term covers them both.
@@ -262,6 +275,12 @@ fun ChatScreen(
                         citationSheet = true
                     },
                     onSavePlan = { vm.savePlanToWorkspace(planMarkdown(it.planEntries)) },
+                    // A7.4: the turn-scoped cards; a row opens the detail sheet.
+                    subagents = subagents,
+                    onSubagentOpen = { detailSubagentId = it.id },
+                    onSubagentBackground = { vm.subagentBackground(it.id) },
+                    onSubagentForeground = { vm.subagentForeground(it.id) },
+                    onSubagentCancel = { vm.subagentCancel(it.id) },
                     listState = listState,
                     modifier = Modifier.fillMaxSize(),
                     // Keep the status line above the floating capsule — the
@@ -285,14 +304,20 @@ fun ChatScreen(
                 runningDetail = model.runningDetail,
                 turnStartedAtMs = turnTimes[model.lastUserId]?.start ?: 0L,
                 queuedCount = queuedPrompts.size,
-                // A7.3 lands the real subagent flow; the segment exists and
-                // wakes up the moment a count arrives.
+                // A7.4: the store's subagent list, wire-reported live count.
                 subagentCount = subagentCount,
                 showScrollToEnd = !atBottom && model.itemById.isNotEmpty(),
                 onReconnect = vm::reconnectNow,
                 onStop = vm::cancelTurn,
                 onOpenQueue = { queueSheet = true },
-                onOpenSubagents = {},
+                // A single agent skips the list — straight to its detail.
+                onOpenSubagents = {
+                    if (subagents.size == 1) {
+                        detailSubagentId = subagents.first().id
+                    } else {
+                        subagentListOpen = true
+                    }
+                },
                 onScrollToEnd = {
                     scope.launch { listState.animateScrollToItem(0) }
                 },
@@ -375,6 +400,7 @@ fun ChatScreen(
             sessions = sessions.orEmpty(),
             onSearchWorkspace = vm::searchWorkspace,
             onMentionResources = vm::mentionResources,
+            onMentionInsert = vm::registerMentionRef,
         )
     }
     if (modelSheet) {
@@ -409,6 +435,34 @@ fun ChatScreen(
                 queueSheet = false
             },
             onRemove = vm::cancelQueued,
+        )
+    }
+    // A7.4: the capsule's list sheet + the per-agent detail sheet. The
+    // detail resolves live off the store list so output keeps streaming in.
+    if (subagentListOpen) {
+        SubagentListSheet(
+            subagents = subagents,
+            onOpen = { detailSubagentId = it.id },
+            onBackground = { vm.subagentBackground(it.id) },
+            onForeground = { vm.subagentForeground(it.id) },
+            onCancel = { vm.subagentCancel(it.id) },
+            onDismiss = { subagentListOpen = false },
+        )
+    }
+    detailSubagent?.let { agent ->
+        SubagentDetailSheet(
+            agent = agent,
+            // Children surface as separate sessions — the hub routes their
+            // `session/request_permission` to whoever subscribes them.
+            childPendingApproval = sessions.orEmpty()
+                .firstOrNull { it.sessionId == agent.childSessionId }
+                ?.pendingPermission == true,
+            onBackground = { vm.subagentBackground(agent.id) },
+            onForeground = { vm.subagentForeground(agent.id) },
+            onCancel = { vm.subagentCancel(agent.id) },
+            onOpenChild = agent.childSessionId
+                ?.let { sid -> { vm.openChildSession(sid) } },
+            onDismiss = { detailSubagentId = null },
         )
     }
     val context = LocalContext.current

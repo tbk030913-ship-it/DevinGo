@@ -71,6 +71,7 @@ import com.devingo.app.PendingElicitation
 import com.devingo.app.PendingPermission
 import com.devingo.app.QueuedPrompt
 import com.devingo.app.RowKind
+import com.devingo.app.Subagent
 import com.devingo.app.TranscriptModel
 import com.devingo.app.Turn
 import com.devingo.app.TurnTiming
@@ -179,6 +180,12 @@ internal fun Transcript(
     onQuote: (ChatItem) -> Unit,
     /** Plan card's 保存到工作区 — writes the plan as plan.md via the bridge. */
     onSavePlan: (ChatItem) -> Unit,
+    /** A7.4: session subagents + the card/sheet callbacks. */
+    subagents: List<Subagent> = emptyList(),
+    onSubagentOpen: (Subagent) -> Unit = {},
+    onSubagentBackground: (Subagent) -> Unit = {},
+    onSubagentForeground: (Subagent) -> Unit = {},
+    onSubagentCancel: (Subagent) -> Unit = {},
     listState: LazyListState,
     modifier: Modifier = Modifier,
     bottomInset: Dp = 0.dp,
@@ -190,6 +197,18 @@ internal fun Transcript(
     val turnByKey = model.turnByKey
     val lastItemId = model.lastItemId
     val terminalAgentItemIds = model.terminalAgentItemIds
+    // A7.4: subagents render inside their owning turn's work column; one
+    // whose turn was evicted (or never recorded) parks on the latest turn.
+    val latestTurnKey = turnByKey.keys.lastOrNull()
+    val subagentsByTurn = remember(turnByKey, subagents) {
+        if (subagents.isEmpty() || latestTurnKey == null) {
+            emptyMap()
+        } else {
+            subagents.groupBy { s ->
+                if (s.turnId in turnByKey) s.turnId else latestTurnKey
+            }
+        }
+    }
 
     LazyColumn(
         state = listState,
@@ -327,6 +346,11 @@ internal fun Transcript(
                                 onReviewDiff = { path ->
                                     onReviewDiff(turn.key, path)
                                 },
+                                subagents = subagentsByTurn[turn.key].orEmpty(),
+                                onSubagentOpen = onSubagentOpen,
+                                onSubagentBackground = onSubagentBackground,
+                                onSubagentForeground = onSubagentForeground,
+                                onSubagentCancel = onSubagentCancel,
                             )
                         }
                     }
@@ -412,6 +436,11 @@ private fun WorkRow(
     onToggle: () -> Unit,
     onShowDiff: () -> Unit,
     onReviewDiff: (String) -> Unit,
+    subagents: List<Subagent>,
+    onSubagentOpen: (Subagent) -> Unit,
+    onSubagentBackground: (Subagent) -> Unit,
+    onSubagentForeground: (Subagent) -> Unit,
+    onSubagentCancel: (Subagent) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -479,8 +508,9 @@ private fun WorkRow(
             ?.let { compactWorkEntryText(liveThoughtLine(it)) }
             ?.takeIf { it.isNotEmpty() }
     }
-    // t3code ThreadThinkingRow: sent, running, no chunk/tool back yet.
-    val awaitingFirst = live && turn.body.isEmpty()
+    // t3code ThreadThinkingRow: sent, running, no chunk/tool back yet —
+    // a spawned subagent IS activity, so its card pre-empts the shimmer.
+    val awaitingFirst = live && turn.body.isEmpty() && subagents.isEmpty()
 
     val chevronRot by animateFloatAsState(
         targetValue = if (expanded) 90f else 0f,
@@ -630,6 +660,19 @@ private fun WorkRow(
             exit = shrinkVertically() + fadeOut(),
         ) {
             WorkLogColumn(entries = entries, live = live, onReviewDiff = onReviewDiff)
+        }
+        // A7.4: the subagent group sits in the work column but outside the
+        // fold — its own header already summarizes, and burying live agents
+        // behind the turn's fold would hide exactly what it reports.
+        if (subagents.isNotEmpty()) {
+            ThreadSubagentGroupCard(
+                subagents = subagents,
+                onOpen = onSubagentOpen,
+                onBackground = onSubagentBackground,
+                onForeground = onSubagentForeground,
+                onCancel = onSubagentCancel,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp),
+            )
         }
     }
 }

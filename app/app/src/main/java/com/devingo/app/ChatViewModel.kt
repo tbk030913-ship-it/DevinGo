@@ -122,6 +122,13 @@ class ChatViewModel(
     val draftAttachments: StateFlow<List<ImageAttachment>> = bound({ draftAttachments }, emptyList())
     /** The quote pinned to the composer (U5.5 citation workflow). */
     val draftCitation: StateFlow<CitationAttachment?> = bound({ draftCitation }, null)
+    /** The bound session's spawned subagents, live (A7.4). */
+    val subagents: StateFlow<List<Subagent>> = bound({ subagents }, emptyList())
+    /**
+     * Wire-reported `cognition.ai/numLiveSubagents` (-1 = never sent). The
+     * capsule prefers it over the count derived from [subagents].
+     */
+    val numLiveSubagents: StateFlow<Int> = bound({ numLiveSubagents }, -1)
 
     // ---- shared (connection-level) flows -------------------------------------
 
@@ -310,6 +317,28 @@ class ChatViewModel(
         }
     }
 
+    // ---- subagents (A7.4) ------------------------------------------------------
+
+    /** `_cognition.ai/subagent/cancel` on the bound session. */
+    fun subagentCancel(id: String) {
+        store?.subagentCancel(id)
+    }
+
+    /** `_cognition.ai/subagent/background` on the bound session. */
+    fun subagentBackground(id: String) {
+        store?.subagentBackground(id)
+    }
+
+    /** `_cognition.ai/subagent/foreground` on the bound session. */
+    fun subagentForeground(id: String) {
+        store?.subagentForeground(id)
+    }
+
+    /** Open a subagent's child session in place (detail sheet's 打开会话). */
+    fun openChildSession(sessionId: String) {
+        cm.openSession(sessionId, null)
+    }
+
     // ---- drafts (persisted per session) -------------------------------------------
 
     fun setDraft(text: String) {
@@ -342,6 +371,11 @@ class ChatViewModel(
     /** The workspace's file paths for the composer's @file picker (N6.2). */
     suspend fun fetchWorkspaceFiles(): List<String> =
         store?.fetchWorkspaceFiles() ?: emptyList()
+
+    /** A picker-inserted `@{kind}:{ref}` — verbatim ref for the send scan. */
+    fun registerMentionRef(ref: String) {
+        store?.registerMentionRef(ref)
+    }
 
     /** The bridge's fuzzy file+dir search — the @-picker's typed feed (A7.3). */
     suspend fun searchWorkspace(query: String): List<FsSearchItem> =

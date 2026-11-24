@@ -111,6 +111,19 @@ interface AcpEvent {
      * pending question card on its own; drop it without answering.
      */
     data class ElicitationComplete(val elicitationId: Long? = null) : AcpEvent
+    /**
+     * A `tool_call`/`tool_call_update` identified as a Devin subagent (A7.4):
+     * kind `subagent`/`task`, or `_meta` carrying
+     * `cognition.ai/childSessionUrl` / `cognition.ai/sharedSubagentId`. The
+     * call does NOT surface as a transcript tool row — the subagent card
+     * renders it instead.
+     */
+    data class SubagentUpdate(val call: ToolCallInfo) : AcpEvent
+    /**
+     * `cognition.ai/numLiveSubagents` reported on a session/update frame's
+     * `_meta` (params- or update-level).
+     */
+    data class SubagentCount(val count: Int) : AcpEvent
 }
 
 /**
@@ -535,10 +548,6 @@ class AcpClient(
         r.strField("sessionId", "newSessionId", "forkedSessionId")
     }
 
-    /** `session/prompt` while a turn runs — Devin advertises midTurnPrompts. */
-    suspend fun promptMidTurn(sessionId: String, text: String): PromptResult =
-        prompt(sessionId, text)
-
     /** Probe of Devin's `_cognition.ai/session/rename`; failures surface as AcpException. */
     suspend fun renameSession(sessionId: String, title: String) = request(
         AcpMethods.SESSION_RENAME,
@@ -578,7 +587,8 @@ class AcpClient(
             ?: return emptyList()
         return arr.mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
-            val name = o.strField("name", "title", "id", "key", "displayName", "label")
+            // Prefer the human label for display; the machine id stays ref.
+            val name = o.strField("name", "title", "displayName", "label", "id", "key")
                 ?: return@mapNotNull null
             MentionResource(
                 id = o.strField("id", "key", "name", "title") ?: name,
@@ -587,6 +597,32 @@ class AcpClient(
             )
         }
     }
+
+    // ---- subagents (A7.4) ----------------------------------------------------
+    // Devin's `_cognition.ai/subagent/*` control surface — negotiated via
+    // clientCapabilities._meta["cognition.ai/subagentSupport"]. [subagentId]
+    // is the sharedSubagentId when the wire carries one, else the toolCallId.
+
+    /** Stop a running subagent. */
+    suspend fun subagentCancel(sessionId: String, subagentId: String) =
+        subagentAction(AcpMethods.SUBAGENT_CANCEL, sessionId, subagentId)
+
+    /** Move a subagent off the foreground (keeps running). */
+    suspend fun subagentBackground(sessionId: String, subagentId: String) =
+        subagentAction(AcpMethods.SUBAGENT_BACKGROUND, sessionId, subagentId)
+
+    /** Bring a backgrounded subagent back to the foreground. */
+    suspend fun subagentForeground(sessionId: String, subagentId: String) =
+        subagentAction(AcpMethods.SUBAGENT_FOREGROUND, sessionId, subagentId)
+
+    private suspend fun subagentAction(method: String, sessionId: String, subagentId: String) =
+        request(
+            method,
+            buildJsonObject {
+                put("sessionId", sessionId)
+                put("subagentId", subagentId)
+            },
+        )
 
     private fun notify(method: String, params: JsonElement) {
         send(
@@ -815,6 +851,13 @@ class AcpClient(
 
     private fun handleSessionUpdate(params: JsonObject, sessionId: String?, seq: Long) {
         val update = params["update"] as? JsonObject ?: return
+        // Devin reports the live subagent count on a frame's `_meta` (A7.4) —
+        // params- or update-level, whichever carries it.
+        val numLiveSubagents = metaInt(params["_meta"], "cognition.ai/numLiveSubagents")
+            ?: metaInt(update["_meta"], "cognition.ai/numLiveSubagents")
+        if (numLiveSubagents != null) {
+            emit(sessionId, seq, AcpEvent.SubagentCount(numLiveSubagents))
+        }
         when (val kind = update["sessionUpdate"]?.jsonPrimitive?.textOrNull) {
             "agent_message_chunk" -> update.textOfContent()?.let {
                 emit(sessionId, seq, AcpEvent.AgentChunk(it))
@@ -849,11 +892,17 @@ class AcpClient(
                 val info = runCatching {
                     json.decodeFromJsonElement<ToolCallInfo>(update)
                 }.getOrNull() ?: return
-                emit(
-                    sessionId, seq,
-                    if (kind == "tool_call") AcpEvent.ToolCall(info)
-                    else AcpEvent.ToolCallUpdate(info),
-                )
+                when {
+                    // A7.4: subagent calls route to the store's subagent
+                    // list — they never land as transcript tool rows.
+                    isSubagentCall(info) ->
+                        emit(sessionId, seq, AcpEvent.SubagentUpdate(info))
+                    else -> emit(
+                        sessionId, seq,
+                        if (kind == "tool_call") AcpEvent.ToolCall(info)
+                        else AcpEvent.ToolCallUpdate(info),
+                    )
+                }
             }
             "plan" -> {
                 val entries = (update["entries"] as? JsonArray)?.mapNotNull { el ->
@@ -917,6 +966,30 @@ class AcpClient(
         (this["content"] as? JsonObject)?.get("text")?.jsonPrimitive?.textOrNull
             ?: (this["content"] as? JsonPrimitive)?.textOrNull
 
+    /**
+     * A `tool_call` carrying a Devin subagent (A7.4): kind `subagent`/`task`,
+     * `cognition.ai/inferenceToolName` naming a task spawner (Devin's tool
+     * names ride _meta, like `exec`/`kill_shell` do), or `_meta` with
+     * `cognition.ai/childSessionUrl` / `sharedSubagentId` / `childSessionId`.
+     */
+    private fun isSubagentCall(call: ToolCallInfo): Boolean {
+        if (call.kind == "subagent" || call.kind == "task") return true
+        val meta = call._meta ?: return false
+        if (meta["cognition.ai/childSessionUrl"] != null ||
+            meta["cognition.ai/sharedSubagentId"] != null ||
+            meta["cognition.ai/childSessionId"] != null
+        ) {
+            return true
+        }
+        return (meta["cognition.ai/inferenceToolName"] as? JsonPrimitive)
+            ?.textOrNull in SUBAGENT_TOOL_NAMES
+    }
+
+    /** Loose int read on a `_meta` object: number literal or numeric string. */
+    private fun metaInt(meta: JsonElement?, key: String): Int? =
+        ((meta as? JsonObject)?.get(key) as? JsonPrimitive)
+            ?.let { it.longOrNull?.toInt() ?: it.doubleOrNull?.toInt() ?: it.textOrNull?.toIntOrNull() }
+
     private fun failAll(reason: String, emitEvent: Boolean = true) {
         // Claim each deferred with an atomic remove — a put() racing a
         // values() snapshot + clear() could strand it uncompleted forever.
@@ -951,6 +1024,10 @@ class AcpClient(
             put("cognition.ai/sessionRename", true)
             put("cognition.ai/sessionShare", true)
         }
+
+        /** `inferenceToolName` values that spawn a subagent (A7.4). */
+        private val SUBAGENT_TOOL_NAMES =
+            setOf("task", "subagent", "spawn_subagent", "spawn_agent")
     }
 }
 

@@ -1332,6 +1332,7 @@ class ConnectionManager private constructor(private val app: Application) {
     private fun AcpEvent.marksUnread(): Boolean = when (this) {
         is AcpEvent.AgentChunk, is AcpEvent.UserChunk, is AcpEvent.ThoughtChunk,
         is AcpEvent.ToolCall, is AcpEvent.ToolCallUpdate, is AcpEvent.PlanUpdate,
+        is AcpEvent.SubagentUpdate,
         is AcpEvent.SessionTitle, is AcpEvent.Failure, is AcpEvent.RemoteTurnEnd -> true
         else -> false
     }

@@ -375,6 +375,12 @@ object AcpMethods {
     const val SKILLS_LIST = "_cognition.ai/skills/list"
     const val PLANS_LIST = "_cognition.ai/plans/list"
 
+    // Devin subagent control surface (A7.4) — negotiated via
+    // clientCapabilities._meta["cognition.ai/subagentSupport"].
+    const val SUBAGENT_CANCEL = "_cognition.ai/subagent/cancel"
+    const val SUBAGENT_BACKGROUND = "_cognition.ai/subagent/background"
+    const val SUBAGENT_FOREGROUND = "_cognition.ai/subagent/foreground"
+
     // Devin revert extension (negotiated via clientCapabilities._meta).
     const val REVERT_LIST_STEPS = "_cognition.ai/revert/listSteps"
     const val REVERT_FORK_FROM_STEP = "_cognition.ai/revert/forkFromStep"

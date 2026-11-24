@@ -23,6 +23,7 @@ import com.devingo.app.acp.SessionMode
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.SessionNewResult
 import com.devingo.app.acp.ToolCallInfo
+import com.devingo.app.acp.strField
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -132,14 +133,19 @@ class SessionStore(
         /** Default workspace path the plan card's 保存到工作区 writes. */
         const val PLAN_FILE_NAME = "plan.md"
         /**
-         * `@{kind}:{ref}` send-time scanner — the same kind vocabulary as
-         * the UI chip regex in ContextChips (A7.3).
+         * `@{kind}:` send-time scanner — the same kind vocabulary as the
+         * UI chip regex in ContextChips (A7.3). The ref itself is resolved
+         * per-match: registered picker refs can contain spaces; a typed
+         * mention stays one whitespace-free word.
          */
         val SEND_MENTION_TOKEN = Regex(
             "@(file|folder|directory|rule|skill|plan|session|conversation|git|" +
                 "codemap|url|image|doc|symbol|task|terminal|web|issue|" +
-                "pull-request|review-comment):\\S*",
+                "pull-request|review-comment):",
         )
+
+        /** Bare `@token` candidates inside a text segment (N6.2). */
+        val BARE_MENTION_TOKEN = Regex("@\\S+")
         /** ACP `tool_call.kind` values — the vocabulary toolKind is normalized to. */
         val ACP_TOOL_KINDS = setOf(
             "read", "edit", "delete", "move", "search",
@@ -229,6 +235,21 @@ class SessionStore(
     /** Turn start/end keyed on the user message's item id. */
     private val _turnTimes = MutableStateFlow<Map<Long, TurnTiming>>(emptyMap())
     val turnTimes = _turnTimes.asStateFlow()
+
+    // ---- subagents (A7.4) ------------------------------------------------
+    // task/subagent tool calls never become transcript items — they live
+    // here and feed the work-log card, the capsule count and the sheets.
+
+    /** Live view of the session's spawned subagents, spawn order kept. */
+    private val _subagents = MutableStateFlow<List<Subagent>>(emptyList())
+    val subagents = _subagents.asStateFlow()
+
+    /**
+     * Wire-reported `cognition.ai/numLiveSubagents`; -1 until first report.
+     * The capsule prefers it over the locally-derived live count.
+     */
+    private val _numLiveSubagents = MutableStateFlow(-1)
+    val numLiveSubagents = _numLiveSubagents.asStateFlow()
 
     /** Composer drafts survive switching away and back. */
     private val _draft = MutableStateFlow("")
@@ -604,6 +625,10 @@ class SessionStore(
             consumedSeqs.clear()
         }
         liveSeqFloor = 0
+        // The load replay re-delivers every subagent tool call — start the
+        // list fresh so it rebuilds against the new transcript's turn ids.
+        _subagents.value = emptyList()
+        _numLiveSubagents.value = -1
         preLoadUserIds = currentMessages.filter { it.kind == Kind.User }.map { it.id }
         staged = mutableListOf()
     }
@@ -731,23 +756,38 @@ class SessionStore(
             is AcpEvent.ToolCall -> {
                 promptAcked = true
                 if (isLive(seq)) remoteTurnActivity()
-                val detail = toolDetailOf(ev.call)
-                append(
-                    Kind.Tool,
-                    toolTitleOf(ev.call) ?: ev.call.kind ?: "tool call",
-                    status = ev.call.status ?: "pending",
-                    toolCallId = ev.call.toolCallId,
-                    toolKind = toolKindOf(ev.call),
-                    detail = detail?.text,
-                    detailTruncated = detail?.headTruncated == true,
-                    exitCode = exitCodeOf(ev.call),
-                )
+                if (_subagents.value.any { it.toolCallId == ev.call.toolCallId }) {
+                    // Known subagent call re-delivered without its meta —
+                    // fold into the subagent list, never the transcript.
+                    upsertSubagent(ev.call)
+                } else {
+                    val detail = toolDetailOf(ev.call)
+                    append(
+                        Kind.Tool,
+                        toolTitleOf(ev.call) ?: ev.call.kind ?: "tool call",
+                        status = ev.call.status ?: "pending",
+                        toolCallId = ev.call.toolCallId,
+                        toolKind = toolKindOf(ev.call),
+                        detail = detail?.text,
+                        detailTruncated = detail?.headTruncated == true,
+                        exitCode = exitCodeOf(ev.call),
+                    )
+                }
             }
             is AcpEvent.ToolCallUpdate -> {
                 promptAcked = true
                 if (isLive(seq)) remoteTurnActivity()
                 updateTool(ev.call)
             }
+            is AcpEvent.SubagentUpdate -> {
+                promptAcked = true
+                if (isLive(seq)) remoteTurnActivity()
+                // A call first classified as a plain tool left a transcript
+                // row behind — pull it now that it's known to be a subagent.
+                removeToolRow(ev.call.toolCallId)
+                upsertSubagent(ev.call)
+            }
+            is AcpEvent.SubagentCount -> _numLiveSubagents.value = ev.count
             is AcpEvent.PlanUpdate -> {
                 promptAcked = true
                 if (isLive(seq)) remoteTurnActivity()
@@ -829,6 +869,134 @@ class SessionStore(
                 } else {
                     it
                 }
+            }
+        }
+    }
+
+    // ---- subagents (A7.4) ------------------------------------------------------
+
+    /**
+     * Upsert a `subagent`/`task` tool call into [_subagents]. Spawn order is
+     * kept; terminal updates freeze [Subagent.result] and [Subagent.endedAt].
+     */
+    private fun upsertSubagent(call: ToolCallInfo) {
+        val id = subagentMetaStr(call, "cognition.ai/sharedSubagentId")
+            ?: call.toolCallId
+        val status = normalizeSubagentStatus(
+            subagentMetaStr(call, "cognition.ai/agentStatus") ?: call.status,
+        )
+        val prompt = subagentPromptOf(call)
+        // Progress rides _meta when the wire sends it, else the call's
+        // content blocks carry the output text.
+        val detail = subagentMetaStr(call, "cognition.ai/progress")
+            ?: toolDetailOf(call)?.text
+        val terminal = status == "completed" || status == "failed" ||
+            status == "stopped"
+        val now = System.currentTimeMillis()
+        _subagents.update { list ->
+            // Frames disagree on whether they carry sharedSubagentId — match
+            // the stable toolCallId too or the entry would fork in two.
+            val idx = list.indexOfFirst {
+                it.id == id || it.toolCallId == call.toolCallId
+            }
+            val old = list.getOrNull(idx)
+            val next = Subagent(
+                id = old?.id ?: id,
+                toolCallId = call.toolCallId,
+                title = call.title?.subagentDisplayTitle() ?: old?.title
+                    ?: prompt?.lineSequence()?.firstOrNull()?.take(80)
+                    ?: "子代理",
+                status = status ?: old?.status ?: "pending",
+                prompt = prompt ?: old?.prompt,
+                detail = detail ?: old?.detail,
+                result = if (terminal) detail ?: old?.detail ?: old?.result
+                else old?.result,
+                startedAt = old?.startedAt ?: now,
+                endedAt = if (terminal) old?.endedAt?.takeIf { it > 0 } ?: now
+                else 0L,
+                childSessionId = subagentChildSessionId(call)
+                    ?: old?.childSessionId,
+                childSessionUrl = subagentMetaStr(
+                    call, "cognition.ai/childSessionUrl",
+                ) ?: old?.childSessionUrl,
+                turnId = old?.turnId
+                    ?: currentMessages.lastOrNull { it.kind == Kind.User }?.id
+                    ?: 0L,
+            )
+            if (idx < 0) list + next
+            else list.toMutableList().apply { set(idx, next) }
+        }
+    }
+
+    /**
+     * `_meta[key]` as a string — a bare primitive, or an object whose
+     * `status`/`state`/`id`/`url`/`sessionId` member carries the value.
+     */
+    private fun subagentMetaStr(call: ToolCallInfo, key: String): String? =
+        when (val v = call._meta?.get(key)) {
+            is JsonPrimitive -> v.content.takeIf { it.isNotBlank() && it != "null" }
+            is JsonObject -> v.strField("status", "state", "id", "url", "sessionId")
+            else -> null
+        }
+
+    /** `cognition.ai/childSessionId`, else the childSessionUrl's tail. */
+    private fun subagentChildSessionId(call: ToolCallInfo): String? =
+        subagentMetaStr(call, "cognition.ai/childSessionId")
+            ?: subagentMetaStr(call, "cognition.ai/childSessionUrl")
+                ?.substringAfterLast('/')
+                ?.takeIf { it.isNotBlank() }
+
+    /** The task prompt out of `rawInput` (Task-style calls carry `prompt`). */
+    private fun subagentPromptOf(call: ToolCallInfo): String? =
+        (call.rawInput as? JsonObject)
+            ?.strField("prompt", "instruction", "task", "description", "input")
+            ?.takeIf { it.isNotBlank() }
+
+    /** t3's `formatSubagentDisplayTitle`: drop the "Subagent:" prefix. */
+    private fun String.subagentDisplayTitle(): String =
+        replace(Regex("^Subagent:\\s*", RegexOption.IGNORE_CASE), "")
+
+    /**
+     * Wire status onto pending/working/background/completed/failed/stopped —
+     * covers both ACP tool_call statuses (pending/in_progress/completed/
+     * failed) and Devin's richer `agentStatus` vocabulary.
+     */
+    private fun normalizeSubagentStatus(raw: String?): String? =
+        when (raw?.lowercase()) {
+            null -> null
+            "in_progress", "running", "working", "active",
+            "waiting", "idle", "foreground" -> "working"
+            "background", "backgrounded" -> "background"
+            "completed", "complete", "done", "finished",
+            "success", "succeeded" -> "completed"
+            "failed", "error", "errored" -> "failed"
+            "cancelled", "canceled", "stopped", "interrupted", "killed" -> "stopped"
+            else -> "pending"
+        }
+
+    /** `_cognition.ai/subagent/cancel` — stop a live subagent. */
+    fun subagentCancel(id: String) =
+        subagentAction(id) { client.subagentCancel(sessionId, it) }
+
+    /** `_cognition.ai/subagent/background` — move off the foreground. */
+    fun subagentBackground(id: String) =
+        subagentAction(id) { client.subagentBackground(sessionId, it) }
+
+    /** `_cognition.ai/subagent/foreground` — bring back to the foreground. */
+    fun subagentForeground(id: String) =
+        subagentAction(id) { client.subagentForeground(sessionId, it) }
+
+    private fun subagentAction(
+        subagentId: String,
+        call: suspend (String) -> Unit,
+    ) {
+        scope.launch {
+            try {
+                call(subagentId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                append(Kind.Error, "子代理操作失败: ${e.display()}")
             }
         }
     }
@@ -1031,6 +1199,17 @@ class SessionStore(
         }
     }
 
+    /**
+     * Refs the @-picker inserted — `@{kind}:` + a ref that may contain
+     * spaces can't be re-derived from the draft text at send time.
+     */
+    private val mentionRefHints = HashSet<String>()
+
+    /** The picker inserted `@{kind}:{ref}` — remember the verbatim ref. */
+    fun registerMentionRef(ref: String) {
+        mentionRefHints += ref
+    }
+
     /** Interrupt the running turn with a new instruction right now. */
     fun steer(text: String) {
         val trimmed = text.trimEnd()
@@ -1047,7 +1226,14 @@ class SessionStore(
         promptAcked = true // the turn is live; a steer failure isn't a lost echo
         steerJob = scope.launch {
             try {
-                reportStopReason(client.promptMidTurn(sessionId, merged).stopReason)
+                // Same block assembly as send — @-mentions steer as
+                // resource_links, not literal tokens.
+                reportStopReason(
+                    client.promptBlocks(
+                        sessionId,
+                        buildBlocks(merged, emptyList()),
+                    ).stopReason,
+                )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1315,30 +1501,42 @@ class SessionStore(
             }
         }
         // Bare-@path pass over one text segment (N6.2): a post-whitespace
-        // `@token` that looks path-ish becomes a file resource_link.
+        // `@token` that looks path-ish becomes a file resource_link. Text
+        // between tokens copies verbatim — newlines and indentation in the
+        // prompt survive.
         fun bareMentions(seg: String) {
-            seg.split(Regex("\\s+")).filter { it.isNotEmpty() }.forEach { tok ->
-                val m = tok.removePrefix("@")
-                val looksLikePath = tok.startsWith("@") && !m.contains(':') &&
-                    (m.contains('/') || m.contains('\\') || m.contains('.'))
-                if (looksLikePath) {
-                    flushText()
-                    blocks += ContentBlock(type = "resource_link", uri = fileUri(m), name = m)
-                } else {
-                    buf.append(tok).append(' ')
-                }
+            var cur = 0
+            for (match in BARE_MENTION_TOKEN.findAll(seg)) {
+                if (match.range.first > 0 && !seg[match.range.first - 1].isWhitespace()) continue
+                val ref = match.value.substring(1).trimMentionTail()
+                val looksLikePath = ref.isNotEmpty() && !ref.contains(':') &&
+                    (ref.contains('/') || ref.contains('\\') || ref.contains('.'))
+                if (!looksLikePath) continue
+                buf.append(seg, cur, match.range.first)
+                flushText()
+                blocks += ContentBlock(type = "resource_link", uri = fileUri(ref), name = ref)
+                cur = match.range.last + 1
             }
+            buf.append(seg, cur, seg.length)
         }
         var cursor = 0
         for (match in SEND_MENTION_TOKEN.findAll(text)) {
             // A mid-word `@` (emails, handles) is not a mention token.
             if (match.range.first > 0 && !text[match.range.first - 1].isWhitespace()) continue
             val kind = match.groupValues[1]
-            val ref = match.value.substring(kind.length + 2)
+            val refStart = match.range.last + 1
+            // A picker-inserted ref can hold spaces — a registered ref wins;
+            // a typed mention stays one whitespace-free word.
+            val ref = mentionRefHints.asSequence()
+                .filter { text.startsWith(it, refStart) }
+                .maxByOrNull { it.length }
+                ?: text.substring(refStart)
+                    .takeWhile { !it.isWhitespace() }
+                    .trimMentionTail()
             if (ref.isEmpty()) continue
             bareMentions(text.substring(cursor, match.range.first))
-            blocks += mentionBlock(kind, ref, match.value)
-            cursor = match.range.last + 1
+            blocks += mentionBlock(kind, ref, "@$kind:$ref")
+            cursor = refStart + ref.length
         }
         bareMentions(text.substring(cursor))
         flushText()
@@ -1392,6 +1590,10 @@ class SessionStore(
         val path = rel.replace('\\', '/').trimStart('/')
         return "file:///$base/$path"
     }
+
+    /** Trailing sentence punctuation isn't part of a mention ref. */
+    private fun String.trimMentionTail(): String =
+        trimEnd(*",;:!?)]}'\"".toCharArray())
 
     /** Non-`end_turn` stop reasons get a visible system line. */
     private fun reportStopReason(stopReason: String?) {
@@ -1936,7 +2138,24 @@ class SessionStore(
         }
     }
 
+    /** A call reclassified as a subagent mid-flight leaves its row behind. */
+    private fun removeToolRow(toolCallId: String) {
+        mutateMessages { list ->
+            if (list.none { it.toolCallId == toolCallId }) {
+                list
+            } else {
+                list.filterNot { it.toolCallId == toolCallId }
+            }
+        }
+    }
+
     private fun updateTool(call: ToolCallInfo) {
+        // A subagent call can lose its kind/_meta on later updates — keep
+        // routing it to the subagent list instead of surfacing a stray row.
+        if (_subagents.value.any { it.toolCallId == call.toolCallId }) {
+            upsertSubagent(call)
+            return
+        }
         mutateMessages { list ->
             val idx = list.indexOfLast { it.toolCallId == call.toolCallId }
             if (idx < 0) {
