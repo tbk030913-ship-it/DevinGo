@@ -850,7 +850,10 @@ class ConnectionManager private constructor(private val app: Application) {
                 }
             }
             launch {
-                store.pendingPermissionCount.collect { n ->
+                combine(
+                    store.pendingPermissionCount,
+                    store.pendingElicitationCount,
+                ) { p, e -> p + e }.collect { n ->
                     _permissionCounts.update {
                         if (n == 0) it - store.sessionId else it + (store.sessionId to n)
                     }

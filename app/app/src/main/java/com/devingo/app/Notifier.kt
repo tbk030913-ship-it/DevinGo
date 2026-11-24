@@ -74,13 +74,17 @@ class Notifier(context: Context) {
             !(AppVisibility.isForeground && AppVisibility.chatVisible &&
                 AppVisibility.chatSessionId == sessionId)
 
-    /** The agent is blocked on a permission decision. */
-    fun notifyPermissionPending(title: String, sessionId: String? = null) {
+    /** The agent is blocked on a permission decision (or a question). */
+    fun notifyPermissionPending(
+        title: String,
+        sessionId: String? = null,
+        headline: String = "DevinGo 需要授权",
+    ) {
         if (!prefs.notifyPermission || !shouldPost(sessionId)) return
         post(
             channelId = CHANNEL_PERMISSION,
             id = ID_PERMISSION,
-            title = "DevinGo 需要授权",
+            title = headline,
             text = title.ifBlank { "Devin 请求执行操作" },
             priority = NotificationCompat.PRIORITY_HIGH,
             sessionId = sessionId,

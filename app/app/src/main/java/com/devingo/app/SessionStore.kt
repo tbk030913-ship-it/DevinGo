@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -1516,7 +1517,11 @@ class SessionStore(
         val entry = ElicEntry(req, pending)
         synchronized(requestLock) { openElicitations[requestId] = entry }
         pushElicitation(pending)
-        notifier.notifyPermissionPending("Devin 有问题需要你回答", sessionId)
+        notifier.notifyPermissionPending(
+            "Devin 有问题需要你回答",
+            sessionId,
+            headline = "DevinGo 需要回答",
+        )
         val reply = choice.await()
         popElicitation(pending)
         synchronized(requestLock) { openElicitations.remove(requestId, entry) }
@@ -1526,16 +1531,20 @@ class SessionStore(
             entry.req.respond(buildJsonObject { put("action", "cancel") })
         } else {
             if (reply.lines.isNotEmpty()) {
-                append(
-                    Kind.Answered,
-                    text = if (reply.lines.size == 1) {
-                        "已回答 · ${reply.lines.first()}"
-                    } else {
-                        "已回答 ${reply.lines.size} 个问题"
-                    },
-                    detail = reply.lines.joinToString("\n")
-                        .takeIf { reply.lines.size > 1 },
-                )
+                // choice.await() resumed on the client dispatcher — hop
+                // onto the store scope before touching the transcript.
+                withContext(scope.coroutineContext) {
+                    append(
+                        Kind.Answered,
+                        text = if (reply.lines.size == 1) {
+                            "已回答 · ${reply.lines.first()}"
+                        } else {
+                            "已回答 ${reply.lines.size} 个问题"
+                        },
+                        detail = reply.lines.joinToString("\n")
+                            .takeIf { reply.lines.size > 1 },
+                    )
+                }
             }
             entry.req.respond(
                 buildJsonObject {

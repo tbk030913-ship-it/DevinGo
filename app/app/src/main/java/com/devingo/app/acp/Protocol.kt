@@ -27,9 +27,9 @@ data class ClientCapabilities(
     val fs: FsCapabilities = FsCapabilities(),
     val terminal: Boolean = false,
     /**
-     * ACP elicitation capability, serialized as an empty object — the app
-     * hosts no elicitation UI, but devin reads the full declared capability
-     * set when deciding what `agentCapabilities._meta` to echo.
+     * ACP elicitation capability, serialized as an empty object — backed
+     * by the A7.2 `PendingUserInputCard`; devin reads the full declared
+     * capability set when deciding what `agentCapabilities._meta` to echo.
      */
     val elicitation: JsonObject = JsonObject(emptyMap()),
     /**

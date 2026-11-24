@@ -492,10 +492,8 @@ private fun toggleOption(
     }
     draft.copy(selected = sel, custom = "")
 } else {
-    draft.copy(
-        selected = if (wireValue in draft.selected) emptyList() else listOf(wireValue),
-        custom = "",
-    )
+    // Single-select stays sticky on re-tap (t3 pendingUserInput parity).
+    draft.copy(selected = listOf(wireValue), custom = "")
 }
 
 /** Typing a non-blank custom answer drops the option selection. */
