@@ -1585,6 +1585,7 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64,
 	if s.earliestSeq() > afterSeq+1 || afterSeq >= s.nextSeq {
 		h.deliverLocked(c, resultFrameRaw(id, mustJSON(map[string]any{
 			"sessionId": sid, "needLoad": true, "lastSeq": s.nextSeq - 1,
+			"running": s.running > 0,
 		})))
 		return
 	}
@@ -1598,6 +1599,7 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64,
 	if len(s.lastInfo) == 0 && s.loaders[c] == 0 {
 		h.deliverLocked(c, resultFrameRaw(id, mustJSON(map[string]any{
 			"sessionId": sid, "needLoad": true, "lastSeq": s.nextSeq - 1,
+			"running": s.running > 0,
 		})))
 		return
 	}

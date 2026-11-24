@@ -424,7 +424,7 @@ private fun StatusLine(
         AnimatedContent(
             targetState = text,
             transitionSpec = {
-                (fadeIn(tween(150)) togetherWith fadeOut(tween(100)))
+                (fadeIn(tween(FADE_IN_MS)) togetherWith fadeOut(tween(FADE_OUT_MS)))
             },
             label = "statusText",
         ) { t ->
@@ -514,10 +514,17 @@ private fun WorkRow(
             elapsed = ((System.currentTimeMillis() - startedAt) / 1000).toInt()
         }
     }
-    val currentStep = items.lastOrNull {
+    // t3code liveToolActivitySummary: the label IS the current activity —
+    // the in-progress tool's action verbatim; between tools the agent is
+    // never "idle", so fall through to thinking/replying instead of a
+    // blank line (a missing row reads as frozen).
+    val lastTool = items.lastOrNull {
         it.kind == Kind.Tool && it.status == "in_progress"
-    }?.text?.takeIf { it.isNotBlank() }
-        ?: if (items.any { it.kind == Kind.Thought }) "思考中" else null
+    }
+    val currentStep = lastTool?.text?.takeIf { it.isNotBlank() }
+        ?: if (live && (items.any { it.kind == Kind.Thought } ||
+                items.lastOrNull()?.kind == Kind.Agent || items.isEmpty())
+        ) "思考中" else null
 
     // t3code's exposed thought: the newest non-empty reasoning, flattened
     // to one compacted line — while the turn is live, and afterwards while
@@ -536,7 +543,7 @@ private fun WorkRow(
 
     val chevronRot by animateFloatAsState(
         targetValue = if (expanded) 90f else 0f,
-        animationSpec = tween(200),
+        animationSpec = tween(DISCLOSURE_MS),
         label = "workChevron",
     )
     Column(
@@ -632,8 +639,10 @@ private fun WorkRow(
                     )
                 } else {
                     Text(
-                        timing?.durationSec?.let { workDurationLabel(it) }
-                            ?: "查看过程 · ${items.size} 步",
+                        // t3code "Worked for Xs · N steps" — both when known.
+                        timing?.durationSec?.let {
+                            workDurationLabel(it) + " · ${items.size} 步"
+                        } ?: "查看过程 · ${items.size} 步",
                         style = MaterialTheme.typography.labelLarge,
                         color = cs.onSurfaceVariant,
                         maxLines = 1,
@@ -655,31 +664,36 @@ private fun WorkRow(
             }
         }
         if (live && currentStep != null) {
-            val isExec = items.lastOrNull {
-                it.kind == Kind.Tool && it.status == "in_progress"
-            }?.toolKind == "execute"
+            val isExec = lastTool?.toolKind == "execute"
             AnimatedContent(
                 targetState = currentStep,
                 transitionSpec = {
-                    fadeIn(tween(150)) togetherWith fadeOut(tween(100))
+                    fadeIn(tween(FADE_IN_MS)) togetherWith fadeOut(tween(FADE_OUT_MS))
                 },
                 label = "workStep",
             ) { step ->
                 Text(
+                    // The activity line IS the live label (t3code's
+                    // collapsed tool-group row): same weight as the header,
+                    // the sweep makes liveness legible without a tap.
                     step,
-                    style = (if (isExec) monoText(MaterialTheme.typography.bodySmall)
-                    else MaterialTheme.typography.bodySmall),
-                    color = cs.outline,
+                    style = (if (isExec) monoText(MaterialTheme.typography.labelLarge)
+                    else MaterialTheme.typography.labelLarge),
+                    color = cs.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(start = 20.dp),
+                    modifier = Modifier
+                        .padding(start = 20.dp)
+                        .steppedShimmer(),
                 )
             }
         }
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
+            enter = expandVertically(tween(DISCLOSURE_MS)) +
+                fadeIn(tween(FADE_IN_MS)),
+            exit = shrinkVertically(tween(DISCLOSURE_MS)) +
+                fadeOut(tween(FADE_OUT_MS)),
         ) {
             WorkLogColumn(entries = entries, live = live, onReviewDiff = onReviewDiff)
         }
@@ -750,7 +764,16 @@ private fun TurnDiffStatPill(
 
 // ---- fresh-only entry motion -----------------------------------------------------
 
-private const val FRESH_ENTRY_WINDOW_MS = 2_000L
+// ---- motion tokens (t3code's motion.ts values) ---------------------------------
+// One language for the whole transcript: disclosure/layout changes run
+// DISCLOSURE_MS; content swaps run FADE_IN/OUT; row entrances run
+// ENTRY_ANIM_MS but only while the item is younger than
+// FRESH_ENTRY_WINDOW_MS (t3code isFreshTimestamp — replays and LazyColumn
+// reuse compose at rest, no re-animated old rows).
+private const val DISCLOSURE_MS = 180
+private const val FADE_IN_MS = 140
+private const val FADE_OUT_MS = 120
+private const val FRESH_ENTRY_WINDOW_MS = 3_000L
 private const val ENTRY_ANIM_MS = 220
 private val ENTRY_RISE = 25.dp
 

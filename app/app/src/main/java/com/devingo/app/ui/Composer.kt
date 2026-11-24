@@ -714,6 +714,20 @@ private fun ComposerSendArea(
     onStop: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
+    // t3code "Stopping" affordance: after the tap the stop button greys and
+    // goes inert until the turn actually drops (running → false) or a 10s
+    // cap returns it — cancel can't be double-fired and dead-stop reads as
+    // an action, not a broken button.
+    var stopping by remember { mutableStateOf(false) }
+    LaunchedEffect(running) {
+        if (!running) stopping = false
+    }
+    LaunchedEffect(stopping) {
+        if (stopping) {
+            kotlinx.coroutines.delay(10_000)
+            stopping = false
+        }
+    }
     // Trailing black circle: 48dp touch box around a 36dp visual.
     Box(
         Modifier
@@ -725,7 +739,10 @@ private fun ComposerSendArea(
             onClick = {
                 when (sendState) {
                     SendState.Disabled -> Unit
-                    SendState.Stop -> onStop()
+                    SendState.Stop -> {
+                        stopping = true
+                        onStop()
+                    }
                     SendState.Send -> when {
                         queueEditing -> onSend()
                         running && !shellCommand -> onSendMenuChange(true)
@@ -733,7 +750,7 @@ private fun ComposerSendArea(
                     }
                 }
             },
-            enabled = sendState != SendState.Disabled,
+            enabled = sendState != SendState.Disabled && !stopping,
             shape = CircleShape,
             color = Color.Transparent,
             modifier = Modifier.size(48.dp),
@@ -746,7 +763,7 @@ private fun ComposerSendArea(
             ) {
                 Surface(
                     shape = CircleShape,
-                    color = if (sendState == SendState.Disabled) {
+                    color = if (sendState == SendState.Disabled || stopping) {
                         DevinGoColors.disabledButton
                     } else {
                         cs.primary
