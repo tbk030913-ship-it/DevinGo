@@ -4,8 +4,10 @@ import android.widget.Toast
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -63,6 +65,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.SessionBadge
 import com.devingo.app.acp.AcpSession
+import com.devingo.app.acp.AgentType
 import com.devingo.app.ui.theme.DevinGoColors
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
@@ -381,7 +384,10 @@ private fun SessionMetaLine(s: AcpSession, lastSession: Boolean, badge: SessionB
 
 // ---- bottom bar -----------------------------------------------------------------------
 
-/** Filter/sort button + "新建会话" pill floating over the session list. */
+/** Filter/sort button + "新建会话" pill floating over the session list.
+ *  Long-pressing the pill opens the W8.3 agent-mode menu — each non-default
+ *  mode spawns the session on a dedicated `devin acp` process. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun HomeBottomBar(
     busy: Boolean,
@@ -395,8 +401,9 @@ internal fun HomeBottomBar(
     onSort: (HomeSort) -> Unit,
     onHideEmpty: (Boolean) -> Unit,
     onCompact: (Boolean) -> Unit,
-    onNewSession: () -> Unit,
+    onNewSession: (AgentType) -> Unit,
     newSessionLoading: Boolean,
+    agentTypesSupported: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -488,48 +495,97 @@ internal fun HomeBottomBar(
             }
         }
         Spacer(Modifier.weight(1f))
-        Surface(
-            onClick = onNewSession,
-            enabled = configured && !newSessionLoading,
-            modifier = Modifier.height(48.dp),
-            shape = CircleShape,
-            color = if (configured && !newSessionLoading) {
-                cs.primary
-            } else {
-                DevinGoColors.disabledButton
-            },
-        ) {
-            Row(
-                Modifier.padding(horizontal = 20.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (newSessionLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp,
-                        color = cs.onPrimary,
-                    )
+        Box {
+            var agentMenu by remember { mutableStateOf(false) }
+            val pillEnabled = configured && !newSessionLoading
+            Surface(
+                modifier = Modifier
+                    .height(48.dp)
+                    .combinedClickable(
+                        enabled = pillEnabled,
+                        onClick = { onNewSession(AgentType.Default) },
+                        onLongClick = { agentMenu = true },
+                    ),
+                shape = CircleShape,
+                color = if (pillEnabled) {
+                    cs.primary
                 } else {
+                    DevinGoColors.disabledButton
+                },
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (newSessionLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = cs.onPrimary,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Add, null,
+                            modifier = Modifier.size(18.dp),
+                            tint = cs.onPrimary,
+                        )
+                    }
+                    Text(
+                        if (newSessionLoading && statusText.isNotBlank()) {
+                            statusText.take(12)
+                        } else {
+                            "新建会话"
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (configured) cs.onPrimary else cs.onSurfaceVariant,
+                        maxLines = 1,
+                    )
                     Icon(
-                        Icons.Filled.Add, null,
-                        modifier = Modifier.size(18.dp),
-                        tint = cs.onPrimary,
+                        Icons.Filled.KeyboardArrowDown, "选择专项模式",
+                        modifier = Modifier.size(14.dp),
+                        tint = if (configured) {
+                            cs.onPrimary.copy(alpha = 0.7f)
+                        } else {
+                            cs.onSurfaceVariant
+                        },
                     )
                 }
-                Text(
-                    if (newSessionLoading && statusText.isNotBlank()) {
-                        statusText.take(12)
-                    } else {
-                        "新建会话"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (configured) cs.onPrimary else cs.onSurfaceVariant,
-                    maxLines = 1,
-                )
+            }
+            DevinMenu(
+                expanded = agentMenu,
+                onDismissRequest = { agentMenu = false },
+            ) {
+                if (!agentTypesSupported) {
+                    DevinMenuItem(
+                        "专项 Agent 模式",
+                        subtitle = "bridge 版本过旧，请升级",
+                        enabled = false,
+                        onClick = {},
+                    )
+                } else {
+                    AgentType.entries.forEach { t ->
+                        DevinMenuItem(
+                            agentTypeLabel(t),
+                            subtitle = t.wire,
+                            onClick = {
+                                agentMenu = false
+                                onNewSession(t)
+                            },
+                        )
+                    }
+                }
             }
         }
     }
+}
+
+/** W8.3 agent-mode menu labels (spec-mandated emoji + name). */
+private fun agentTypeLabel(t: AgentType) = when (t) {
+    AgentType.Default -> "💻 编码"
+    AgentType.Review -> "🔍 代码审查"
+    AgentType.Codemap -> "🗺️ 代码地图"
+    AgentType.Summarizer -> "📝 会话总结"
 }
 
 // ---- misc -----------------------------------------------------------------------------

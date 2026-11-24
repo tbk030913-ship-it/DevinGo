@@ -201,6 +201,11 @@ fun SettingsScreen(
                 subtitle = masked(prefs.apiKey),
                 onClick = { editField = EditField.ApiKey },
             )
+            SettingRow(
+                "策略拒答回退模型",
+                subtitle = prefs.refusalFallbackModel.ifBlank { "未设置 · 主模型被拒答时不降级" },
+                onClick = { editField = EditField.RefusalFallback },
+            )
 
             // ---- Tailscale ----------------------------------------------------------
             SectionHeader("Tailscale", Modifier.padding(start = 20.dp))
@@ -514,7 +519,7 @@ fun SettingsScreen(
 private fun masked(value: String): String =
     if (value.isBlank()) "未设置" else "••••••••"
 
-private enum class EditField { Host, Token, Cwd, ApiKey }
+private enum class EditField { Host, Token, Cwd, ApiKey, RefusalFallback }
 
 /** Single-field editor sheet; secrets get a visibility toggle. */
 @Composable
@@ -526,6 +531,11 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
         EditField.Token -> Triple("Token", prefs.token, true)
         EditField.Cwd -> Triple("默认工作目录", prefs.cwd, false)
         EditField.ApiKey -> Triple("Devin API Key", prefs.apiKey, true)
+        EditField.RefusalFallback -> Triple(
+            "策略拒答回退模型（如 opus）",
+            prefs.refusalFallbackModel,
+            false,
+        )
     }
     var value by remember(field) { mutableStateOf(initial) }
     var showSecret by remember { mutableStateOf(false) }
@@ -575,6 +585,7 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
                     EditField.Token -> prefs.token = value.trim()
                     EditField.Cwd -> prefs.cwd = value.trim()
                     EditField.ApiKey -> prefs.apiKey = value.trim()
+                    EditField.RefusalFallback -> prefs.refusalFallbackModel = value.trim()
                 }
                 onDismiss()
             },

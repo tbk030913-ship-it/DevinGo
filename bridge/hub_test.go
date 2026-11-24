@@ -80,6 +80,16 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if stats != "" {
+		// A boot record per spawn: argv + the refusal-fallback env — the
+		// spawn-profile test (W8.3) asserts a profiled proc was launched
+		// with exactly these.
+		if f, err := os.OpenFile(stats, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			f.WriteString("BOOT " + strings.Join(os.Args[1:], " ") +
+				" ENV_FB=" + os.Getenv("DEVIN_REFUSAL_FALLBACK") + "\n")
+			f.Close()
+		}
+	}
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 64<<10), 16<<20)
 	for sc.Scan() {
@@ -194,9 +204,12 @@ func setupHub(t *testing.T, bin string) string {
 	*defaultDir = t.TempDir()
 	t.Cleanup(func() {
 		bridgeHub.mu.Lock()
-		p := bridgeHub.proc
+		procs := make([]*devinProc, 0, len(bridgeHub.procs))
+		for _, p := range bridgeHub.procs {
+			procs = append(procs, p)
+		}
 		bridgeHub.mu.Unlock()
-		if p != nil {
+		for _, p := range procs {
 			killProcessTree(p.cmd)
 		}
 		*devinBin, *defaultDir, *token, bridgeHub = oldBin, oldDir, oldToken, oldHub
@@ -751,7 +764,7 @@ func TestAttachNeedLoadOnJournalEpochReset(t *testing.T) {
 	// A fresh journal epoch: the session is hosted but its journal only
 	// just restarted — the client's cursor of 7 belongs to the dead one.
 	bridgeHub.mu.Lock()
-	bridgeHub.getSessionLocked("EPOCH-SID")
+	bridgeHub.getSessionLocked("EPOCH-SID", "")
 	bridgeHub.mu.Unlock()
 
 	c := dialClient(t, srv)
@@ -794,7 +807,7 @@ func TestProcDeathErrorsInflightAndRespawns(t *testing.T) {
 	}
 
 	bridgeHub.mu.Lock()
-	p := bridgeHub.proc
+	p := bridgeHub.procs[""]
 	bridgeHub.mu.Unlock()
 	killProcessTree(p.cmd)
 
@@ -1099,7 +1112,7 @@ func TestMidDrainFrameQueuesBehindBacklog(t *testing.T) {
 	}
 
 	bridgeHub.mu.Lock()
-	p := bridgeHub.proc
+	p := bridgeHub.procs[""]
 	// Fake the mid-drain window: one op still queued, drain in progress.
 	c1 := &Client{hub: bridgeHub, send: make(chan []byte, 8), sessions: map[*Session]bool{}}
 	op1 := []byte(`{"jsonrpc":"2.0","id":10,"method":"test/first"}`)
@@ -1155,7 +1168,7 @@ func TestPostDeathAgentRequestDropped(t *testing.T) {
 	sid := initAndNew(t, a)
 
 	bridgeHub.mu.Lock()
-	p := bridgeHub.proc
+	p := bridgeHub.procs[""]
 	bridgeHub.mu.Unlock()
 	killProcessTree(p.cmd)
 	a.awaitMethod(t, "_devingo/agent_dead", 20*time.Second) // procDied done
@@ -1279,7 +1292,7 @@ func TestSessionCapSkipsLoadingSessions(t *testing.T) {
 	}
 	// FILL-00 is mid-load: oldest, but must not be evicted.
 	bridgeHub.sessions["FILL-00"].loaders[&Client{}] = 1
-	bridgeHub.getSessionLocked("NEW-SID") // past the cap -> evicts oldest idle
+	bridgeHub.getSessionLocked("NEW-SID", "") // past the cap -> evicts oldest idle
 	_, loadingKept := bridgeHub.sessions["FILL-00"]
 	_, newHosted := bridgeHub.sessions["NEW-SID"]
 	total := len(bridgeHub.sessions)
@@ -1293,5 +1306,115 @@ func TestSessionCapSkipsLoadingSessions(t *testing.T) {
 	}
 	if total != maxHostedSessions {
 		t.Fatalf("hub holds %d sessions, want %d (one idle evicted)", total, maxHostedSessions)
+	}
+}
+
+// W8.3: a session/new carrying the _meta spawn profile rides its own
+// `devin acp` process — argv gets --agent-type, the env gets
+// DEVIN_REFUSAL_FALLBACK, and session-scoped traffic routes back to it.
+// Once nothing uses the profile its proc is reaped; the default resident
+// process never spawns for profiled sessions.
+func TestSpawnProfileRouting(t *testing.T) {
+	stats := setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+	a := dialClient(t, srv)
+
+	meta := rpcMsg{
+		"devingo/agentType":       "review",
+		"devingo/refusalFallback": "test-model",
+	}
+	a.request(t, 1, "session/new", rpcMsg{"cwd": "C:/proj", "_meta": meta})
+	resp := a.awaitID(t, 1, 20*time.Second)
+	if resp["error"] != nil {
+		t.Fatalf("profiled session/new: %v", resp["error"])
+	}
+	sid, _ := resp["result"].(rpcMsg)["sessionId"].(string)
+	if sid == "" {
+		t.Fatalf("profiled session/new result: %v", resp["result"])
+	}
+
+	// Exactly one proc, spawned with the profile; the default proc stays
+	// unspawned — nothing asked for it.
+	bridgeHub.mu.Lock()
+	s := bridgeHub.sessions[sid]
+	nprocs := len(bridgeHub.procs)
+	def := bridgeHub.procs[""]
+	bridgeHub.mu.Unlock()
+	if nprocs != 1 || def != nil {
+		t.Fatalf("procs = %d (default spawned: %v), want 1 profiled proc only", nprocs, def != nil)
+	}
+	wantKey := "review\x00test-model"
+	if s == nil || s.procKey != wantKey {
+		t.Fatalf("session procKey = %q, want %q", s.procKey, wantKey)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	var boot string
+	for time.Now().Before(deadline) {
+		boot = readStats(t, stats)
+		if strings.Contains(boot, "--agent-type review") {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(boot, "--agent-type review") || !strings.Contains(boot, "ENV_FB=test-model") {
+		t.Fatalf("spawned proc missing profile args/env:\n%s", boot)
+	}
+
+	// Session-scoped traffic routes to the profiled proc (the stub logs
+	// every inbound frame it sees — a prompt reaching devin proves the
+	// routing ran on the only process alive).
+	a.request(t, 2, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "hi"}},
+	})
+	if resp := a.awaitID(t, 2, 20*time.Second); resp["error"] != nil {
+		t.Fatalf("prompt on profiled session: %v", resp["error"])
+	}
+
+	// Same-profile session/new reuses the proc — still exactly one.
+	a.request(t, 3, "session/new", rpcMsg{"cwd": "C:/proj", "_meta": meta})
+	resp = a.awaitID(t, 3, 20*time.Second)
+	sid2, _ := resp["result"].(rpcMsg)["sessionId"].(string)
+	bridgeHub.mu.Lock()
+	nprocs = len(bridgeHub.procs)
+	bridgeHub.mu.Unlock()
+	if resp["error"] != nil || sid2 == "" {
+		t.Fatalf("second profiled session/new: %v", resp["error"])
+	}
+	if nprocs != 1 {
+		t.Fatalf("same profile spawned a second proc (procs=%d)", nprocs)
+	}
+
+	// A bogus agent type is rejected -32602 before any spawn.
+	a.request(t, 4, "session/new", rpcMsg{
+		"cwd": "C:/proj", "_meta": rpcMsg{"devingo/agentType": "bogus"},
+	})
+	resp = a.awaitID(t, 4, 20*time.Second)
+	if resp["error"] == nil {
+		t.Fatal("bogus agentType was not rejected")
+	}
+	if code, _ := resp["error"].(rpcMsg)["code"].(float64); int(code) != -32602 {
+		t.Fatalf("bogus agentType error code = %v, want -32602", resp["error"])
+	}
+
+	// Deleting both profiled sessions reaps the idle profile proc.
+	for i, d := range map[int]string{5: sid, 6: sid2} {
+		a.request(t, i, "session/delete", rpcMsg{"sessionId": d})
+		if resp := a.awaitID(t, i, 20*time.Second); resp["error"] != nil {
+			t.Fatalf("session/delete %s: %v", d, resp["error"])
+		}
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		bridgeHub.mu.Lock()
+		nprocs = len(bridgeHub.procs)
+		bridgeHub.mu.Unlock()
+		if nprocs == 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if nprocs != 0 {
+		t.Fatalf("idle profile proc was not reaped (procs=%d)", nprocs)
 	}
 }

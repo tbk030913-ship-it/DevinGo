@@ -80,10 +80,28 @@ data class AuthenticateParams(
     val _meta: JsonObject? = null,
 )
 
+/**
+ * `devin acp --agent-type` spawn modes the bridge can host on a dedicated
+ * per-profile process (W8.3; `_meta["devingo/agentType"]`). Default rides
+ * the shared resident process — its wire value is also accepted.
+ */
+enum class AgentType(val wire: String) {
+    Default("default"),
+    Review("review"),
+    Codemap("codemap"),
+    Summarizer("summarizer"),
+}
+
 @Serializable
 data class SessionNewParams(
     val cwd: String,
     val mcpServers: List<JsonObject> = emptyList(),
+    /**
+     * `_devingo` spawn profile (W8.3): `devingo/agentType` +
+     * `devingo/refusalFallback` — the bridge routes the request to a
+     * per-profile `devin acp` process. Ignored by agent-side devin.
+     */
+    val _meta: JsonObject? = null,
 )
 
 @Serializable

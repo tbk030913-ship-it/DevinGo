@@ -3,6 +3,7 @@ package com.devingo.app
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.devingo.app.acp.AgentCaps
+import com.devingo.app.acp.AgentType
 import com.devingo.app.acp.FsDirListing
 import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
@@ -111,6 +112,7 @@ class ChatViewModel(
             extraConfigOptions = sui.extraConfigOptions,
             revertSupported = conn.revertSupported,
             subagentSupported = conn.subagentSupported,
+            agentTypesSupported = conn.agentTypesSupported,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState())
 
@@ -193,15 +195,21 @@ class ChatViewModel(
         cwd: String,
         resumeSessionId: String? = null,
         apiKey: String? = null,
-    ) = cm.connect(host, token, cwd, resumeSessionId, apiKey)
+        agentType: AgentType = AgentType.Default,
+    ) = cm.connect(host, token, cwd, resumeSessionId, apiKey, agentType)
 
     /** Drawer/Home tap on a listed session — instant switch, no reconnect. */
     fun openSession(sessionId: String, cwd: String? = null, host: String = "", token: String = "") =
         cm.openSession(sessionId, cwd, host, token)
 
     /** "+" / per-project new session on the shared connection. */
-    fun newSession(cwd: String? = null, host: String = "", token: String = "") =
-        cm.newSession(cwd, host, token)
+    fun newSession(
+        cwd: String? = null,
+        host: String = "",
+        token: String = "",
+        agentType: AgentType = AgentType.Default,
+    ) =
+        cm.newSession(cwd, host, token, agentType)
 
     /** Leave chat for Home — the session's store keeps running off-screen. */
     fun leaveSession() = cm.leaveSession()
@@ -214,8 +222,8 @@ class ChatViewModel(
 
     fun authenticate() = cm.authenticate()
 
-    /** (resumeId, cwd) of the failed open attempt, for the retry snackbar. */
-    fun retryTarget(): Pair<String?, String> = cm.retryTarget()
+    /** (resumeId, cwd, agentType) of the failed open attempt — the retry snackbar. */
+    fun retryTarget(): OpenTarget = cm.retryTarget()
 
     // ---- session list ------------------------------------------------------------
 
@@ -500,9 +508,8 @@ class ChatViewModel(
      * 「让 Devin 生成 Commit Message」 request path. Queues behind a running
      * turn like a normal composer send (W8.2).
      */
-    fun sendPrompt(text: String) {
-        store?.send(text)
-    }
+    fun sendPrompt(text: String): Boolean =
+        store?.send(text, mergeCitation = false) ?: false
 
     /**
      * Rules/skills/plans the agent lists for @-mentions. Failures (agent

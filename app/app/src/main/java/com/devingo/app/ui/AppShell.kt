@@ -37,6 +37,7 @@ import com.devingo.app.ChatViewModel
 import com.devingo.app.Page
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
+import com.devingo.app.acp.AgentType
 import kotlinx.coroutines.launch
 
 /**
@@ -146,10 +147,13 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                                 },
                                 openTarget = openTarget,
                                 onPickSession = ::pickSession,
-                                onNewSession = {
+                                onNewSession = { agentType ->
                                     scope.launch {
                                         drawerState.close()
-                                        vm.newSession(null, prefs.host.trim(), prefs.token.trim())
+                                        vm.newSession(
+                                            null, prefs.host.trim(),
+                                            prefs.token.trim(), agentType,
+                                        )
                                     }
                                 },
                                 onNewSessionCwd = { cwd ->
@@ -185,8 +189,8 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
                 onPickSession = { s ->
                     scope.launch { startConnectFromHome(vm, prefs, s) }
                 },
-                onNewSession = {
-                    scope.launch { startConnectFromHome(vm, prefs, null) }
+                onNewSession = { agentType ->
+                    scope.launch { startConnectFromHome(vm, prefs, null, agentType) }
                 },
                 onNewSessionCwd = { cwd ->
                     scope.launch { startConnectCwd(vm, prefs, cwd) }
@@ -203,7 +207,12 @@ fun AppShell(vm: ChatViewModel, prefs: Prefs) {
     }
 }
 
-private fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: AcpSession?) {
+private fun startConnectFromHome(
+    vm: ChatViewModel,
+    prefs: Prefs,
+    s: AcpSession?,
+    agentType: AgentType = AgentType.Default,
+) {
     val host = prefs.host.trim()
     if (host.isEmpty()) return
     vm.connect(
@@ -212,6 +221,7 @@ private fun startConnectFromHome(vm: ChatViewModel, prefs: Prefs, s: AcpSession?
         (s?.cwd ?: prefs.cwd.trim()),
         resumeSessionId = s?.sessionId,
         apiKey = prefs.apiKey,
+        agentType = agentType,
     )
 }
 

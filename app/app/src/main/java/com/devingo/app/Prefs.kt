@@ -135,6 +135,15 @@ class Prefs(context: Context) {
         set(v) { sp.edit().putBoolean("tailnetEnabled", v).apply(); bumpSettings() }
 
     /**
+     * W8.3: model name for `devin acp`'s policy-refusal fallback
+     * (`DEVIN_REFUSAL_FALLBACK`) — sent on session/new so the bridge
+     * spawns the session's process with it. Blank = no fallback.
+     */
+    var refusalFallbackModel: String
+        get() = sp.getString("refusalFallbackModel", "") ?: ""
+        set(v) = sp.edit().putString("refusalFallbackModel", v).apply()
+
+    /**
      * Project-group expansion overrides for the session list. Null until the
      * user toggles a group — before that, HomeScreen computes defaults.
      */

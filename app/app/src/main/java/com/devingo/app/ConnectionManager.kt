@@ -8,6 +8,7 @@ import android.util.Log
 import com.devingo.app.acp.ACP_ERROR_AUTH_REQUIRED
 import com.devingo.app.acp.AcpClient
 import com.devingo.app.acp.AgentCaps
+import com.devingo.app.acp.AgentType
 import com.devingo.app.acp.AcpEvent
 import com.devingo.app.acp.AcpException
 import com.devingo.app.acp.AcpMethods
@@ -64,6 +65,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlin.random.Random
 
 /**
@@ -110,6 +114,12 @@ class ConnectionManager private constructor(private val app: Application) {
         val revertSupported: Boolean = false,
         /** Same contract as [revertSupported], for `_cognition.ai/subagent/…`. */
         val subagentSupported: Boolean = false,
+        /**
+         * `_devingo/hello` advertised the W8.3 spawn-profile surface
+         * (`_meta` agentType/refusalFallback on session/new|load). Optimistic
+         * until hello answers — a hello failure can't tell old from new.
+         */
+        val agentTypesSupported: Boolean = true,
     )
 
     companion object {
@@ -422,8 +432,10 @@ class ConnectionManager private constructor(private val app: Application) {
             // Introduce ourselves to the gateway (attach/journal/…); the
             // app ships against _devingo/* but a stale bridge must not wedge
             // the connection over the hello alone.
-            runCatching { client.hello(clientId) }
+            val helloCaps = runCatching { client.hello(clientId) }
                 .onFailure { e -> Log.w(TAG, "_devingo/hello: ${e.message}") }
+                .getOrNull()
+                ?.get("capabilities") as? JsonObject
             // socketLive flips only once the handshake is done — a cancel
             // mid-handshake must not leave a believed-live half-init socket.
             socketLive = true
@@ -440,6 +452,12 @@ class ConnectionManager private constructor(private val app: Application) {
                     // counterpart: stay optimistic and let -32601 decide.
                     revertSupported = !caps.metaNegotiated || caps.revert,
                     subagentSupported = !caps.metaNegotiated || caps.subagentSupport,
+                    // A hello that answered without the flag means a bridge
+                    // too old for spawn profiles; a failed hello stays
+                    // optimistic — the failure tells nothing.
+                    agentTypesSupported = helloCaps == null ||
+                        (helloCaps["agentTypes"] as? JsonPrimitive)
+                            ?.booleanOrNull == true,
                 )
             }
             // Stores that outlived a dead socket (reconnect exhausted, or a
@@ -483,16 +501,17 @@ class ConnectionManager private constructor(private val app: Application) {
         cwd: String,
         resumeSessionId: String? = null,
         apiKey: String? = null,
+        agentType: AgentType = AgentType.Default,
     ) {
         noteHost(host, token)
         lastApiKey = apiKey?.trim()?.ifBlank { null }
-        pendingOpen = OpenTarget(resumeSessionId, cwd)
+        pendingOpen = OpenTarget(resumeSessionId, cwd, agentType)
         pendingCwd = cwd
         openJob?.cancel()
         openJob = scope.launch {
             try {
                 if (!ensureSocket()) return@launch
-                openOrCreate(resumeSessionId, cwd.ifBlank { defaultCwd })
+                openOrCreate(resumeSessionId, cwd.ifBlank { defaultCwd }, agentType)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -542,16 +561,22 @@ class ConnectionManager private constructor(private val app: Application) {
         }
     }
 
-    /** Fresh session rooted at [cwd] (or the bridge default). */
-    fun newSession(cwd: String? = null, host: String = "", token: String = "") {
+    /** Fresh session rooted at [cwd] (or the bridge default), spawned on
+     *  [agentType]'s `devin acp` profile (W8.3 — Default = resident proc). */
+    fun newSession(
+        cwd: String? = null,
+        host: String = "",
+        token: String = "",
+        agentType: AgentType = AgentType.Default,
+    ) {
         if (host.isNotBlank()) noteHost(host, token)
-        pendingOpen = OpenTarget(null, cwd)
+        pendingOpen = OpenTarget(null, cwd, agentType)
         pendingCwd = cwd.orEmpty()
         openJob?.cancel()
         openJob = scope.launch {
             try {
                 if (!ensureSocket()) return@launch
-                openOrCreate(null, cwd.orEmpty().ifBlank { defaultCwd })
+                openOrCreate(null, cwd.orEmpty().ifBlank { defaultCwd }, agentType)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -562,12 +587,20 @@ class ConnectionManager private constructor(private val app: Application) {
         }
     }
 
-    private suspend fun openOrCreate(resumeId: String?, cwd: String) {
-        _openTarget.value = OpenTarget(resumeId, cwd)
+    private suspend fun openOrCreate(
+        resumeId: String?,
+        cwd: String,
+        agentType: AgentType = AgentType.Default,
+    ) {
+        _openTarget.value = OpenTarget(resumeId, cwd, agentType)
         _conn.update { it.copy(phase = Phase.StartingSession, statusText = "打开会话…") }
         try {
             if (resumeId == null) {
-                val s = client.newSession(cwd)
+                val s = client.newSession(
+                    cwd,
+                    agentType,
+                    refusalFallback = Prefs(app).refusalFallbackModel,
+                )
                 val store = createStore(s.sessionId, cwd)
                 store.markSubscribed()
                 store.applySessionConfig(s)
@@ -1196,7 +1229,9 @@ class ConnectionManager private constructor(private val app: Application) {
                         ?: throw AcpException("bridge 不可达")
                     client.connect(wsUrl(dial), lastToken)
                     val init = client.initialize()
-                    runCatching { client.hello(clientId) }
+                    val helloCaps = runCatching { client.hello(clientId) }
+                        .getOrNull()
+                        ?.get("capabilities") as? JsonObject
                     // Live only once the handshake completed — a cancel
                     // mid-handshake must not leave a believed-live socket.
                     socketLive = true
@@ -1214,6 +1249,9 @@ class ConnectionManager private constructor(private val app: Application) {
                             revertSupported = !caps.metaNegotiated || caps.revert,
                             subagentSupported = !caps.metaNegotiated ||
                                 caps.subagentSupport,
+                            agentTypesSupported = helloCaps == null ||
+                                (helloCaps["agentTypes"] as? JsonPrimitive)
+                                    ?.booleanOrNull == true,
                         )
                     }
                     // Re-attach every store at its journal cursor — the
@@ -1318,7 +1356,11 @@ class ConnectionManager private constructor(private val app: Application) {
                     _conn.update {
                         it.copy(phase = Phase.StartingSession, statusText = "已登录，打开会话…")
                     }
-                    openOrCreate(target.sessionId, target.cwd.orEmpty().ifBlank { defaultCwd })
+                    openOrCreate(
+                        target.sessionId,
+                        target.cwd.orEmpty().ifBlank { defaultCwd },
+                        target.agentType,
+                    )
                 } else {
                     _conn.update { it.copy(phase = Phase.Ready, statusText = "") }
                 }
@@ -1356,7 +1398,11 @@ class ConnectionManager private constructor(private val app: Application) {
                 client.authenticate("devin-browser")
             }
             _conn.update { it.copy(awaitingBrowserLogin = false) }
-            openOrCreate(target.sessionId, target.cwd.orEmpty().ifBlank { defaultCwd })
+            openOrCreate(
+                target.sessionId,
+                target.cwd.orEmpty().ifBlank { defaultCwd },
+                target.agentType,
+            )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1371,11 +1417,12 @@ class ConnectionManager private constructor(private val app: Application) {
     }
 
     /**
-     * The (resumeId, cwd) the last open attempt was aimed at — an error
-     * snackbar's 重试 replays exactly these. Null resumeId = a new session.
+     * The (resumeId, cwd, agentType) the last open attempt was aimed at —
+     * an error snackbar's 重试 replays exactly these. Null sessionId = a
+     * new session.
      */
-    fun retryTarget(): Pair<String?, String> =
-        (pendingOpen?.sessionId) to (pendingOpen?.cwd ?: pendingCwd)
+    fun retryTarget(): OpenTarget =
+        pendingOpen ?: OpenTarget(null, pendingCwd)
 
     private fun AcpException.isAuthError(): Boolean =
         code == ACP_ERROR_AUTH_REQUIRED || message?.let {

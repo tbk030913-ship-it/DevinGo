@@ -67,6 +67,7 @@ import com.devingo.app.OpenTarget
 import com.devingo.app.Phase
 import com.devingo.app.Prefs
 import com.devingo.app.acp.AcpSession
+import com.devingo.app.acp.AgentType
 import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.tailnet.TailnetManager
@@ -128,7 +129,7 @@ internal fun HomeScreen(
     onExpandedChange: (Set<String>) -> Unit,
     openTarget: OpenTarget?,
     onPickSession: (AcpSession) -> Unit,
-    onNewSession: () -> Unit,
+    onNewSession: (AgentType) -> Unit,
     onNewSessionCwd: (String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -160,7 +161,11 @@ internal fun HomeScreen(
         Phase.StartingSession,
     )
 
-    fun startConnect(resumeId: String? = null, sessionCwd: String? = null) {
+    fun startConnect(
+        resumeId: String? = null,
+        sessionCwd: String? = null,
+        agentType: AgentType = AgentType.Default,
+    ) {
         if (host.isEmpty()) {
             settingsOpen = true
             return
@@ -172,6 +177,7 @@ internal fun HomeScreen(
             (sessionCwd ?: prefs.cwd.trim()),
             resumeSessionId = resumeId,
             apiKey = prefs.apiKey,
+            agentType = agentType,
         )
     }
 
@@ -312,10 +318,10 @@ internal fun HomeScreen(
                 if (isAuth) {
                     vm.authenticate()
                 } else {
-                    // Replay the failed attempt's session/cwd — a bare
-                    // startConnect() would lose the resume target.
-                    val (resumeId, cwd) = vm.retryTarget()
-                    startConnect(resumeId, cwd)
+                    // Replay the failed attempt's session/cwd/agent — a
+                    // bare startConnect() would lose the resume target.
+                    val (resumeId, cwd, agentType) = vm.retryTarget()
+                    startConnect(resumeId, cwd, agentType)
                 }
             }
         }
@@ -552,9 +558,11 @@ internal fun HomeScreen(
                 onSort = { homeState.sortBy = it },
                 onHideEmpty = { homeState.hideEmpty = it },
                 onCompact = { homeState.compact = it },
-                onNewSession = {
-                    if (drawerMode) onNewSession() else startConnect()
+                onNewSession = { agentType ->
+                    if (drawerMode) onNewSession(agentType)
+                    else startConnect(null, null, agentType)
                 },
+                agentTypesSupported = ui.agentTypesSupported,
                 newSessionLoading = busy ||
                     (openTarget != null && openTarget?.sessionId == null),
                 modifier = Modifier

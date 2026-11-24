@@ -1,5 +1,9 @@
 // Session-hosting core (optimization task C1, plan A): ONE resident
-// `devin acp` process hosts every session. The Hub owns the process
+// `devin acp` process hosts default sessions; sessions created with a
+// `_meta` spawn profile (devingo/agentType, devingo/refusalFallback —
+// W8.3) get their own per-profile process since `devin acp
+// --agent-type`/`DEVIN_REFUSAL_FALLBACK` apply process-wide. The Hub owns
+// the process
 // lifecycle, proxies `initialize`/`authenticate` itself, demuxes the
 // process's NDJSON stream by sessionId, journals per-session traffic into a
 // sequence-numbered ring buffer, and fans events out to subscribed clients.
@@ -26,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +82,7 @@ type journalEntry struct {
 type agentReq struct {
 	id      int64           // internal id the clients see
 	devinID json.RawMessage // id devin assigned
+	proc    *devinProc      // the process the request arrived on — replies route back to it
 	session *Session
 	target  *Client         // unscoped requests: the one routed client, the only answerer
 	seq     uint64          // journal seq of the request frame (0 when unscoped)
@@ -113,6 +119,7 @@ type Session struct {
 	subs         map[*Client]bool
 	loaders      map[*Client]int // in-flight session/load refcount per client; replay routes only to them
 	cwd          string          // workspace root from session/new|load params — /fs/write resolves under it
+	procKey      string          // spawn profile hosting this session — routes every session-scoped frame ("" = resident default)
 	journal      []journalEntry  // ring: oldest at index 0
 	jBytes       int
 	nextSeq      uint64 // 1-based; entry seq == nextSeq-1 after append
@@ -123,13 +130,19 @@ type Session struct {
 	idleTimer    *time.Timer
 }
 
-// devinProc is the resident `devin acp` process. ready closes once the
-// gateway's initialize (+ authenticate) finished — initErr tells how.
+// devinProc is one resident `devin acp` process. The "" profile is the
+// default process spawned on first demand; any other key (agentType +
+// refusalFallback — W8.3) gets its own process since both settings are
+// process-wide. ready closes once the gateway's initialize (+ authenticate)
+// finished — initErr tells how.
 type devinProc struct {
-	hub   *Hub
-	cmd   *exec.Cmd
-	pid   int
-	stdin io.Writer
+	hub             *Hub
+	key             string // procKeyFor() encoding; "" = default
+	agentType       string // validated --agent-type value, "" = default agent
+	refusalFallback string // DEVIN_REFUSAL_FALLBACK env value
+	cmd             *exec.Cmd
+	pid             int
+	stdin           io.Writer
 
 	writeMu sync.Mutex
 	// atomic: writeLine must read it without hub.mu (it already holds
@@ -151,7 +164,7 @@ type queuedOp struct {
 
 type Hub struct {
 	mu            sync.Mutex
-	proc          *devinProc
+	procs         map[string]*devinProc // by spawn-profile key; procs[""] is the default resident process
 	sessions      map[string]*Session
 	clients       map[*Client]bool
 	pendingClient map[int64]*clientReq
@@ -162,6 +175,7 @@ type Hub struct {
 
 func newHub() *Hub {
 	return &Hub{
+		procs:         map[string]*devinProc{},
 		sessions:      map[string]*Session{},
 		clients:       map[*Client]bool{},
 		pendingClient: map[int64]*clientReq{},
@@ -169,23 +183,128 @@ func newHub() *Hub {
 	}
 }
 
+// -------------------------------------------------------- spawn profile ---
+
+// procKeyFor encodes a spawn profile (agent type + refusal fallback) into
+// the procs map key. "" is the shared default process — the overwhelmingly
+// common case — anything else gets an on-demand process per profile.
+func procKeyFor(agentType, refusalFallback string) string {
+	if agentType == "" && refusalFallback == "" {
+		return ""
+	}
+	return agentType + "\x00" + refusalFallback
+}
+
+func parseProcKey(key string) (agentType, refusalFallback string) {
+	if i := strings.IndexByte(key, 0); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return key, ""
+}
+
+// knownAgentTypes are the `devin acp --agent-type` values the gateway
+// accepts (devin-strings.txt: "The type of agent to run"). The value lands
+// verbatim in spawn argv — a closed set is the validation.
+var knownAgentTypes = map[string]bool{
+	"review":     true,
+	"codemap":    true,
+	"summarizer": true,
+}
+
+// modelNameRe bounds a refusal-fallback model name. It rides the spawn env
+// (DEVIN_REFUSAL_FALLBACK), not a shell, but the charset check keeps junk
+// from silently spawning a doomed process.
+var modelNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._:\-+/]{0,63}$`)
+
+// spawnProfile reads the _devingo spawn profile out of params._meta:
+// {"devingo/agentType": "review"|"codemap"|"summarizer",
+//  "devingo/refusalFallback": "<model>"} — both optional, "default"/"" mean
+// the resident process. A non-empty reject means the request is malformed.
+func spawnProfile(head rpcHead) (agentType, refusalFallback, reject string) {
+	if len(head.Params.Meta) == 0 {
+		return "", "", ""
+	}
+	var meta struct {
+		AgentType       string `json:"devingo/agentType"`
+		RefusalFallback string `json:"devingo/refusalFallback"`
+	}
+	_ = json.Unmarshal(head.Params.Meta, &meta)
+	switch meta.AgentType {
+	case "", "default":
+	default:
+		if !knownAgentTypes[meta.AgentType] {
+			return "", "", "unknown agentType " + strconv.Quote(meta.AgentType)
+		}
+		agentType = meta.AgentType
+	}
+	if meta.RefusalFallback != "" {
+		if !modelNameRe.MatchString(meta.RefusalFallback) {
+			return "", "", "invalid refusalFallback model name"
+		}
+		refusalFallback = meta.RefusalFallback
+	}
+	return agentType, refusalFallback, ""
+}
+
+// frameProcKeyLocked picks the spawn profile a client frame routes to.
+// session/new|load honor the _meta profile (validated here); every other
+// session-scoped frame rides the proc its session was created on; anything
+// else takes the default resident process.
+func (h *Hub) frameProcKeyLocked(head rpcHead) (key, reject string) {
+	switch head.Method {
+	case "session/new":
+		agentType, fb, errMsg := spawnProfile(head)
+		if errMsg != "" {
+			return "", errMsg
+		}
+		return procKeyFor(agentType, fb), ""
+	case "session/load":
+		// A known session stays on the proc that already hosts it; the
+		// meta profile only guides loads of sessions the hub lost track
+		// of (restart/eviction) — devin keeps sessions agent-side.
+		if s := h.sessions[head.Params.SessionID]; s != nil {
+			return s.procKey, ""
+		}
+		agentType, fb, errMsg := spawnProfile(head)
+		if errMsg != "" {
+			return "", errMsg
+		}
+		return procKeyFor(agentType, fb), ""
+	}
+	if sid := head.Params.SessionID; sid != "" {
+		if s := h.sessions[sid]; s != nil {
+			return s.procKey, ""
+		}
+	}
+	return "", ""
+}
+
 // ---------------------------------------------------------------- proc ---
 
-// ensureProc returns the live resident process, spawning it on first demand
-// or after a death. Lazy spawn keeps the bridge — and the test suite —
-// hermetic until a client actually needs devin.
-func (h *Hub) ensureProc() *devinProc {
+// ensureProcFor returns the live process for a spawn profile, spawning it
+// on first demand or after a death. Lazy spawn keeps the bridge — and the
+// test suite — hermetic until a client actually needs devin.
+func (h *Hub) ensureProcFor(key string) *devinProc {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if p := h.proc; p != nil && p.alive.Load() {
+	if p := h.procs[key]; p != nil && p.alive.Load() {
 		return p
 	}
-	p := &devinProc{hub: h, ready: make(chan struct{})}
+	agentType, refusalFallback := parseProcKey(key)
+	p := &devinProc{
+		hub: h, key: key,
+		agentType: agentType, refusalFallback: refusalFallback,
+		ready: make(chan struct{}),
+	}
 	p.alive.Store(true)
-	h.proc = p
+	h.procs[key] = p
 	go p.run()
 	return p
 }
+
+// ensureProc is the default resident process — the cold-start path for
+// session/list and every frame carrying no spawn profile.
+func (h *Hub) ensureProc() *devinProc { return h.ensureProcFor("") }
 
 func (p *devinProc) readyClosed() bool {
 	select {
@@ -218,8 +337,17 @@ func (p *devinProc) run() {
 	if *model != "" {
 		args = append(args, "--model", *model)
 	}
+	if p.agentType != "" {
+		args = append(args, "--agent-type", p.agentType)
+	}
 	cmd := exec.Command(*devinBin, args...)
 	cmd.Dir = *defaultDir
+	if p.refusalFallback != "" {
+		// The refusal fallback reaches `devin acp` through the environment —
+		// the top-level CLI forwards --refusal-fallback to its acp child the
+		// same way (devin-strings.txt).
+		cmd.Env = append(os.Environ(), "DEVIN_REFUSAL_FALLBACK="+p.refusalFallback)
+	}
 	cmd.Stderr = &stderrLogger{}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -236,7 +364,12 @@ func (p *devinProc) run() {
 		return
 	}
 	p.cmd, p.stdin, p.pid = cmd, stdin, cmd.Process.Pid
-	log.Printf("[%d] devin acp started (resident)", p.pid)
+	if p.key == "" {
+		log.Printf("[%d] devin acp started (resident)", p.pid)
+	} else {
+		log.Printf("[%d] devin acp started (agentType=%q refusalFallback=%q)",
+			p.pid, p.agentType, p.refusalFallback)
+	}
 	go p.readLoop(stdout)
 	go p.watch(cmd)
 
@@ -382,8 +515,8 @@ func (h *Hub) procDied(p *devinProc, cause error) {
 		return // already reaped (e.g. failInit raced the watcher)
 	}
 	p.alive.Store(false)
-	if h.proc == p {
-		h.proc = nil
+	if h.procs[p.key] == p {
+		delete(h.procs, p.key)
 	}
 	queued := p.queue
 	p.queue = nil
@@ -401,6 +534,9 @@ func (h *Hub) procDied(p *devinProc, cause error) {
 		}
 	}
 	for id, ar := range h.pendingAgent {
+		if ar.proc != p {
+			continue // lives on a sibling process — still answerable
+		}
 		delete(h.pendingAgent, id)
 		ar.timer.Stop()
 		if ar.session != nil {
@@ -414,6 +550,9 @@ func (h *Hub) procDied(p *devinProc, cause error) {
 	}
 	p.setReadyLocked(cause) // no-op when ready already closed
 	for _, s := range h.sessions {
+		if s.procKey != p.key {
+			continue // hosted on a sibling process — unaffected
+		}
 		s.running = 0
 		s.inflight = 0
 		s.loaders = map[*Client]int{}
@@ -504,14 +643,24 @@ func (h *Hub) dispatchReady(p *devinProc, c *Client, data []byte, head rpcHead) 
 	}
 }
 
-// procReady resolves the resident process for a devin-bound frame. It
-// returns the process once ready has closed AND the post-ready drain has
-// flushed (initErr tells how init went), nil when the frame was queued
-// behind the handshake/backlog or an error was delivered after
+// procReady resolves the process for a devin-bound frame — the resident
+// default, or the per-profile process the frame's spawn profile routes to
+// (W8.3). It returns the process once ready has closed AND the post-ready
+// drain has flushed (initErr tells how init went), nil when the frame was
+// queued behind the handshake/backlog or an error was delivered after
 // back-to-back dead processes.
 func (h *Hub) procReady(c *Client, data []byte, head rpcHead) *devinProc {
+	h.mu.Lock()
+	key, reject := h.frameProcKeyLocked(head)
+	h.mu.Unlock()
+	if reject != "" {
+		if len(head.ID) > 0 {
+			h.deliver(c, errorFrame(head.ID, -32602, reject))
+		}
+		return nil
+	}
 	for attempts := 0; attempts < 2; attempts++ {
-		p := h.ensureProc()
+		p := h.ensureProcFor(key)
 		h.mu.Lock()
 		if !p.alive.Load() {
 			h.mu.Unlock()
@@ -556,7 +705,7 @@ func (h *Hub) forwardToDevin(c *Client, p *devinProc, head rpcHead, data []byte)
 	h.pendingClient[internal] = cr
 	var s *Session
 	if cr.sid != "" {
-		s = h.getSessionLocked(cr.sid)
+		s = h.getSessionLocked(cr.sid, p.key)
 		cr.session = s
 		s.inflight++
 		// Any in-flight session-scoped request — not just prompt — keeps
@@ -669,11 +818,8 @@ func responseOutcome(data []byte) string {
 }
 
 func (h *Hub) forwardResponseToDevin(ar *agentReq, wire []byte) {
-	h.mu.Lock()
-	p := h.proc
-	alive := p != nil && p.alive.Load()
-	h.mu.Unlock()
-	if !alive {
+	p := ar.proc
+	if p == nil || !p.alive.Load() {
 		return
 	}
 	if err := p.writeLine(wire); err != nil {
@@ -743,9 +889,14 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 	}
 	var s *Session
 	if cr.method == "session/new" && !failed && sid != "" {
-		s = h.getSessionLocked(sid) // the session's id only exists now
+		s = h.getSessionLocked(sid, cr.proc.key) // the session's id only exists now
 	} else if sid != "" {
 		s = h.sessions[sid]
+	}
+	if failed {
+		// A failed request on a profiled proc may leave it with nothing to
+		// host (e.g. session/new rejected) — reap it if it is idle.
+		h.maybeReapProcLocked(cr.proc.key)
 	}
 	// Bookkeeping pairs with the forward-time increments on the session
 	// object that was marked — h.sessions[sid] may be a different (or
@@ -856,6 +1007,7 @@ func (h *Hub) devinRequest(p *devinProc, line []byte, head rpcHead) {
 	h.nextID = internal
 	ar := &agentReq{
 		id:      internal,
+		proc:    p,
 		devinID: append(json.RawMessage(nil), head.ID...),
 	}
 	h.pendingAgent[internal] = ar
@@ -865,7 +1017,7 @@ func (h *Hub) devinRequest(p *devinProc, line []byte, head rpcHead) {
 	var s *Session
 	var targets []*Client
 	if sid != "" {
-		s = h.getSessionLocked(sid)
+		s = h.getSessionLocked(sid, p.key)
 		ar.session = s
 		s.pending[internal] = ar
 		entry := h.appendLocked(s, jReq, wire)
@@ -982,7 +1134,7 @@ func (h *Hub) devinNotification(p *devinProc, line []byte, head rpcHead) {
 		h.mu.Unlock()
 		return
 	}
-	s := h.getSessionLocked(sid)
+	s := h.getSessionLocked(sid, p.key)
 	entry := h.appendLocked(s, jNotif, line)
 	wire := withSeq(entry)
 	pool := s.subs
@@ -1040,6 +1192,10 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 				"permissionResolved": true,
 				"sessionResync":      true,
 				"initCached":         true,
+				// W8.3: session/new|load accept _meta devingo/agentType +
+				// devingo/refusalFallback — a per-profile `devin acp` proc
+				// is spawned for them.
+				"agentTypes": true,
 			},
 		})
 		h.deliver(c, resultFrameRaw(head.ID, res))
@@ -1215,10 +1371,12 @@ func (h *Hub) replayWireLocked(s *Session, e journalEntry) []byte {
 
 // ------------------------------------------------------------ sessions ---
 
-// getSessionLocked finds or lazily creates the session for an id. Lazily
+// getSessionLocked finds or lazily creates the session for an id on the
+// proc identified by procKey — the caller's frame came from or is bound
+// for that process, so a freshly recorded session rides it. Lazily
 // covers journal-worthy traffic for sessions the hub never saw created
 // (foreign sids in devin's stream).
-func (h *Hub) getSessionLocked(sid string) *Session {
+func (h *Hub) getSessionLocked(sid, procKey string) *Session {
 	if s := h.sessions[sid]; s != nil {
 		return s
 	}
@@ -1227,6 +1385,7 @@ func (h *Hub) getSessionLocked(sid string) *Session {
 	}
 	s := &Session{
 		id:        sid,
+		procKey:   procKey,
 		subs:      map[*Client]bool{},
 		loaders:   map[*Client]int{},
 		pending:   map[int64]*agentReq{},
@@ -1329,11 +1488,40 @@ func (h *Hub) dropSessionLocked(s *Session, sendClose bool) {
 	}
 	ptySessions.dropSession(s.id) // kill a terminal console bound to this session
 	if sendClose {
-		if p := h.proc; p != nil && p.alive.Load() && p.isReady() {
+		if p := h.procs[s.procKey]; p != nil && p.alive.Load() && p.isReady() {
 			go h.callDevin(p, devinCallTimeout, "session/close",
 				map[string]any{"sessionId": s.id})
 		}
 	}
+	if s.procKey != "" {
+		h.maybeReapProcLocked(s.procKey)
+	}
+}
+
+// maybeReapProcLocked stops a non-default process once nothing needs it:
+// no hosted session rides it and no request is still in flight on it. The
+// resident default process is never reaped — it serves session/list and
+// cold-start handshakes. The kill is async; procDied does the map removal.
+func (h *Hub) maybeReapProcLocked(key string) {
+	p := h.procs[key]
+	if p == nil || key == "" {
+		return
+	}
+	for _, s := range h.sessions {
+		if s.procKey == key {
+			return
+		}
+	}
+	for _, cr := range h.pendingClient {
+		if cr.proc == p {
+			return
+		}
+	}
+	if len(p.queue) > 0 {
+		return // ops still parked behind the handshake
+	}
+	log.Printf("spawn-profile proc %q idle; stopping (pid %d)", key, p.pid)
+	go killProcessTree(p.cmd)
 }
 
 // maybeArmIdleLocked schedules the idle grace timer once a session holds
@@ -2439,7 +2627,13 @@ func untrackedSection(cwd, rel string) string {
 		}
 	}
 	b.WriteString("new file mode 100644\n")
-	data, err := os.ReadFile(p)
+	f, err := os.Open(p)
+	if err != nil {
+		fmt.Fprintf(&b, "Binary files /dev/null and %s differ\n", qb)
+		return b.String()
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(gitUntrackedMaxFile)+1))
+	f.Close()
 	if err != nil || len(data) > gitUntrackedMaxFile || isBinaryContent(data) {
 		fmt.Fprintf(&b, "Binary files /dev/null and %s differ\n", qb)
 		return b.String()
@@ -2537,13 +2731,17 @@ var (
 	errGitNoFiles = errors.New("files is required")
 	errGitNoMsg   = errors.New("message is required")
 	errGitNoBase  = errors.New("no merge base with the default branch")
+	errGitTooMany = errors.New("too many files selected")
 )
 
 // gitOpEnv disables interactive waits: a push over https must fail fast
 // instead of parking on a credential prompt or a pager the phone can't
-// see.
+// see. Empty ASKPASS vars are the CI-standard kill for interactive
+// credential helpers (askpass/manager GUIs) — TERMINAL_PROMPT alone
+// doesn't cover them.
 var gitOpEnv = append(os.Environ(),
-	"GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "PAGER=cat")
+	"GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "PAGER=cat",
+	"GIT_ASKPASS=", "SSH_ASKPASS=", "SSH_ASKPASS_REQUIRE=never")
 
 // gitStatusFile is one /git/status row: the porcelain path folded to one
 // letter plus its numstat counts (untracked files count their own lines).
@@ -2604,9 +2802,13 @@ func (h *Hub) sessionGitStatus(sid, cwdParam string) (*gitStatusResult, error) {
 		"--left-right", "--count", "HEAD...@{upstream}"); err == nil {
 		fmt.Sscanf(string(out), "%d\t%d", &res.Ahead, &res.Behind)
 	}
-	if files, err := gitStatusFiles(ctx, root); err == nil {
-		res.Files = files
+	files, err := gitStatusFiles(ctx, root)
+	if err != nil {
+		// A corrupt index or lock contention must not masquerade as a
+		// clean worktree — surface the failure to the sheet.
+		return nil, err
 	}
+	res.Files = files
 	return res, nil
 }
 
@@ -2634,6 +2836,15 @@ func gitDefaultBranch(ctx context.Context, cwd string) string {
 		if exec.CommandContext(ctx, "git", "-C", cwd,
 			"show-ref", "--verify", "--quiet", "refs/heads/"+b).Run() == nil {
 			return b
+		}
+	}
+	// No conventional name: treat the checked-out branch as the default —
+	// the commit guard errs on the visible side rather than missing a
+	// commit straight onto a solo repo's principal branch.
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", cwd,
+		"symbolic-ref", "--short", "-q", "HEAD"); err == nil {
+		if s := strings.TrimSpace(string(out)); s != "" {
+			return s
 		}
 	}
 	return "main"
@@ -2727,7 +2938,14 @@ func porcelainLetter(xy string) string {
 // countFileLines is the numstat substitute for untracked files — the same
 // bounded read untrackedSection caps at.
 func countFileLines(cwd, rel string) int {
-	data, err := os.ReadFile(filepath.Join(cwd, rel))
+	f, err := os.Open(filepath.Join(cwd, rel))
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	// Cap+1: a multi-GB untracked file must not be fully buffered just to
+	// count its lines (W8.2 review).
+	data, err := io.ReadAll(io.LimitReader(f, int64(gitUntrackedMaxFile)+1))
 	if err != nil || isBinaryContent(data) {
 		return 0
 	}
@@ -2790,8 +3008,11 @@ func cleanGitPath(p string) (string, bool) {
 	if p == "" || p == "." {
 		return ".", true
 	}
+	// `--` ends option parsing but NOT pathspec fnmatch — a literal `a*b`
+	// filename would still sweep siblings, so glob metachars are rejected
+	// outright (the app sends porcelain paths; none are ever legal globs).
 	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") ||
-		strings.ContainsRune(p, ':') {
+		strings.ContainsRune(p, ':') || strings.ContainsAny(p, "*?[") {
 		return "", false
 	}
 	for _, seg := range strings.Split(p, "/") {
@@ -2813,6 +3034,9 @@ func (h *Hub) sessionGitDiffQuery(sid, cwdParam, mode, pathspec string) (string,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
 	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return "", false, err
+	}
 	if mode == "branch" {
 		base, err := gitMergeBaseDefault(ctx, root)
 		if err != nil {
@@ -2894,6 +3118,23 @@ func (h *Hub) sessionGitCommit(sid, cwdParam string, files []string,
 	if strings.TrimSpace(message) == "" {
 		return "", "", errGitNoMsg
 	}
+	// Validate everything before the first side effect — a bad file in
+	// `files` must not leave the workspace sitting on a new branch.
+	// The byte cap keeps the add/commit argv under Windows' ~32 KiB
+	// CreateProcess limit (review: 256 KiB bodies could spawn-fail).
+	addArgs := []string{"add", "--"}
+	addBytes := 0
+	for _, f := range files {
+		p, ok := cleanGitPath(f)
+		if !ok || p == "." {
+			return "", "", errGitBadPath
+		}
+		addBytes += len(p) + 1
+		if addBytes > 24<<10 {
+			return "", "", errGitTooMany
+		}
+		addArgs = append(addArgs, p)
+	}
 	if createBranch != "" {
 		if !gitBranchNameOK(ctx, root, createBranch) {
 			return "", "", errGitBadRef
@@ -2902,18 +3143,16 @@ func (h *Hub) sessionGitCommit(sid, cwdParam string, files []string,
 			return "", "", err
 		}
 	}
-	addArgs := []string{"add", "--"}
-	for _, f := range files {
-		p, ok := cleanGitPath(f)
-		if !ok || p == "." {
-			return "", "", errGitBadPath
-		}
-		addArgs = append(addArgs, p)
-	}
 	if _, err := gitOp(ctx, root, addArgs...); err != nil {
 		return "", "", err
 	}
-	if _, err := gitOp(ctx, root, "commit", "-m", message); err != nil {
+	// `commit -- <paths>` (not bare `commit -m`) — a staged-but-unselected
+	// file must never ride into this commit, and on a subdirectory-bound
+	// workspace it would also smuggle root-level staged paths past the
+	// fs confinement (W8.2 quality review I1).
+	commitArgs := append([]string{"commit", "-m", message, "--"},
+		addArgs[2:]...)
+	if _, err := gitOp(ctx, root, commitArgs...); err != nil {
 		return "", "", err
 	}
 	if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
@@ -3004,6 +3243,12 @@ func gitOp(ctx context.Context, cwd string, args ...string) (string, error) {
 func sanitizeGitOutput(s, cwd string) string {
 	s = strings.ReplaceAll(s, cwd+string(filepath.Separator), "")
 	s = strings.ReplaceAll(s, cwd, "")
+	// Windows: git echoes some paths forward-slashed (C:/x/y) — scrub that
+	// rendering of the same workspace too or it survives into the client.
+	if sl := filepath.ToSlash(cwd); sl != cwd {
+		s = strings.ReplaceAll(s, sl+"/", "")
+		s = strings.ReplaceAll(s, sl, "")
+	}
 	var b strings.Builder
 	for {
 		i := strings.Index(s, "://")
@@ -3039,6 +3284,9 @@ type rpcHead struct {
 	Params struct {
 		SessionID string `json:"sessionId"`
 		Cwd       string `json:"cwd"` // session/new|load workspace root
+		// _meta carries the _devingo spawn profile (agentType /
+		// refusalFallback) on session/new|load — read by frameProcKeyLocked.
+		Meta json.RawMessage `json:"_meta"`
 	} `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  json.RawMessage `json:"error"`

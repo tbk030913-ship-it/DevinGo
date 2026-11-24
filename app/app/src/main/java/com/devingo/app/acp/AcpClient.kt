@@ -397,10 +397,27 @@ class AcpClient(
         )
     }
 
-    suspend fun newSession(cwd: String): SessionNewResult {
+    /**
+     * New session rooted at [cwd]. [agentType] != Default (and/or a set
+     * [refusalFallback] model) asks the bridge to host it on a dedicated
+     * `devin acp` process spawned with that profile (W8.3); bridges
+     * without the `agentTypes` capability forward the `_meta` keys to
+     * devin, which ignores them.
+     */
+    suspend fun newSession(
+        cwd: String,
+        agentType: AgentType = AgentType.Default,
+        refusalFallback: String = "",
+    ): SessionNewResult {
+        val meta = buildJsonObject {
+            if (agentType != AgentType.Default) put("devingo/agentType", agentType.wire)
+            if (refusalFallback.isNotBlank()) put("devingo/refusalFallback", refusalFallback.trim())
+        }
         val frame = request(
             AcpMethods.SESSION_NEW,
-            json.encodeToJsonElement(SessionNewParams(cwd = cwd)),
+            json.encodeToJsonElement(
+                SessionNewParams(cwd = cwd, _meta = meta.ifEmpty { null }),
+            ),
             timeoutMs = 120_000,
         )
         val result = json.decodeFromJsonElement<SessionNewResult>(frame["result"] ?: frame)
@@ -1759,7 +1776,7 @@ private suspend fun bridgeGitJson(
     query: List<Pair<String, String>> = emptyList(),
     body: JsonObject? = null,
 ): JsonObject = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
+    val client = bridgeHttpClient.newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
         // Mutations get the bridge's own 30s budget plus slack.
         .readTimeout(35, TimeUnit.SECONDS)

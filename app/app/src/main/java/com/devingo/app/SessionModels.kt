@@ -83,6 +83,12 @@ data class UiState(
      * 切后台/切前台/停止 chips.
      */
     val subagentSupported: Boolean = false,
+    /**
+     * Bridge `_devingo/hello` advertised the W8.3 spawn-profile surface
+     * (`_meta` agentType/refusalFallback on session/new|load). False only
+     * when hello answered without the capability — an old bridge.
+     */
+    val agentTypesSupported: Boolean = true,
 )
 
 enum class Kind {
@@ -385,10 +391,12 @@ sealed interface Page {
 }
 
 /** The session an open/switch attempt is aimed at (drawer spinner + retry);
- *  null sessionId = the attempt creates a new session. */
+ *  null sessionId = the attempt creates a new session on [agentType]'s
+ *  `devin acp` profile (W8.3 — Default rides the resident process). */
 data class OpenTarget(
     val sessionId: String?,
     val cwd: String?,
+    val agentType: com.devingo.app.acp.AgentType = com.devingo.app.acp.AgentType.Default,
 )
 
 /** A heads-up for something happening in a session that isn't on screen. */
