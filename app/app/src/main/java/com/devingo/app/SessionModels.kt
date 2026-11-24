@@ -70,11 +70,11 @@ data class UiState(
     /** configOptions entries outside mode/model (effort, thinking, …). */
     val extraConfigOptions: List<ConfigOption> = emptyList(),
     /**
-     * The agent answered a `_cognition.ai/revert/…` call with something
-     * other than method_not_found — optimistic until probed (a failed
-     * `revert/listSteps` flips it and the menu entry hides).
+     * Negotiated at handshake from `agentCapabilities._meta` (A7.1); a
+     * `_cognition.ai/revert/…` call answering method_not_found still flips
+     * it off and the menu entry hides.
      */
-    val revertSupported: Boolean = true,
+    val revertSupported: Boolean = false,
 )
 
 enum class Kind { User, Agent, Thought, Tool, Plan, System, Error }

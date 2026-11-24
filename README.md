@@ -158,6 +158,9 @@ cd app
   多会话活动时会聚合成一张卡片，点击直达首要会话，审批多于 1 个时改为计数）
 - Devin 私有扩展：`_cognition.ai/revert/*`（回退步骤列表 + 分叉）、`_cognition.ai/output`
   （warn/error 级日志）、`available_commands_update`（斜杠命令）
+- 能力协商：`clientCapabilities._meta` 声明全套 `cognition.ai/*` 客户端能力（fs/terminal
+  仍为 false，App 无法应答），握手应答的 `agentCapabilities._meta` 解析为 `AgentCaps`
+  （`ConnectionManager.agentCaps`）供 UI 按能力门控
 - 未知 agent→client 请求（如 `fs/*`、`terminal/*`）统一回 `method_not_found` —— Devin 会自行完成文件/终端操作
 
 ## 安全注意

@@ -292,10 +292,18 @@ class AcpClient(
         json.encodeToJsonElement(
             InitializeParams(
                 protocolVersion = 1,
-                clientCapabilities = ClientCapabilities(),
-                clientInfo = ClientInfo("DevinGo", "0.1.0"),
-                // Probe result: declaring cognition.ai/revert is what makes the
-                // agent echo revert/revertByUserMessageId/revertHistoryRewound.
+                clientCapabilities = ClientCapabilities(
+                    // Devin negotiates its extension surface off
+                    // clientCapabilities._meta — declaring the full set is
+                    // what makes it echo the complete agentCapabilities._meta
+                    // (probe: acptest/probe-logs/01-init-all.log). fs/terminal
+                    // stay false: the app can't host those requests.
+                    elicitation = JsonObject(emptyMap()),
+                    _meta = CLIENT_CAPS_META,
+                ),
+                clientInfo = ClientInfo("DevinGo", "0.2.0"),
+                // Kept from the pre-negotiation declaration — devin still
+                // honors the top-level revert flag.
                 _meta = buildJsonObject { put("cognition.ai/revert", true) },
             ),
         ),
@@ -867,6 +875,18 @@ class AcpClient(
 
     companion object {
         private const val TAG = "AcpClient"
+
+        /**
+         * The `clientCapabilities._meta` declaration that unlocks devin's
+         * full `agentCapabilities._meta` echo — parsed into [AgentCaps].
+         */
+        private val CLIENT_CAPS_META = buildJsonObject {
+            put("cognition.ai/revert", true)
+            put("cognition.ai/multiRootWorkspace", true)
+            put("cognition.ai/subagentSupport", true)
+            put("cognition.ai/sessionRename", true)
+            put("cognition.ai/sessionShare", true)
+        }
     }
 }
 

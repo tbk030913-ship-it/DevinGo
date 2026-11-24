@@ -15,8 +15,9 @@ data class InitializeParams(
     val clientCapabilities: ClientCapabilities,
     val clientInfo: ClientInfo,
     /**
-     * Pass-through for capability metadata (e.g. future revert / elicitation
-     * declarations); null until those are negotiated.
+     * Top-level capability metadata — kept to the revert declaration (devin
+     * negotiates off `clientCapabilities._meta`; this mirrors the gateway's
+     * own initialize params).
      */
     val _meta: JsonObject? = null,
 )
@@ -25,6 +26,18 @@ data class InitializeParams(
 data class ClientCapabilities(
     val fs: FsCapabilities = FsCapabilities(),
     val terminal: Boolean = false,
+    /**
+     * ACP elicitation capability, serialized as an empty object — the app
+     * hosts no elicitation UI, but devin reads the full declared capability
+     * set when deciding what `agentCapabilities._meta` to echo.
+     */
+    val elicitation: JsonObject = JsonObject(emptyMap()),
+    /**
+     * Devin extension negotiation: flags declared here
+     * (`cognition.ai/<name>`) are what the agent echoes back under
+     * `agentCapabilities._meta` (probe: acptest/probe-logs/01-init-all.log).
+     */
+    val _meta: JsonObject? = null,
 )
 
 @Serializable
@@ -42,6 +55,8 @@ data class InitializeResult(
     val authMethods: List<AuthMethod> = emptyList(),
     val agentInfo: AgentInfo? = null,
     val agentCapabilities: JsonObject? = null,
+    /** Result-level metadata — devin puts `mcpConfigPath` here. */
+    val _meta: JsonObject? = null,
 )
 
 @Serializable

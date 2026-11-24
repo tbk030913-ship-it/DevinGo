@@ -7,6 +7,7 @@ import android.net.NetworkCapabilities
 import android.util.Log
 import com.devingo.app.acp.ACP_ERROR_AUTH_REQUIRED
 import com.devingo.app.acp.AcpClient
+import com.devingo.app.acp.AgentCaps
 import com.devingo.app.acp.AcpEvent
 import com.devingo.app.acp.AcpException
 import com.devingo.app.acp.AcpMethods
@@ -91,11 +92,13 @@ class ConnectionManager private constructor(private val app: Application) {
          */
         val connected: Boolean = false,
         /**
-         * Optimistic agent-capability flag: a `_cognition.ai/revert/…` call
-         * returning method_not_found flips it (per-bridge — the capability
-         * belongs to the resident devin build, not to one session).
+         * Whether the agent's revert surface is usable — seeded from the
+         * negotiated [agentCaps] at handshake; a `_cognition.ai/revert/…`
+         * call returning method_not_found still flips it off (per-bridge —
+         * the capability belongs to the resident devin build, not to one
+         * session).
          */
-        val revertSupported: Boolean = true,
+        val revertSupported: Boolean = false,
     )
 
     companion object {
@@ -139,6 +142,14 @@ class ConnectionManager private constructor(private val app: Application) {
 
     private val _conn = MutableStateFlow(ConnState())
     val conn = _conn.asStateFlow()
+
+    /**
+     * The negotiated agent capability set (A7.1) — parsed from the
+     * `initialize` result's `agentCapabilities._meta`; UI gating reads it.
+     * Empty until the first handshake completes (all flags unsupported).
+     */
+    private val _agentCaps = MutableStateFlow(AgentCaps())
+    val agentCaps = _agentCaps.asStateFlow()
 
     /** `_devingo/sessions` cache — null until the first successful load. */
     private val _sessions = MutableStateFlow<List<AcpSession>?>(null)
@@ -313,8 +324,10 @@ class ConnectionManager private constructor(private val app: Application) {
                     socketLive = false
                     dropEpoch()
                     // A different bridge may run a different devin build —
-                    // forget the old revert probe and re-detect on demand.
-                    _conn.update { it.copy(revertSupported = true) }
+                    // drop the negotiated caps; the next initialize
+                    // repopulates them.
+                    _agentCaps.value = AgentCaps()
+                    _conn.update { it.copy(revertSupported = false) }
                 }
             }
             lastCandKey = cand.joinToString("|")
@@ -403,12 +416,15 @@ class ConnectionManager private constructor(private val app: Application) {
             // mid-handshake must not leave a believed-live half-init socket.
             socketLive = true
             canAuthenticate = init.authMethods.isNotEmpty()
+            val caps = AgentCaps.from(init)
+            _agentCaps.value = caps
             _conn.update {
                 it.copy(
                     phase = Phase.Ready,
                     statusText = "",
                     agentTitle = init.agentInfo?.title ?: init.agentInfo?.name,
                     connected = true,
+                    revertSupported = caps.revert,
                 )
             }
             // Stores that outlived a dead socket (reconnect exhausted, or a
@@ -1024,11 +1040,13 @@ class ConnectionManager private constructor(private val app: Application) {
                     val dial = probeActiveHost()
                         ?: throw AcpException("bridge 不可达")
                     client.connect(wsUrl(dial), lastToken)
-                    client.initialize()
+                    val init = client.initialize()
                     runCatching { client.hello(clientId) }
                     // Live only once the handshake completed — a cancel
                     // mid-handshake must not leave a believed-live socket.
                     socketLive = true
+                    val caps = AgentCaps.from(init)
+                    _agentCaps.value = caps
                     // Re-attach every store at its journal cursor — the
                     // replayed gap lands as ordinary events.
                     reattachStores()
@@ -1040,6 +1058,7 @@ class ConnectionManager private constructor(private val app: Application) {
                             reconnecting = false,
                             reconnectRetryAtMs = null,
                             connected = true,
+                            revertSupported = caps.revert,
                         )
                     }
                     refreshSessions()

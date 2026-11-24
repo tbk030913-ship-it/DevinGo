@@ -458,6 +458,51 @@ func TestInitializeServedFromCache(t *testing.T) {
 	}
 }
 
+// (a2) the gateway's own initialize declares the full client-capability
+// set — devin keys its agentCapabilities._meta echo off the flags inside
+// clientCapabilities._meta (probe: acptest/probe-logs/01-init-all.log).
+func TestGatewayInitParamsDeclaresExtensions(t *testing.T) {
+	params := gatewayInitParams()
+	if params["protocolVersion"] != 1 {
+		t.Fatalf("protocolVersion = %v, want 1", params["protocolVersion"])
+	}
+	caps, _ := params["clientCapabilities"].(map[string]any)
+	if caps == nil {
+		t.Fatal("clientCapabilities missing")
+	}
+	fs, _ := caps["fs"].(map[string]any)
+	if fs["readTextFile"] != false || fs["writeTextFile"] != false {
+		t.Fatalf("fs capability = %v, want read/write false", fs)
+	}
+	if caps["terminal"] != false {
+		t.Fatalf("terminal = %v, want false", caps["terminal"])
+	}
+	if _, ok := caps["elicitation"].(map[string]any); !ok {
+		t.Fatalf("elicitation = %v, want empty object", caps["elicitation"])
+	}
+	meta, _ := caps["_meta"].(map[string]any)
+	for _, k := range []string{
+		"cognition.ai/revert",
+		"cognition.ai/multiRootWorkspace",
+		"cognition.ai/subagentSupport",
+		"cognition.ai/sessionRename",
+		"cognition.ai/sessionShare",
+	} {
+		if meta[k] != true {
+			t.Fatalf("clientCapabilities._meta[%q] = %v, want true", k, meta[k])
+		}
+	}
+	top, _ := params["_meta"].(map[string]any)
+	if top["cognition.ai/revert"] != true {
+		t.Fatalf("top-level _meta[cognition.ai/revert] = %v, want true",
+			top["cognition.ai/revert"])
+	}
+	info, _ := params["clientInfo"].(map[string]any)
+	if info["name"] != "devingo-bridge" {
+		t.Fatalf("clientInfo.name = %v, want devingo-bridge", info["name"])
+	}
+}
+
 // (b) client request ids round-trip untouched even though devin saw internal
 // numeric ids.
 func TestRequestIDRewriting(t *testing.T) {

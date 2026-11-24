@@ -270,16 +270,25 @@ func (p *devinProc) run() {
 	p.markReady()
 }
 
-// gatewayInitParams mirrors the app's initialize params: declaring the
-// revert capability is what makes devin echo the _cognition.ai/revert/*
-// surface, and fs/terminal stay false so the agent never routes requests
-// the app can't answer.
+// gatewayInitParams mirrors the app's initialize params: declaring the full
+// client-capability set inside clientCapabilities._meta is what makes devin
+// echo its complete agentCapabilities._meta (probe: acptest/probe-logs/
+// 01-init-all.log), and fs/terminal stay false so the agent never routes
+// requests the app can't answer.
 func gatewayInitParams() map[string]any {
 	return map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
-			"fs":       map[string]any{"readTextFile": false, "writeTextFile": false},
-			"terminal": false,
+			"fs":          map[string]any{"readTextFile": false, "writeTextFile": false},
+			"terminal":    false,
+			"elicitation": map[string]any{},
+			"_meta": map[string]any{
+				"cognition.ai/revert":             true,
+				"cognition.ai/multiRootWorkspace": true,
+				"cognition.ai/subagentSupport":    true,
+				"cognition.ai/sessionRename":      true,
+				"cognition.ai/sessionShare":       true,
+			},
 		},
 		"clientInfo": map[string]any{"name": "devingo-bridge", "version": gatewayVersion},
 		"_meta":      map[string]any{"cognition.ai/revert": true},
