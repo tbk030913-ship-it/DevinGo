@@ -73,6 +73,11 @@ type journalEntry struct {
 	seq   uint64
 	kind  byte
 	frame json.RawMessage // RPC frame as clients see it (internal ids, NO _seq)
+	// jResp only: the client request method the response answers. Carried
+	// into the wrapped _devingo/event so subscribers can tell a real
+	// prompt-result (a turn boundary) from any other session-scoped call's
+	// response — an unrelated error frame is NOT a turn end.
+	method string
 }
 
 // agentReq is an unanswered agent->client request (a permission prompt or a
@@ -125,7 +130,7 @@ type Session struct {
 	jBytes       int
 	nextSeq      uint64 // 1-based; entry seq == nextSeq-1 after append
 	pending      map[int64]*agentReq
-	lastInfo     json.RawMessage // last session/new|load result (configOptions etc.)
+	lastInfo     json.RawMessage // last session/new|load result (configOptions etc.), kept current by syncConfigLocked
 	lastPrompter *Client         // preferred target for non-permission agent requests
 	idleSince    time.Time       // when it last became idle (no subs/in-flight/pending)
 	idleTimer    *time.Timer
@@ -1032,12 +1037,19 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 			h.dropSessionLocked(s, false) // devin already deleted it
 			s = nil
 		}
+	case "session/set_config_option", "session/set_mode", "session/set_model":
+		if !failed {
+			var patch sessionConfigPatch
+			if json.Unmarshal(head.Result, &patch) == nil {
+				s.syncConfigLocked(patch)
+			}
+		}
 	}
 	if s == nil {
 		h.deliverLocked(cr.client, raw)
 		return
 	}
-	entry := h.appendLocked(s, jResp, raw)
+	entry := h.appendLocked(s, jResp, raw, cr.method)
 	h.deliverLocked(cr.client, withSeq(entry))
 	// Other subscribers learn the turn state changed via the wrapped copy.
 	if wrapped := wrapEventFrame(s.id, entry); len(wrapped) > 0 {
@@ -1082,7 +1094,7 @@ func (h *Hub) devinRequest(p *devinProc, line []byte, head rpcHead) {
 		s = h.getSessionLocked(sid, p.key)
 		ar.session = s
 		s.pending[internal] = ar
-		entry := h.appendLocked(s, jReq, wire)
+		entry := h.appendLocked(s, jReq, wire, "")
 		ar.seq = entry.seq
 		targets = h.agentReqTargetsLocked(s, head.Method)
 	} else {
@@ -1197,7 +1209,22 @@ func (h *Hub) devinNotification(p *devinProc, line []byte, head rpcHead) {
 		return
 	}
 	s := h.getSessionLocked(sid, p.key)
-	entry := h.appendLocked(s, jNotif, line)
+	entry := h.appendLocked(s, jNotif, line, "")
+	if head.Method == "session/update" {
+		var env struct {
+			Params struct {
+				Update struct {
+					Kind string `json:"sessionUpdate"`
+					sessionConfigPatch
+				} `json:"update"`
+			} `json:"params"`
+		}
+		if json.Unmarshal(line, &env) == nil &&
+			(env.Params.Update.Kind == "config_option_update" ||
+				env.Params.Update.Kind == "current_mode_update") {
+			s.syncConfigLocked(env.Params.Update.sessionConfigPatch)
+		}
+	}
 	wire := withSeq(entry)
 	pool := s.subs
 	if len(s.loaders) > 0 {
@@ -1214,6 +1241,156 @@ func (h *Hub) devinNotification(p *devinProc, line []byte, head rpcHead) {
 	// this is a no-op (not idle, or timer already armed).
 	s.maybeArmIdleLocked(h)
 	h.mu.Unlock()
+}
+
+// sessionConfigPatch is the config slice of a session/new|load result —
+// re-sent by set_config_option responses and config_option_update
+// notifications; current_mode_update carries only the new mode id.
+type sessionConfigPatch struct {
+	ConfigOptions json.RawMessage `json:"configOptions"`
+	CurrentModeID string          `json:"currentModeId"`
+}
+
+// syncConfigLocked keeps the attach snapshot's config surface current —
+// without it the next _devingo/attach replays the session's creation-time
+// mode/model/effort and the client's UI snaps back. configOptions entries
+// merge by id (a partial array is as safe as a full re-send); the
+// modes/models fields, when the snapshot carries them, win the client's
+// mode/model resolution, so their current ids sync from the matching
+// option too.
+func (s *Session) syncConfigLocked(patch sessionConfigPatch) {
+	if len(s.lastInfo) == 0 {
+		return
+	}
+	var info map[string]json.RawMessage
+	if json.Unmarshal(s.lastInfo, &info) != nil || info == nil {
+		return
+	}
+	changed := false
+	var opts []json.RawMessage
+	if len(patch.ConfigOptions) > 0 &&
+		json.Unmarshal(patch.ConfigOptions, &opts) == nil {
+		var existing []json.RawMessage
+		if cur, ok := info["configOptions"]; ok {
+			_ = json.Unmarshal(cur, &existing)
+		}
+		index := map[string]int{}
+		for i, o := range existing {
+			id, _ := configOptionKind(o)
+			index[id] = i
+		}
+		for _, o := range opts {
+			id, _ := configOptionKind(o)
+			if i, ok := index[id]; ok && id != "" {
+				existing[i] = o
+			} else {
+				index[id] = len(existing)
+				existing = append(existing, o)
+			}
+		}
+		if raw, err := json.Marshal(existing); err == nil {
+			info["configOptions"] = raw
+			changed = true
+		}
+		for _, o := range opts {
+			var k struct {
+				CurrentValue string `json:"currentValue"`
+			}
+			if json.Unmarshal(o, &k) != nil || k.CurrentValue == "" {
+				continue
+			}
+			id, cat := configOptionKind(o)
+			switch {
+			case id == "mode" || cat == "mode":
+				changed = setCurrentLocked(info, "modes", "currentModeId", k.CurrentValue) || changed
+			case id == "model" || cat == "model":
+				changed = setCurrentLocked(info, "models", "currentModelId", k.CurrentValue) || changed
+			}
+		}
+	}
+	if patch.CurrentModeID != "" {
+		changed = setCurrentLocked(info, "modes", "currentModeId", patch.CurrentModeID) || changed
+		changed = patchOptionCurrentLocked(info, "mode", patch.CurrentModeID) || changed
+	}
+	if changed {
+		if raw, err := json.Marshal(info); err == nil {
+			s.lastInfo = raw
+		}
+	}
+}
+
+// configOptionKind returns a config option entry's id and category.
+func configOptionKind(o json.RawMessage) (id, category string) {
+	var k struct {
+		ID       string `json:"id"`
+		Category string `json:"category"`
+	}
+	_ = json.Unmarshal(o, &k)
+	return k.ID, k.Category
+}
+
+// setCurrentLocked patches info[field][key] only when info[field] is an
+// existing object — creating one would flip the client onto an empty
+// modes/models list it previously resolved from configOptions.
+func setCurrentLocked(info map[string]json.RawMessage, field, key, value string) bool {
+	raw, ok := info[field]
+	if !ok {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return false
+	}
+	val, err := json.Marshal(value)
+	if err != nil {
+		return false
+	}
+	obj[key] = val
+	raw, err = json.Marshal(obj)
+	if err != nil {
+		return false
+	}
+	info[field] = raw
+	return true
+}
+
+// patchOptionCurrentLocked rewrites the currentValue of the configOptions
+// entry whose id or category is kind (mode/model/…).
+func patchOptionCurrentLocked(info map[string]json.RawMessage, kind, value string) bool {
+	raw, ok := info["configOptions"]
+	if !ok {
+		return false
+	}
+	var opts []json.RawMessage
+	if json.Unmarshal(raw, &opts) != nil {
+		return false
+	}
+	for i, o := range opts {
+		id, cat := configOptionKind(o)
+		if id != kind && cat != kind {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(o, &obj) != nil || obj == nil {
+			return false
+		}
+		val, err := json.Marshal(value)
+		if err != nil {
+			return false
+		}
+		obj["currentValue"] = val
+		opts[i], err = json.Marshal(obj)
+		if err != nil {
+			return false
+		}
+		raw, err = json.Marshal(opts)
+		if err != nil {
+			return false
+		}
+		info["configOptions"] = raw
+		return true
+	}
+	return false
 }
 
 // ----------------------------------------------------------- _devingo ----
@@ -1503,8 +1680,8 @@ func (s *Session) hasEntry(seq uint64) bool {
 // appendLocked journals one frame, evicting the oldest entries past the
 // ring caps. Pending approvals keep their own copy in agentReq.frame, so
 // eviction never strands an unanswered request.
-func (h *Hub) appendLocked(s *Session, kind byte, frame json.RawMessage) journalEntry {
-	e := journalEntry{seq: s.nextSeq, kind: kind,
+func (h *Hub) appendLocked(s *Session, kind byte, frame json.RawMessage, method string) journalEntry {
+	e := journalEntry{seq: s.nextSeq, kind: kind, method: method,
 		frame: append(json.RawMessage(nil), frame...)}
 	s.nextSeq++
 	s.journal = append(s.journal, e)
@@ -1525,7 +1702,7 @@ func (h *Hub) appendLocked(s *Session, kind byte, frame json.RawMessage) journal
 // pushes it live to subscribers (skipping `except`, e.g. the responder that
 // just resolved the approval). Used for permission_resolved / agent_dead.
 func (h *Hub) broadcastJournalLocked(s *Session, frame json.RawMessage, except *Client) {
-	entry := h.appendLocked(s, jNotif, frame)
+	entry := h.appendLocked(s, jNotif, frame, "")
 	wire := withSeq(entry)
 	for c := range s.subs {
 		if c != except {
@@ -1893,6 +2070,10 @@ func wrapEventFrame(sid string, e journalEntry) []byte {
 	params, err := json.Marshal(map[string]any{
 		"sessionId": sid,
 		"event":     e.frame,
+		// The answered request's method — lets subscribers confine turn-end
+		// handling to session/prompt results instead of guessing from the
+		// payload shape. Absent on frames journaled before this field.
+		"reqMethod": e.method,
 	})
 	if err != nil {
 		return nil

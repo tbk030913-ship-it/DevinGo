@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -39,6 +40,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ui.theme.DevinGoColors
@@ -384,19 +387,22 @@ private fun RunningLabel(
         CapsuleText(label, Modifier.widthIn(max = 200.dp))
     }
     SegmentDivider()
+    // A square glyph, not "停止" text — mid-transition the width clip can
+    // halve a glyph into a stray 停 fragment; a shape clips clean. Same
+    // filled-square affordance as the composer's stop state.
     Box(
         Modifier
             .height(CONTROL_HEIGHT)
             .clip(CircleShape)
             .clickable(onClick = onStop)
+            .semantics { contentDescription = "停止" }
             .padding(horizontal = 14.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            "停止",
-            style = MaterialTheme.typography.labelSmall,
-            color = cs.onSurface,
-            maxLines = 1,
+        Box(
+            Modifier
+                .size(10.dp)
+                .background(cs.onSurface, RoundedCornerShape(2.5.dp)),
         )
     }
 }

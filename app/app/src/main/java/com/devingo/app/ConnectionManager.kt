@@ -631,7 +631,7 @@ class ConnectionManager private constructor(private val app: Application) {
                 val store = createStore(s.sessionId, cwd)
                 store.markSubscribed()
                 store.applySessionConfig(s)
-                store.append(Kind.System, "会话已建立 · $cwd")
+                store.append(Kind.System, "会话已建立 · $cwd", transport = true)
                 bindStore(store)
                 onSessionReady?.invoke(s.sessionId, cwd)
                 refreshSessions()
@@ -650,7 +650,9 @@ class ConnectionManager private constructor(private val app: Application) {
                     bindStore(existing)
                     try {
                         attachStore(existing, announce = false)
-                        existing.append(Kind.System, "已重连并恢复会话")
+                        existing.append(
+                            Kind.System, "已重连并恢复会话", transport = true,
+                        )
                     } catch (e: AcpException) {
                         if (e.isAuthError() && canAuthenticate) {
                             authenticateAndReopen()
@@ -693,7 +695,12 @@ class ConnectionManager private constructor(private val app: Application) {
                 } else {
                     store.markAttached(r)
                 }
-                if (announce) store.append(Kind.System, "会话已恢复 · ${store.cwd}")
+                if (announce) {
+                    store.append(
+                        Kind.System, "会话已恢复 · ${store.cwd}",
+                        transport = true,
+                    )
+                }
             } finally {
                 store.endReplay()
                 // Usually empty — a frame only parks here when it arrived
@@ -1128,6 +1135,11 @@ class ConnectionManager private constructor(private val app: Application) {
                             pendingElicitation = e,
                             turnStartedAtMillis = turnStart,
                             finished = finished,
+                            finishedElapsedMs = if (finished != null && turnStart > 0) {
+                                finishedAt - turnStart
+                            } else {
+                                0L
+                            },
                         ),
                         project = project,
                         finishedAtMillis = if (finished != null) finishedAt else 0L,
@@ -1437,12 +1449,15 @@ class ConnectionManager private constructor(private val app: Application) {
             if (store.attached) continue
             try {
                 attachStore(store, announce = false)
-                store.append(Kind.System, "已重连并恢复会话")
+                store.append(Kind.System, "已重连并恢复会话", transport = true)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "reattach ${store.sessionId}: ${e.message}")
-                store.append(Kind.System, "会话恢复失败: ${e.display()}")
+                store.append(
+                    Kind.System, "会话恢复失败: ${e.display()}",
+                    transport = true,
+                )
             }
         }
     }

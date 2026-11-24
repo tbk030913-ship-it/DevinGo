@@ -149,6 +149,14 @@ data class ChatItem(
      * bubble gets a "↪ 已转向" corner badge (U5.4).
      */
     val steered: Boolean = false,
+    /**
+     * Connection/session-lifecycle banner (restore, disconnect, agent
+     * death) — a boundary marker, not turn content: it renders at the
+     * turn's bottom edge below the work fold instead of wedging between
+     * the reply and its process group. System/Error only — flagging a
+     * work kind (Thought/Tool/Answered) would double-render it.
+     */
+    val transport: Boolean = false,
 )
 
 /** One `diff` content item of a tool call: unified old/new file text. */

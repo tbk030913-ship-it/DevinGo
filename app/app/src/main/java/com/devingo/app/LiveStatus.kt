@@ -56,6 +56,8 @@ fun deriveLiveStatus(
     turnStartedAtMillis: Long,
     /** Set by the caller for a few minutes after a turn ends: Done or Failed. */
     finished: LiveStatus.State? = null,
+    /** Turn duration when [finished] is set — the Done card shows 用时. */
+    finishedElapsedMs: Long = 0,
     /** Pending approvals across all sessions (ConnectionManager.total). */
     pendingCount: Int = 0,
 ): LiveStatus {
@@ -118,10 +120,14 @@ fun deriveLiveStatus(
     }
 
     finished?.let {
+        // Same m:ss the capsule's ticker showed while it ran.
+        val elapsed = finishedElapsedMs / 1000
+        val elapsedText = "${elapsed / 60}:${(elapsed % 60).toString().padStart(2, '0')}"
+        val doneDetail = if (elapsed > 0) "本轮已完成 · 用时 $elapsedText" else "本轮已完成"
         return LiveStatus(
             state = it,
             title = title,
-            detail = if (it == LiveStatus.State.Failed) "本轮失败" else "本轮已完成",
+            detail = if (it == LiveStatus.State.Failed) "本轮失败" else doneDetail,
             startedAtMillis = turnStartedAtMillis,
             sessionId = ui.sessionId,
         )

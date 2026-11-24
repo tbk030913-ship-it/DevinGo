@@ -55,6 +55,8 @@ class TranscriptCache(context: Context, private val json: Json) {
         val attachmentCount: Int = 0,
         /** U5.4: the mid-turn "↪ 已转向" badge survives cache restores too. */
         val steered: Boolean = false,
+        /** Transport banners keep their turn-edge placement across restores. */
+        val transport: Boolean = false,
     )
 
     @Serializable

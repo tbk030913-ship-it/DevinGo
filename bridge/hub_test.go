@@ -35,6 +35,8 @@ type rpcMsg = map[string]any
 //	session/prompt -> three chunk updates; "PERM" in the prompt text also
 //	                emits session/request_permission with devin-side id 910,
 //	                then the prompt result
+//	session/set_config_option -> updates the stub's current mode/model and
+//	                answers with the full configOptions array (as devin does)
 //	session/list -> one canned entry (sessionId S001)
 //	test/hang    -> never responds (in-flight request for proc-death test)
 //	test/ghost   -> one session/update for unhosted GHOST-SESSION, then {}
@@ -53,10 +55,38 @@ import (
 type rpc = map[string]any
 
 var seq int
+var curMode = "accept-edits"
+var curModel = "swe-2-high"
+
+var modeChoices = []any{
+	rpc{"id": "accept-edits", "name": "Accept Edits"},
+	rpc{"id": "plan", "name": "Plan"},
+	rpc{"id": "ask", "name": "Ask"},
+}
+var modelChoices = []any{
+	rpc{"id": "swe-2-high", "name": "SWE-2 High"},
+	rpc{"id": "adaptive", "name": "Adaptive"},
+}
 
 func send(m rpc) {
 	b, _ := json.Marshal(m)
 	fmt.Println(string(b))
+}
+
+// Both config shapes: devin answers configOptions, the classic ACP
+// modes/models objects ride along so attach-snapshot sync has both
+// surfaces to keep current (the client prefers modes/models).
+func sessionConfig() rpc {
+	return rpc{
+		"configOptions": []any{
+			rpc{"id": "mode", "category": "mode", "type": "select", "currentValue": curMode,
+				"options": modeChoices},
+			rpc{"id": "model", "category": "model", "type": "select", "currentValue": curModel,
+				"options": modelChoices},
+		},
+		"modes":  rpc{"currentModeId": curMode, "availableModes": modeChoices},
+		"models": rpc{"currentModelId": curModel, "availableModels": modelChoices},
+	}
 }
 
 func respond(id any, result rpc) {
@@ -124,11 +154,31 @@ func main() {
 			respond(id, rpc{})
 		case "session/new":
 			seq++
-			respond(id, rpc{"sessionId": fmt.Sprintf("S%03d", seq), "configOptions": []any{}})
+			res := sessionConfig()
+			res["sessionId"] = fmt.Sprintf("S%03d", seq)
+			respond(id, res)
 		case "session/load":
 			notifyUpdate(sid, "replay-1")
 			notifyUpdate(sid, "replay-2")
-			respond(id, rpc{"configOptions": []any{}})
+			respond(id, sessionConfig())
+		case "session/set_config_option":
+			cid, _ := params["configId"].(string)
+			val, _ := params["value"].(string)
+			switch cid {
+			case "mode":
+				curMode = val
+			case "model":
+				curModel = val
+			}
+			respond(id, sessionConfig())
+		case "test/modeupdate":
+			// Emits a current_mode_update ahead of its empty result —
+			// exercises the notification-side snapshot sync.
+			send(rpc{"jsonrpc": "2.0", "method": "session/update", "params": rpc{
+				"sessionId": sid,
+				"update":    rpc{"sessionUpdate": "current_mode_update", "currentModeId": "ask"},
+			}})
+			respond(id, rpc{})
 		case "session/prompt":
 			text := ""
 			if blocks, ok := params["prompt"].([]any); ok && len(blocks) > 0 {
@@ -579,6 +629,7 @@ func TestAttachReplaysJournal(t *testing.T) {
 
 	var seqs []float64
 	var updates, wrapped int
+	var reqMethods []string
 	for uint64(lastSeq) > uint64(len(seqs)) {
 		m := b.next(t, 10*time.Second)
 		seq, _ := m["_seq"].(float64)
@@ -592,6 +643,9 @@ func TestAttachReplaysJournal(t *testing.T) {
 			}
 		case "_devingo/event":
 			wrapped++
+			p, _ := m["params"].(rpcMsg)
+			rm, _ := p["reqMethod"].(string)
+			reqMethods = append(reqMethods, rm)
 		}
 	}
 	for i := 1; i < len(seqs); i++ {
@@ -604,6 +658,16 @@ func TestAttachReplaysJournal(t *testing.T) {
 	}
 	if wrapped < 2 {
 		t.Fatalf("expected >=2 _devingo/event wraps (new+prompt results), got %d", wrapped)
+	}
+	// The wrap must name the answered request — subscribers confine
+	// turn-end handling to session/prompt results (bogus ends wedge
+	// running off mid-turn and fire false done-notifications).
+	want := map[string]bool{"session/new": true, "session/prompt": true}
+	for _, rm := range reqMethods {
+		delete(want, rm)
+	}
+	if len(want) > 0 {
+		t.Fatalf("wrapped reqMethods %v missing %v", reqMethods, want)
 	}
 }
 
@@ -1519,4 +1583,61 @@ func TestSessionsSupersedeAnswersDisplaced(t *testing.T) {
 	if resp["error"] == nil {
 		t.Fatalf("superseded sessions request got no error: %v", resp)
 	}
+}
+
+// The attach snapshot must track config changes — a stale lastInfo replays
+// the session's creation-time mode/model and the client's UI snaps back.
+// Covers both sync paths: the set_config_option response array and the
+// current_mode_update notification.
+func TestAttachSeesConfigChanges(t *testing.T) {
+	setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+	a := dialClient(t, srv)
+
+	a.request(t, 1, "session/new", rpcMsg{"cwd": "C:/proj"})
+	resp := a.awaitID(t, 1, 20*time.Second)
+	sid, _ := resp["result"].(rpcMsg)["sessionId"].(string)
+	if sid == "" {
+		t.Fatalf("session/new: %v", resp)
+	}
+
+	// The snapshot carries both config shapes: the configOptions entry
+	// (devin's surface) and the classic modes object (which the client
+	// prefers when present). Both must stay synced.
+	curModes := func(id int) (opt, modes string) {
+		a.request(t, id, "_devingo/attach", rpcMsg{"sessionId": sid})
+		res, _ := a.awaitID(t, id, 20*time.Second)["result"].(rpcMsg)
+		sess, _ := res["session"].(rpcMsg)
+		opts, _ := sess["configOptions"].([]any)
+		for _, o := range opts {
+			if om, _ := o.(rpcMsg); om["id"] == "mode" {
+				opt, _ = om["currentValue"].(string)
+			}
+		}
+		m, _ := sess["modes"].(rpcMsg)
+		modes, _ = m["currentModeId"].(string)
+		return opt, modes
+	}
+	check := func(id int, want, where string) {
+		if opt, modes := curModes(id); opt != want || modes != want {
+			t.Fatalf("%s: mode = %q/%q (configOptions/modes), want %q", where, opt, modes, want)
+		}
+	}
+	check(2, "accept-edits", "baseline")
+
+	// Response-side sync: set_config_option's configOptions array merges
+	// into the snapshot served on the next attach.
+	a.request(t, 3, "session/set_config_option", rpcMsg{
+		"sessionId": sid, "configId": "mode", "value": "plan",
+	})
+	if resp := a.awaitID(t, 3, 20*time.Second); resp["error"] != nil {
+		t.Fatalf("set_config_option: %v", resp["error"])
+	}
+	check(4, "plan", "after set_config_option")
+
+	// Notification-side sync: the stub emits current_mode_update before
+	// its result, so it has already been applied when awaitID returns.
+	a.request(t, 5, "test/modeupdate", rpcMsg{"sessionId": sid})
+	a.awaitID(t, 5, 20*time.Second)
+	check(6, "ask", "after current_mode_update")
 }

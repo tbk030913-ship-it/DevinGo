@@ -391,6 +391,27 @@ class SessionStore(
     private var steerJob: Job? = null
     /** A remote client's turn observed streaming (no local promptJob). */
     private var remoteTurn = false
+    /**
+     * No turn in flight since the last end marker. A straggler journaled
+     * after the prompt result (trailing thought, terminal tool update)
+     * would otherwise re-latch [remoteTurn] with nothing left to clear it
+     * — running wedged on forever. A fresh turn re-opens the gate: a live
+     * UserChunk (peer prompt echo), a NEW ToolCall, an attach/load result,
+     * or our own job's start.
+     */
+    private var turnEnded = false
+    /**
+     * Reopen generation — every new-turn marker bumps it. A prompt/steer
+     * job captures it at start and its finally closes the gate only when
+     * the generation is unchanged, so a peer turn that opened mid-job
+     * keeps its lifecycle instead of being folded into our job's end.
+     */
+    private var turnEpoch = 0
+
+    private fun openTurnGate() {
+        turnEnded = false
+        turnEpoch++
+    }
     /** True once any turn activity (chunk/tool/plan) arrived for the in-flight prompt. */
     @Volatile private var promptAcked = false
 
@@ -622,7 +643,12 @@ class SessionStore(
         // must not trip the coverage check early.
         noteSeq(result.lastSeq)
         result.session?.let { applySessionConfig(it) }
-        remoteTurn = result.running
+        // The hub's running counts OUR in-flight prompt too — while our
+        // job is live it already speaks for the turn; latching remoteTurn
+        // as well would wedge running on past the job's end.
+        remoteTurn = result.running &&
+            promptJob?.isActive != true && steerJob?.isActive != true
+        if (remoteTurn) openTurnGate() else turnEnded = true
         refreshRunning()
         // The hub answers attach BEFORE streaming the backlog: keep the
         // staged copy until the cursor's frames have all landed (or the
@@ -634,6 +660,7 @@ class SessionStore(
     /** Auto-subscribed by the hub: no attach call needed (session/new). */
     fun markSubscribed() {
         attached = true
+        openTurnGate() // brand-new session — no end has happened yet
     }
 
     /** Cursor at replay start — a failed attach rewinds here so a retry
@@ -755,7 +782,11 @@ class SessionStore(
         commitStaged()
         replaying = false
         attached = true
-        remoteTurn = running
+        // Same own-job exclusion as markAttached — the count is hub-side
+        // and includes our in-flight prompts.
+        remoteTurn = running &&
+            promptJob?.isActive != true && steerJob?.isActive != true
+        if (remoteTurn) openTurnGate() else turnEnded = true
         refreshRunning()
         // Replay frames still landing past the response are history — pin the
         // live floor at the cursor so they can't masquerade as a live turn.
@@ -812,6 +843,7 @@ class SessionStore(
     fun liveGap(seq: Long): Boolean = attached && isLive(seq) && seq > lastSeq + 1
 
     private fun remoteTurnActivity() {
+        if (turnEnded) return
         // Our own jobs speak for the turn — remote frames streaming during
         // a prompt/steer mustn't latch remoteTurn, or it outlives the job.
         if (!remoteTurn && promptJob?.isActive != true &&
@@ -838,6 +870,9 @@ class SessionStore(
             }
             is AcpEvent.UserChunk -> {
                 promptAcked = true
+                // A prompt echo is the first frame of a new turn — reopen
+                // the activity gate a post-end straggler had closed.
+                if (isLive(seq)) openTurnGate()
                 flushStreaming()
                 // session/load replays the user's own messages; skip the chunk
                 // if it merely echoes the prompt we just appended locally.
@@ -848,16 +883,33 @@ class SessionStore(
             }
             is AcpEvent.RemoteTurnEnd -> {
                 if (!isLive(seq)) return
+                if (remoteTurn) {
+                    // A peer turn we watched run just finished — same
+                    // heads-up a local prompt's end posts.
+                    notifier.notifyTurnDone(
+                        _ui.value.sessionTitle?.takeIf { it.isNotBlank() }
+                            ?: "DevinGo",
+                        sessionId,
+                    )
+                }
                 remoteTurn = false
+                turnEnded = true
                 refreshRunning()
                 reportStopReason(ev.stopReason)
             }
             is AcpEvent.AgentDead -> {
-                remoteTurn = false
-                refreshRunning()
+                // Replayed deaths must not clobber the attach result's
+                // running state — the process respawns on next demand, so
+                // a historical agent_dead is not a turn boundary.
                 if (isLive(seq)) {
+                    remoteTurn = false
+                    turnEnded = true
+                    refreshRunning()
                     failInflightTools()
-                    append(Kind.Error, "Devin 进程已退出: ${ev.reason}")
+                    append(
+                        Kind.Error, "Devin 进程已退出: ${ev.reason}",
+                        transport = true,
+                    )
                 }
             }
             else -> {
@@ -873,7 +925,12 @@ class SessionStore(
         when (ev) {
             is AcpEvent.ToolCall -> {
                 promptAcked = true
-                if (isLive(seq)) remoteTurnActivity()
+                if (isLive(seq)) {
+                    // A call created from nothing is new-turn work — an
+                    // update's straggler can't forge one.
+                    openTurnGate()
+                    remoteTurnActivity()
+                }
                 if (_subagents.value.any { it.toolCallId == ev.call.toolCallId }) {
                     // Known subagent call re-delivered without its meta —
                     // fold into the subagent list, never the transcript.
@@ -903,7 +960,18 @@ class SessionStore(
             }
             is AcpEvent.SubagentUpdate -> {
                 promptAcked = true
-                if (isLive(seq)) remoteTurnActivity()
+                if (isLive(seq)) {
+                    // Same rule as a new ToolCall — a subagent seen for the
+                    // first time is new-turn work; its status updates
+                    // straggle like any tool's.
+                    if (_subagents.value.none {
+                            it.toolCallId == ev.call.toolCallId
+                        }
+                    ) {
+                        openTurnGate()
+                    }
+                    remoteTurnActivity()
+                }
                 // A call first classified as a plain tool left a transcript
                 // row behind — pull it now that it's known to be a subagent.
                 removeToolRow(ev.call.toolCallId)
@@ -962,8 +1030,15 @@ class SessionStore(
                 if (isLive(seq)) remoteTurnActivity()
                 upsertPlan(ev.entries)
             }
-            is AcpEvent.ModeChanged -> _ui.update { it.copy(currentModeId = ev.modeId) }
-            is AcpEvent.ConfigOptionsUpdated -> applyConfigOptions(ev.options)
+            // Replayed config updates must not stomp the fresh attach
+            // snapshot: a change that arrived while we were detached is
+            // already folded into result.session, and a replayed older
+            // value here would revert it (the snapshot is authoritative
+            // for anything journaled — live events still apply).
+            is AcpEvent.ModeChanged -> {
+                if (isLive(seq)) _ui.update { it.copy(currentModeId = ev.modeId) }
+            }
+            is AcpEvent.ConfigOptionsUpdated -> if (isLive(seq)) applyConfigOptions(ev.options)
             is AcpEvent.SessionTitle -> _ui.update { it.copy(sessionTitle = ev.title) }
             is AcpEvent.UsageUpdate -> {
                 _ui.update {
@@ -1050,7 +1125,7 @@ class SessionStore(
         stagedJob?.cancel()
         failInflightTools()
         refreshRunning()
-        append(Kind.System, "$reason，重连后自动补齐")
+        append(Kind.System, "$reason，重连后自动补齐", transport = true)
     }
 
     private fun failInflightTools() {
@@ -1576,6 +1651,8 @@ class SessionStore(
         promptAcked = true // the turn is live; a steer failure isn't a lost echo
         steerJob = scope.launch {
             remoteTurn = false // our own call now speaks for the turn
+            openTurnGate() // a turn IS in flight again
+            val epoch = turnEpoch
             refreshRunning()
             try {
                 // Same block assembly as send — @-mentions steer as
@@ -1591,8 +1668,14 @@ class SessionStore(
             } finally {
                 // Our own prompt response never returns journaled — this
                 // job's end IS the turn's end. Drop any remoteTurn latch a
-                // post-job chunk set so running can't wedge on.
-                if (steerJob == coroutineContext[Job]) remoteTurn = false
+                // post-job chunk set so running can't wedge on, and close
+                // the gate so a LATER straggler can't latch it back. The
+                // epoch guard keeps a peer turn that opened mid-job — its
+                // frames aren't ours to fold.
+                if (turnEpoch == epoch) {
+                    if (steerJob == coroutineContext[Job]) remoteTurn = false
+                    turnEnded = true
+                }
                 refreshRunning()
             }
         }
@@ -1789,6 +1872,8 @@ class SessionStore(
         promptAcked = false
         promptJob = scope.launch {
             remoteTurn = false // our own job now speaks for the turn
+            openTurnGate() // a turn IS in flight again
+            val epoch = turnEpoch
             refreshRunning()
             try {
                 val result = client.promptBlocks(sessionId, blocks)
@@ -1817,6 +1902,10 @@ class SessionStore(
                     append(Kind.Error, msg)
                 }
             } finally {
+                // The job's end IS the turn's end — close the gate so a
+                // post-job straggler can't latch remoteTurn back on, unless
+                // a newer turn already opened it (peer prompt mid-job).
+                if (turnEpoch == epoch) turnEnded = true
                 // refreshRunning's falling edge releases the next queued
                 // prompt — no explicit drain here or it would send two.
                 refreshRunning()
@@ -3252,6 +3341,7 @@ class SessionStore(
         exitCode: Int? = null,
         attachments: List<ImageAttachment> = emptyList(),
         steered: Boolean = false,
+        transport: Boolean = false,
     ): ChatItem {
         flushStreaming()
         val item = ChatItem(
@@ -3260,6 +3350,7 @@ class SessionStore(
             detail = detail, detailTruncated = detailTruncated,
             exitCode = exitCode, attachments = attachments,
             attachmentCount = attachments.size, steered = steered,
+            transport = transport,
         )
         streamingId = null
         // A Kind.User here is always a live local echo (replayed user text
@@ -3496,6 +3587,7 @@ class SessionStore(
         failed = m.failed,
         attachmentCount = m.attachmentCount,
         steered = m.steered,
+        transport = m.transport,
     )
 
     private fun restoreItem(c: TranscriptCache.CachedItem): ChatItem? {
@@ -3520,6 +3612,7 @@ class SessionStore(
             failed = c.failed,
             attachmentCount = c.attachmentCount,
             steered = c.steered,
+            transport = c.transport,
             isReplay = true,
         )
     }

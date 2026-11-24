@@ -6,10 +6,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.devingo.app.notification.ACTIVITY_DATA_KEYS
 import com.devingo.app.notification.ACTIVITY_MAX_ROWS
@@ -33,6 +35,8 @@ class SessionService : Service() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var idleRepost: Runnable? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     /**
      * The application-level ACP connection owner. Getting it here pins the
@@ -53,6 +57,7 @@ class SessionService : Service() {
             ACTION_STOP -> {
                 idleRepost?.let(mainHandler::removeCallbacks)
                 idleRepost = null
+                releaseWakeLocks()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -81,7 +86,43 @@ class SessionService : Service() {
         scheduleIdleRepost()
         // null intent = START_STICKY restart: repost whatever we last knew.
         startForegroundWithType(buildNotification())
+        holdWakeLocks()
         return START_STICKY
+    }
+
+    /**
+     * The service keeps the process alive but not the CPU: in doze the
+     * OkHttp ping scheduler sleeps with it, the bridge's ping watchdog
+     * (25s + 10s) then drops the socket as half-open — the next wake
+     * surfaces as "连接断开: EOFException". A battery-whitelist exemption
+     * lifts doze's network restriction, never the sleep itself. Held for
+     * the service's whole life — that lifetime already means "socket
+     * stays up" (connected/reconnecting + keepAlive). The WiFi high-perf
+     * lock keeps LAN pings out of power-save batching.
+     */
+    private fun holdWakeLocks() {
+        if (wakeLock == null) {
+            wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "devingo:session")
+                .apply { setReferenceCounted(false) }
+        }
+        if (wakeLock?.isHeld != true) wakeLock?.acquire()
+        if (wifiLock == null) {
+            wifiLock = (applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager)
+                ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "devingo:session")
+                ?.apply { setReferenceCounted(false) }
+        }
+        if (wifiLock?.isHeld != true) runCatching { wifiLock?.acquire() }
+    }
+
+    private fun releaseWakeLocks() {
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        if (wifiLock?.isHeld == true) wifiLock?.release()
+    }
+
+    override fun onDestroy() {
+        releaseWakeLocks()
+        super.onDestroy()
     }
 
     /**
@@ -132,6 +173,7 @@ class SessionService : Service() {
 
     /** dataSync hit its daily quota (API 35+): stop cleanly, don't crash. */
     override fun onTimeout(startId: Int, fgsType: Int) {
+        releaseWakeLocks()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

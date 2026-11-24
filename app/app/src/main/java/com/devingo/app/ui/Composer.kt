@@ -33,7 +33,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -846,12 +845,17 @@ private fun ComposerToolbarRow(
             val canForward by remember {
                 derivedStateOf { scroll.value < scroll.maxValue }
             }
+            // matchParentSize, not fillMaxHeight: a fill takes the full
+            // offered maxHeight (the screen's leftover space, passed down
+            // through the wrap-content rows) and balloons the whole
+            // composer whenever the strip scrolls — matchParentSize only
+            // copies the Box's settled height, never feeds back into it.
             if (canBack) {
                 Box(
                     Modifier
                         .align(Alignment.CenterStart)
                         .width(16.dp)
-                        .fillMaxHeight()
+                        .matchParentSize()
                         .background(
                             Brush.horizontalGradient(
                                 listOf(cs.surfaceContainerHigh, Color.Transparent),
@@ -864,7 +868,7 @@ private fun ComposerToolbarRow(
                     Modifier
                         .align(Alignment.CenterEnd)
                         .width(16.dp)
-                        .fillMaxHeight()
+                        .matchParentSize()
                         .background(
                             Brush.horizontalGradient(
                                 listOf(Color.Transparent, cs.surfaceContainerHigh),

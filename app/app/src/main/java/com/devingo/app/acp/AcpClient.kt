@@ -1128,27 +1128,31 @@ class AcpClient(
                 // _seq even when nothing below surfaces an event — seed it
                 // or the next live frame reads the hole as a gap.
                 if (sessionId != null && seq > 0) seqTracker?.invoke(sessionId, seq)
-                // Only turn-ending frames matter here: a session/prompt
-                // result carries stopReason, a prompt's error frame carries
-                // only `error` — either way the remote turn is over. (An
-                // error on another request kind would just end the marker a
-                // beat early; the next chunk re-marks it.)
-                val frame = p["event"] as? JsonObject
-                val result = frame?.get("result") as? JsonObject
-                val stopReason = (result?.get("stopReason") as? JsonPrimitive)
-                    ?.textOrNull
-                when {
-                    stopReason != null -> emit(
-                        sessionId, seq,
-                        AcpEvent.RemoteTurnEnd(stopReason),
-                    )
-                    frame?.get("error") != null -> emit(
-                        sessionId, seq,
-                        AcpEvent.RemoteTurnEnd(
-                            ((frame["error"] as? JsonObject)?.get("message")
-                                as? JsonPrimitive)?.textOrNull,
-                        ),
-                    )
+                // Only a session/prompt result is a turn boundary — every
+                // other journaled response (set_mode, fs, …) is not, even
+                // when it carries an error: a bogus end would wedge running
+                // off mid-turn and fire a false done-notification. Old
+                // bridges send no reqMethod — treat those as prompt ends,
+                // the pre-tag guess.
+                val reqMethod = (p["reqMethod"] as? JsonPrimitive)?.textOrNull
+                if (reqMethod == null || reqMethod == "session/prompt") {
+                    val frame = p["event"] as? JsonObject
+                    val result = frame?.get("result") as? JsonObject
+                    val stopReason = (result?.get("stopReason") as? JsonPrimitive)
+                        ?.textOrNull
+                    when {
+                        stopReason != null -> emit(
+                            sessionId, seq,
+                            AcpEvent.RemoteTurnEnd(stopReason),
+                        )
+                        frame?.get("error") != null -> emit(
+                            sessionId, seq,
+                            AcpEvent.RemoteTurnEnd(
+                                ((frame["error"] as? JsonObject)?.get("message")
+                                    as? JsonPrimitive)?.textOrNull,
+                            ),
+                        )
+                    }
                 }
             }
             "_cognition.ai/output" -> {

@@ -194,6 +194,11 @@ internal fun buildTranscriptModel(
         queued.forEachIndexed { i, p -> add(RowKind.Queue(i, p.id)) }
         turns.asReversed().forEachIndexed { revIdx, turn ->
             val isLast = revIdx == 0
+            // Transport banners sit at the turn's very edge — index 0 is
+            // the visual bottom, so they emit before the work fold.
+            turn.body.asReversed().forEach { item ->
+                if (item.transport) add(RowKind.Body(item.id, turn.key))
+            }
             if (turn.work.isNotEmpty() || turn.key in subagentKeys ||
                 (isLast && running)
             ) {
@@ -202,8 +207,8 @@ internal fun buildTranscriptModel(
             turn.body.asReversed().forEach { item ->
                 // Thoughts, tools and answered questions collapse into the
                 // turn's WorkRow — they never render as inline body items.
-                if (item.kind != Kind.Thought && item.kind != Kind.Tool &&
-                    item.kind != Kind.Answered
+                if (!item.transport && item.kind != Kind.Thought &&
+                    item.kind != Kind.Tool && item.kind != Kind.Answered
                 ) {
                     add(RowKind.Body(item.id, turn.key))
                 }
@@ -226,14 +231,25 @@ internal fun buildTranscriptModel(
         turnByKey = turns.associateBy { it.key },
         lastItemId = messages.lastOrNull()?.id,
         lastUserId = messages.lastOrNull { it.kind == Kind.User }?.id,
-        runningDetail = messages
-            .lastOrNull { it.kind == Kind.Tool && it.status == "in_progress" }
-            ?.text?.takeIf { it.isNotBlank() }
-            ?: if (messages.lastOrNull { it.kind == Kind.Thought } != null) {
-                "思考中"
-            } else {
-                null
-            },
+        runningDetail = run {
+            val action = messages
+                .lastOrNull { it.kind == Kind.Tool && it.status == "in_progress" }
+                ?.text?.takeIf { it.isNotBlank() }
+                ?: if (messages.lastOrNull { it.kind == Kind.Thought } != null) {
+                    "思考中"
+                } else {
+                    null
+                }
+            // The live turn's step count — same N the WorkRow fold shows;
+            // it accumulates, so the capsule/notification read as progress,
+            // not a static spinner.
+            val steps = turns.lastOrNull()?.work?.size ?: 0
+            when {
+                action == null -> null
+                steps > 0 -> "$action · $steps 步"
+                else -> action
+            }
+        },
         terminalAgentItemIds = terminalAgentIds,
         diffs = buildSessionDiffs(turns),
     )
