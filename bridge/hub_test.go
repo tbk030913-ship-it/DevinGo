@@ -27,18 +27,19 @@ type rpcMsg = map[string]any
 // --- fake devin -------------------------------------------------------------
 //
 // Behavior table:
-//   initialize   -> canned result (marker: agentInfo.name == "stubdevin",
-//                   authMethods: [] so the gateway skips authenticate)
-//   session/new  -> sessionId S001, S002, ... (counter)
-//   session/load -> two replay updates for params.sessionId, then result
-//   session/prompt -> three chunk updates; "PERM" in the prompt text also
-//                   emits session/request_permission with devin-side id 910,
-//                   then the prompt result
-//   session/list -> one canned entry (sessionId S001)
-//   test/hang    -> never responds (in-flight request for proc-death test)
-//   test/ghost   -> one session/update for unhosted GHOST-SESSION, then {}
-//   anything else with an id -> {}
-//   response frames / notifications -> only logged
+//
+//	initialize   -> canned result (marker: agentInfo.name == "stubdevin",
+//	                authMethods: [] so the gateway skips authenticate)
+//	session/new  -> sessionId S001, S002, ... (counter)
+//	session/load -> two replay updates for params.sessionId, then result
+//	session/prompt -> three chunk updates; "PERM" in the prompt text also
+//	                emits session/request_permission with devin-side id 910,
+//	                then the prompt result
+//	session/list -> one canned entry (sessionId S001)
+//	test/hang    -> never responds (in-flight request for proc-death test)
+//	test/ghost   -> one session/update for unhosted GHOST-SESSION, then {}
+//	anything else with an id -> {}
+//	response frames / notifications -> only logged
 const testDevinSrc = `package main
 
 import (

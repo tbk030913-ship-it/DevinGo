@@ -601,6 +601,7 @@ class ConnectionManager private constructor(private val app: Application) {
                     agentType,
                     refusalFallback = Prefs(app).refusalFallbackModel,
                 )
+                Prefs(app).setAgentType(s.sessionId, agentType.wire)
                 val store = createStore(s.sessionId, cwd)
                 store.markSubscribed()
                 store.applySessionConfig(s)
@@ -686,7 +687,18 @@ class ConnectionManager private constructor(private val app: Application) {
      *  itself doesn't carry it. */
     private suspend fun loadInto(store: SessionStore, running: Boolean) {
         store.beginLoad()
-        val r = client.loadSession(store.sessionId, store.cwd)
+        // Re-declare the session's spawn profile (W8.3): a hub-unknown sid
+        // (idle evict, bridge restart) would otherwise silently land on the
+        // resident default agent and lose refusalFallback too.
+        val prefs = Prefs(app)
+        val profile = AgentType.entries.firstOrNull {
+            it.wire == prefs.agentTypeFor(store.sessionId)
+        } ?: AgentType.Default
+        val r = client.loadSession(
+            store.sessionId, store.cwd,
+            agentType = profile,
+            refusalFallback = prefs.refusalFallbackModel,
+        )
         store.finishLoad(r, running)
     }
 

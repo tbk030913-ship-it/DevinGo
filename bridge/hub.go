@@ -101,6 +101,7 @@ type clientReq struct {
 	cwd     string          // params.cwd on session/new|load — the workspace root
 	session *Session        // session marked in-flight at forward time (nil when unscoped)
 	waiter  chan callResult // non-nil for the gateway's own calls
+	fan     bool            // authenticate fan-out copy: response marks authed, never delivered (W8.3)
 }
 
 type callResult struct {
@@ -218,7 +219,9 @@ var modelNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._:\-+/]{0,63}$`)
 
 // spawnProfile reads the _devingo spawn profile out of params._meta:
 // {"devingo/agentType": "review"|"codemap"|"summarizer",
-//  "devingo/refusalFallback": "<model>"} — both optional, "default"/"" mean
+//
+//	"devingo/refusalFallback": "<model>"} — both optional, "default"/"" mean
+//
 // the resident process. A non-empty reject means the request is malformed.
 func spawnProfile(head rpcHead) (agentType, refusalFallback, reject string) {
 	if len(head.Params.Meta) == 0 {
@@ -228,7 +231,9 @@ func spawnProfile(head rpcHead) (agentType, refusalFallback, reject string) {
 		AgentType       string `json:"devingo/agentType"`
 		RefusalFallback string `json:"devingo/refusalFallback"`
 	}
-	_ = json.Unmarshal(head.Params.Meta, &meta)
+	if err := json.Unmarshal(head.Params.Meta, &meta); err != nil {
+		return "", "", "invalid _meta"
+	}
 	switch meta.AgentType {
 	case "", "default":
 	default:
@@ -363,7 +368,9 @@ func (p *devinProc) run() {
 		p.failInit(fmt.Errorf("start %s acp: %w", *devinBin, err))
 		return
 	}
+	p.hub.mu.Lock()
 	p.cmd, p.stdin, p.pid = cmd, stdin, cmd.Process.Pid
+	p.hub.mu.Unlock()
 	if p.key == "" {
 		log.Printf("[%d] devin acp started (resident)", p.pid)
 	} else {
@@ -425,9 +432,9 @@ func gatewayInitParams() map[string]any {
 				"cognition.ai/sessionShare":       true,
 				// A7.6: lifecycle notifications for shell-manager terminals,
 				// user `!` shell commands, and secret asks/sends.
-				"cognition.ai/terminalLifecycle":  true,
-				"cognition.ai/userShellCommand":   true,
-				"cognition.ai/secretSend":         true,
+				"cognition.ai/terminalLifecycle": true,
+				"cognition.ai/userShellCommand":  true,
+				"cognition.ai/secretSend":        true,
 			},
 		},
 		"clientInfo": map[string]any{"name": "devingo-bridge", "version": gatewayVersion},
@@ -635,9 +642,14 @@ func (h *Hub) dispatchReady(p *devinProc, c *Client, data []byte, head rpcHead) 
 			if len(head.ID) > 0 {
 				h.deliver(c, resultFrame(head.ID, json.RawMessage(`{}`)))
 			}
-			return
+		} else {
+			h.forwardToDevin(c, p, head, data) // browser-login fallback
 		}
-		h.forwardToDevin(c, p, head, data) // browser-login fallback
+		// A client login should unlock every live proc, not just the
+		// resident one — a profiled proc spawned before the login has no
+		// path to it otherwise (W8.3 review I1).
+		h.fanAuthenticate(p, head, data)
+		return
 	default:
 		h.forwardToDevin(c, p, head, data)
 	}
@@ -686,6 +698,38 @@ func (h *Hub) procReady(c *Client, data []byte, head rpcHead) *devinProc {
 		h.deliver(c, errorFrame(head.ID, -32000, "devin process unavailable"))
 	}
 	return nil
+}
+
+// fanAuthenticate sends a silent copy of a client-driven authenticate to
+// every OTHER live proc that is still unauthed — a profiled proc spawned
+// before the client logged in has no other way to receive the
+// browser-login fallback (W8.3 review I1). Each proc's devin validates
+// the credential independently; the client is answered by the resident
+// proc's own forward. fan-marked responses only flip proc.authed.
+func (h *Hub) fanAuthenticate(src *devinProc, head rpcHead, data []byte) {
+	if len(head.ID) == 0 {
+		return
+	}
+	h.mu.Lock()
+	var fans []int64
+	procs := map[int64]*devinProc{}
+	for _, q := range h.procs {
+		if q == src || !q.alive.Load() || !q.readyClosed() || q.authed {
+			continue
+		}
+		h.nextID++
+		fans = append(fans, h.nextID)
+		procs[h.nextID] = q
+		h.pendingClient[h.nextID] = &clientReq{proc: q, method: head.Method, fan: true}
+	}
+	h.mu.Unlock()
+	for _, id := range fans {
+		if err := procs[id].writeLine(rewriteID(data, rawInt(id))); err != nil {
+			h.mu.Lock()
+			delete(h.pendingClient, id)
+			h.mu.Unlock()
+		}
+	}
 }
 
 // forwardToDevin rewrites the request id onto the internal sequence,
@@ -859,6 +903,12 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 	}
 	h.mu.Lock()
 	cr := h.pendingClient[n]
+	if cr != nil && cr.proc != p {
+		h.mu.Unlock()
+		log.Printf("devin pid %d answered client id %d owned by pid %d; dropped",
+			p.pid, n, cr.proc.pid)
+		return
+	}
 	delete(h.pendingClient, n)
 	h.mu.Unlock()
 	if cr == nil {
@@ -866,6 +916,14 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 	}
 	if cr.waiter != nil {
 		cr.waiter <- callResult{frame: append([]byte(nil), line...)}
+		return
+	}
+	if cr.fan {
+		if len(head.Error) == 0 || string(head.Error) == "null" {
+			h.mu.Lock()
+			cr.proc.authed = true
+			h.mu.Unlock()
+		}
 		return
 	}
 
@@ -1505,6 +1563,12 @@ func (h *Hub) dropSessionLocked(s *Session, sendClose bool) {
 func (h *Hub) maybeReapProcLocked(key string) {
 	p := h.procs[key]
 	if p == nil || key == "" {
+		return
+	}
+	if p.draining {
+		// markReady's drain pops the queue then dispatches outside the
+		// lock — in that gap an op is neither queued nor pending yet, so
+		// a reap here would eat a legitimately-parked request (M1).
 		return
 	}
 	for _, s := range h.sessions {

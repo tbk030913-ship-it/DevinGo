@@ -431,10 +431,20 @@ class AcpClient(
      * Resume an existing session; history replays as session/update events and
      * the result carries `configOptions` (modes/models) like `session/new`.
      */
-    suspend fun loadSession(id: String, cwd: String): SessionNewResult {
+    suspend fun loadSession(
+        id: String,
+        cwd: String,
+        agentType: AgentType = AgentType.Default,
+        refusalFallback: String = "",
+    ): SessionNewResult {
+        val meta = buildJsonObject {
+            if (agentType != AgentType.Default) put("devingo/agentType", agentType.wire)
+            if (refusalFallback.isNotBlank()) put("devingo/refusalFallback", refusalFallback.trim())
+        }
         val result = request(
             AcpMethods.SESSION_LOAD,
-            json.encodeToJsonElement(SessionLoadParams(sessionId = id, cwd = cwd)),
+            json.encodeToJsonElement(
+                SessionLoadParams(sessionId = id, cwd = cwd, _meta = meta.ifEmpty { null })),
             timeoutMs = 120_000,
         ).let { json.decodeFromJsonElement<SessionNewResult>(it["result"] ?: it) }
         return result.copy(sessionId = result.sessionId.ifEmpty { id })

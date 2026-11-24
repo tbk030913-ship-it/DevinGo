@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
+import org.json.JSONObject
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -142,6 +143,25 @@ class Prefs(context: Context) {
     var refusalFallbackModel: String
         get() = sp.getString("refusalFallbackModel", "") ?: ""
         set(v) = sp.edit().putString("refusalFallbackModel", v).apply()
+
+    /** Per-session spawn profile (W8.3): sid → agentType wire name, so a
+     *  resume's session/load can re-declare the profile the session was
+     *  created with (the wire itself doesn't report it back). */
+    fun agentTypeFor(sid: String): String = try {
+        JSONObject(sp.getString("agentTypes", "{}") ?: "{}").optString(sid)
+    } catch (_: Exception) {
+        ""
+    }
+
+    fun setAgentType(sid: String, wire: String) {
+        val o = try {
+            JSONObject(sp.getString("agentTypes", "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        if (wire.isBlank() || wire == "default") o.remove(sid) else o.put(sid, wire)
+        sp.edit().putString("agentTypes", o.toString()).apply()
+    }
 
     /**
      * Project-group expansion overrides for the session list. Null until the

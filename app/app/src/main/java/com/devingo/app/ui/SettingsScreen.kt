@@ -539,10 +539,15 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
     }
     var value by remember(field) { mutableStateOf(initial) }
     var showSecret by remember { mutableStateOf(false) }
+    var fieldError by remember(field) { mutableStateOf<String?>(null) }
     DevinSheet(title = title, onDismiss = onDismiss) {
         OutlinedTextField(
             value = value,
-            onValueChange = { value = it },
+            onValueChange = { value = it; fieldError = null },
+            isError = fieldError != null,
+            supportingText = {
+                fieldError?.let { Text(it, color = cs.error) }
+            },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             visualTransformation = if (secret && !showSecret) {
@@ -579,15 +584,28 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
         BlackPillButton(
             text = "保存",
             onClick = {
+                var ok = true
                 when (field) {
                     // Manual entries join the candidate list (C5).
                     EditField.Host -> prefs.noteHostCandidate(value.trim())
                     EditField.Token -> prefs.token = value.trim()
                     EditField.Cwd -> prefs.cwd = value.trim()
                     EditField.ApiKey -> prefs.apiKey = value.trim()
-                    EditField.RefusalFallback -> prefs.refusalFallbackModel = value.trim()
+                    // Bridge validates the same charset and -32602s a bad
+                    // name — catch it here so a typo doesn't turn every
+                    // session/new into a silent protocol error (W8.3 M6).
+                    EditField.RefusalFallback -> {
+                        val v = value.trim()
+                        if (v.isEmpty() ||
+                            v.matches(Regex("^[A-Za-z0-9][A-Za-z0-9 ._:\\-+/]{0,63}$"))) {
+                            prefs.refusalFallbackModel = v
+                        } else {
+                            fieldError = "模型名只能含字母数字与 ._:-+/，≤64 字符"
+                            ok = false
+                        }
+                    }
                 }
-                onDismiss()
+                if (ok) onDismiss()
             },
             modifier = Modifier.fillMaxWidth(),
         )

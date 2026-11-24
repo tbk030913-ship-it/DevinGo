@@ -109,6 +109,13 @@ data class SessionLoadParams(
     val sessionId: String,
     val cwd: String,
     val mcpServers: List<JsonObject> = emptyList(),
+    /**
+     * Same spawn profile as [SessionNewParams._meta] (W8.3): on a
+     * hub-unknown sid (idle evict / bridge restart) the bridge needs the
+     * profile to re-spawn the right proc — omitting it silently lands the
+     * resumed session on the resident default agent.
+     */
+    val _meta: JsonObject? = null,
 )
 
 @Serializable
