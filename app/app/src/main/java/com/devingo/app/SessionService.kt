@@ -149,8 +149,8 @@ class SessionService : Service() {
             .setSilent(true)
             // Colorized notifications can't be promoted to Live Updates.
             .setColorized(false)
-            .setContentIntent(openIntent(REQ_CONTENT))
-            .addAction(0, "打开", openIntent(REQ_OPEN))
+            .setContentIntent(openIntent(REQ_CONTENT, status))
+            .addAction(0, "打开", openIntent(REQ_OPEN, status))
 
         // ≥2 live session rows switch the card to the multi-session
         // aggregate; a single session keeps the rich per-session card.
@@ -289,11 +289,16 @@ class SessionService : Service() {
         LiveStatus.State.Idle -> "等待指令"
     }
 
-    private fun openIntent(requestCode: Int): PendingIntent = PendingIntent.getActivity(
-        this, requestCode,
-        Intent(this, MainActivity::class.java),
-        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-    )
+    // The hero session's id rides the tap so an aggregated card lands on
+    // the session that's actually asking/working, not wherever the user
+    // last looked (t3's activity_path deep link).
+    private fun openIntent(requestCode: Int, status: LiveStatus): PendingIntent =
+        PendingIntent.getActivity(
+            this, requestCode,
+            Intent(this, MainActivity::class.java)
+                .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
 
     /**
      * The permission actions fire a broadcast, not the activity: the
@@ -307,7 +312,7 @@ class SessionService : Service() {
      * (Extras don't count toward PendingIntent identity; requestCode does.)
      */
     private fun requestKey(status: LiveStatus): Int =
-        31 * (status.sessionId?.hashCode() ?: 0) + (status.permissionRequestId?.hashCode() ?: 0)
+        31 * (status.sessionId?.hashCode() ?: 0) + status.permissionRequestId.hashCode()
 
     private fun broadcastIntent(
         requestCode: Int,
@@ -343,8 +348,6 @@ class SessionService : Service() {
         const val EXTRA_ACTION_DENY = "deny"
         private const val REQ_CONTENT = 0
         private const val REQ_OPEN = 1
-        private const val REQ_ALLOW = 2
-        private const val REQ_DENY = 3
         private const val EXTRA_STATE = "live_state"
         private const val EXTRA_TITLE = "live_title"
         private const val EXTRA_DETAIL = "live_detail"
@@ -352,7 +355,6 @@ class SessionService : Service() {
         private const val EXTRA_PROMOTE = "live_promote"
         private const val EXTRA_ALLOW_LABEL = "live_allow_label"
         private const val EXTRA_DENY_LABEL = "live_deny_label"
-        private const val EXTRA_FALLBACK_TITLE = "title"
         private const val EXTRA_REQUEST_ID = "live_permission_request_id"
         private const val EXTRA_TOOL_CALL_ID = "live_permission_tool_call_id"
         private const val EXTRA_PENDING_COUNT = "live_pending_count"
@@ -367,9 +369,7 @@ class SessionService : Service() {
 
         fun start(context: Context, title: String?) {
             fallbackTitle = title
-            val intent = Intent(context, SessionService::class.java)
-                .putExtra(EXTRA_FALLBACK_TITLE, title)
-            context.startForegroundService(intent)
+            context.startForegroundService(Intent(context, SessionService::class.java))
         }
 
         /**

@@ -161,7 +161,12 @@ internal class ActivityPresentation(data: Map<String, String>, private val activ
         else -> SpannableStringBuilder().apply {
             rows.forEachIndexed { index, row ->
                 if (index > 0) append("\n")
-                append(statusLine(context, row, row.project.takeUnless { singleProject }.orEmpty()))
+                // Drop the " · project" tail when it would just echo the
+                // title (titleless sessions fall back to the cwd basename).
+                val trailing = row.project
+                    .takeUnless { singleProject || it == row.title }
+                    .orEmpty()
+                append(statusLine(context, row, trailing))
             }
         }
     }
