@@ -20,3 +20,14 @@
 
 - Source: `me.rerere.*` package under `app/app/src/main/java/me/rerere/`,
   ported from RikkaHub (AGPL-3.0). See upstream project for license text.
+
+## t3code mobile modules (T3 Tools Inc.)
+
+- Source: <https://github.com/pingdotgg/t3code>, snapshot cloned at
+  `.research/t3code-20261123/`.
+- Use: Kotlin/Compose ports of `apps/mobile/modules/t3-review-diff`
+  (`app/.../ui/diff/`), `t3-composer-editor` (`ui/ComposerEditor.kt`),
+  `t3-agent-notifications` (`ui/notification/`), `t3-terminal`
+  (`ui/terminal/` — the char-grid frame protocol is also re-implemented
+  server-side in `bridge/pty.go`) and `t3-preview-tunnel` (`bridge/proxy.go`).
+- License: MIT — `LICENSES/t3code-MIT.txt`.

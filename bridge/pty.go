@@ -314,6 +314,8 @@ type ptySession struct {
 	flushScheduled bool
 	killTimer      *time.Timer
 	exited         bool
+	killed         bool      // closed via idle TTL / hub drop — report exit 0
+	closeOnce      sync.Once // conpty.Close isn't idempotent; handle values recycle
 }
 
 func newPtySession(id string, p ptyHandle, cols, rows int) *ptySession {
@@ -376,12 +378,22 @@ func (s *ptySession) flush() {
 	s.broadcastNow()
 }
 
+// closePty releases the ConPTY handles exactly once — the idle timer, hub
+// dropSession and waitForExit can all reach here, and conpty.Close would
+// otherwise double-CloseHandle recycled OS handles.
+func (s *ptySession) closePty() {
+	s.closeOnce.Do(func() { s.pty.Close() })
+}
+
 // waitForExit broadcasts the shell's exit then tears the session down.
 func (s *ptySession) waitForExit(reg *ptyRegistry) {
 	code, _ := s.pty.Wait(context.Background())
 	reg.remove(s.id, s)
 	s.mu.Lock()
 	s.exited = true
+	if s.killed {
+		code = 0 // our own Close makes Wait report STILL_ACTIVE(259)
+	}
 	conns := make([]*ptyConn, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
@@ -393,7 +405,7 @@ func (s *ptySession) waitForExit(reg *ptyRegistry) {
 		c.conn.Write(c.ctx, websocket.MessageText, exitJSON)
 		c.kick(websocket.StatusNormalClosure, "pty exited")
 	}
-	s.pty.Close()
+	s.closePty()
 }
 
 // attach registers a conn and replays the current frame. Refcount bookkeeping
@@ -431,7 +443,10 @@ func (s *ptySession) detach(c *ptyConn) {
 	idle := len(s.conns) == 0 && !s.exited
 	if idle && s.killTimer == nil {
 		s.killTimer = time.AfterFunc(ptyIdleTTL, func() {
-			s.pty.Close() // waitForExit does the rest
+			s.mu.Lock()
+			s.killed = true
+			s.mu.Unlock()
+			s.closePty() // waitForExit does the rest
 		})
 	}
 	s.mu.Unlock()
@@ -509,7 +524,10 @@ func (r *ptyRegistry) dropSession(sid string) {
 	delete(r.byID, sid)
 	r.mu.Unlock()
 	if s != nil {
-		s.pty.Close()
+		s.mu.Lock()
+		s.killed = true
+		s.mu.Unlock()
+		s.closePty()
 	}
 }
 
@@ -527,12 +545,12 @@ type ptyClientMsg struct {
 // origin gates as /acp. The first message attaches a session's workspace
 // shell; later messages feed input, resize or ask for the copyall ring.
 func ptyHandler(w http.ResponseWriter, r *http.Request) {
-	if !ptySupported() {
-		http.Error(w, "terminal console unsupported on this platform", http.StatusNotImplemented)
-		return
-	}
 	if !authorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !ptySupported() {
+		http.Error(w, "terminal console unsupported on this platform", http.StatusNotImplemented)
 		return
 	}
 	if !validOrigin(r) {
