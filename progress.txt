@@ -72,3 +72,4 @@
 2026-11-24 16:05（北京时间）| M9.2 spec审查修复（真机help求证）：devinList改--json（mcp/skills/doctor证实支持，--format仅属models list——此前全部落到文本兜底items=nil）、拆除发明的*_quota_reset_at_unix解码链+resetAtMs字段+卡片重置行（二进制零证据，真实meta是cognition.ai/acuAmount）、refreshMcpServers失败不再永久转圈（error流+InlineRetry）+items空时渲染原始表格防假「暂无」、--force-manual-token-flow注释改borrowed标注；InlineRetry升internal供EcoSheets复用
 2026-11-24 16:40（北京时间）| 批9验收+最终review（代理空返回人工补）：mcpAuthCallback stdin写入截首行防多行注入、loopbackOAuthURL/SSRF门+login map janitor清理+cliNameRe全argv覆盖人工核实通过；README同步mcp/eco端点+session管理面+已知限制（无连接耗时/无quota重置线形/shareId降级）；M9.2 spec修复99ac4c7真机devin --help求证--json
 2026-11-24 16:45（北京时间）| M10 修复审查 7 项（hub 测试/EcoSheets/分支对比/preview 凭据/mcp 重定向/README+BackHandler）+ 设置页检查更新下载安装；review 修复 ?token= 泄露等 6 项；全量验证绿
+2026-11-24 17:05（北京时间）| M10.1 hotfix：_devingo/sessions 空 cwd 时 hub 向 devin 转发 params:null 被 -32602 拒（ListSessionsRequest 要求对象）——callSessionList 恒发 {}；新增 TestSessionListAlwaysSendsParamsObject 钉死；exe 重编

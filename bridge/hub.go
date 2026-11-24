@@ -1857,16 +1857,15 @@ func (h *Hub) callSessionList(cwd, search string) (json.RawMessage, error) {
 			}
 			return nil, initErr
 		}
-		var params map[string]any
-		if cwd != "" || search != "" {
-			params = map[string]any{}
-			if cwd != "" {
-				params["cwd"] = cwd
-			}
-			if search != "" {
-				params["content_search"] = search
-				params["with_message_excerpts"] = true
-			}
+		// devin rejects `params:null` for session/list — it wants the
+		// (possibly empty) ListSessionsRequest object, always.
+		params := map[string]any{}
+		if cwd != "" {
+			params["cwd"] = cwd
+		}
+		if search != "" {
+			params["content_search"] = search
+			params["with_message_excerpts"] = true
 		}
 		return h.callDevin(p, devinCallTimeout, "session/list", params)
 	}

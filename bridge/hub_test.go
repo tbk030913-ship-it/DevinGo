@@ -886,6 +886,25 @@ func TestSessionListServedAfterRespawn(t *testing.T) {
 	}
 }
 
+// Regression: _devingo/sessions with no cwd/search must still forward a
+// params OBJECT — devin answers -32602 when the field is absent/null
+// ("invalid type: null, expected struct ListSessionsRequest").
+func TestSessionListAlwaysSendsParamsObject(t *testing.T) {
+	stats := setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+
+	c := dialClient(t, srv)
+	c.request(t, 1, "_devingo/sessions", rpcMsg{})
+	if resp := c.awaitID(t, 1, 60*time.Second); resp["error"] != nil {
+		t.Fatalf("_devingo/sessions: %v", resp["error"])
+	}
+	// Stats carry raw request lines; the frame's keys marshal sorted, so
+	// "method":"session/list","params":{ must appear verbatim.
+	if n := countStats(t, stats, `"method":"session/list","params":{`); n != 1 {
+		t.Fatalf("session/list params was not an object:\n%s", readStats(t, stats))
+	}
+}
+
 // _devingo/detach must actually unsubscribe: no more session traffic, and
 // the hub's sub set shrinks.
 func TestDetachRemovesSubscription(t *testing.T) {
