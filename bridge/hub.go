@@ -1311,6 +1311,7 @@ func (h *Hub) dropSessionLocked(s *Session, sendClose bool) {
 	for c := range s.subs {
 		delete(c.sessions, s)
 	}
+	ptySessions.dropSession(s.id) // kill a terminal console bound to this session
 	if sendClose {
 		if p := h.proc; p != nil && p.alive.Load() && p.isReady() {
 			go h.callDevin(p, devinCallTimeout, "session/close",

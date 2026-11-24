@@ -133,6 +133,9 @@ func main() {
 	mux.HandleFunc("/fs/write", fsWriteHandler)
 	mux.HandleFunc("/fs/list", fsListHandler)
 	mux.HandleFunc("/git/diff", gitDiffHandler)
+	mux.HandleFunc("/pty", ptyHandler)
+	mux.HandleFunc("/preview/", previewProxyHandler)
+	mux.HandleFunc("/preview-auth", previewAuthHandler)
 	mux.HandleFunc("/pair", pairHandler)
 	mux.HandleFunc("/pair/qr.png", pairQRHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -143,6 +146,9 @@ func main() {
 		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
 		fmt.Fprintln(w, "  POST /fs/list  - list files inside a session workspace")
 		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
+		fmt.Fprintln(w, "  WS  /pty       - terminal console (ConPTY shell in a session workspace)")
+		fmt.Fprintln(w, "  GET /preview/{port}/ - reverse proxy to a localhost dev server (WebView preview)")
+		fmt.Fprintln(w, "  GET /preview-auth?port=N - mint the preview cookie then redirect into the tunnel")
 		fmt.Fprintln(w, "  WS  /acp       - ACP session host (plain ACP + _devingo/* extensions)")
 	})
 

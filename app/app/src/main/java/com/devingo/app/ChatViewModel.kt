@@ -205,6 +205,9 @@ class ChatViewModel(
     /** The bound session's working directory (fixed at store creation). */
     val boundCwd: String get() = store?.cwd.orEmpty()
 
+    /** Bridge http base + token for /pty + /preview (same address /fs uses). */
+    fun bridgeEndpoint(): Pair<String, String?>? = cm.bridgeEndpoint()
+
     fun send(): Boolean {
         val s = store ?: return false
         // The store's draft is the truth — a keystroke in the same frame

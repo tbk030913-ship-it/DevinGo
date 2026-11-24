@@ -70,6 +70,9 @@ import com.devingo.app.UiState
 import com.devingo.app.ui.diff.ReviewRequest
 import com.devingo.app.ui.diff.ReviewSheet
 import com.devingo.app.ui.diff.formatReviewCitation
+import com.devingo.app.ui.terminal.PreviewSheet
+import com.devingo.app.ui.terminal.TerminalSheet
+import com.devingo.app.ui.terminal.detectPreviewPort
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -116,6 +119,13 @@ fun ChatScreen(
     var citationSheet by remember { mutableStateOf(false) }
     // N6.1: which review the sheet shows — a turn scope, or the session's.
     var reviewRequest by remember { mutableStateOf<ReviewRequest?>(null) }
+    // N6.4: terminal + preview sheets — keyed by session so a session
+    // switch drops the console socket along with the sheet.
+    var terminalOpen by remember(ui.sessionId) { mutableStateOf(false) }
+    var previewOpen by remember(ui.sessionId) { mutableStateOf(false) }
+    // Scanned at open time, not per-frame: newest localhost/127.0.0.1 port
+    // the transcript mentions (N6.4).
+    var previewPort by remember(ui.sessionId) { mutableStateOf<Int?>(null) }
     // Per-turn inline work-log expansion; survives scrolling via the map.
     val expandedWork = remember(ui.sessionId) { mutableStateMapOf<Long, Boolean>() }
 
@@ -184,6 +194,11 @@ fun ChatScreen(
             onOpenModel = { modelSheet = true },
             onOpenInfo = { infoSheet = true },
             onOpenReview = { reviewRequest = ReviewRequest.Session() },
+            onOpenTerminal = { terminalOpen = true },
+            onOpenPreview = {
+                previewPort = detectPreviewPort(model, tail)
+                previewOpen = true
+            },
             onRevert = vm::loadRevertSteps,
             onDisconnect = vm::disconnect,
         )
@@ -413,6 +428,28 @@ fun ChatScreen(
             onDismiss = { reviewRequest = null },
         )
     }
+    // N6.4: terminal console + web preview for this session's workspace.
+    if (terminalOpen) {
+        val ep = vm.bridgeEndpoint()
+        TerminalSheet(
+            sessionId = ui.sessionId.orEmpty(),
+            project = vm.boundCwd.substringAfterLast('/')
+                .substringAfterLast('\\')
+                .ifBlank { ui.sessionTitle.orEmpty() },
+            httpBase = ep?.first.orEmpty(),
+            token = ep?.second,
+            onDismiss = { terminalOpen = false },
+        )
+    }
+    if (previewOpen) {
+        val ep = vm.bridgeEndpoint()
+        PreviewSheet(
+            port = previewPort,
+            httpBase = ep?.first.orEmpty(),
+            token = ep?.second,
+            onDismiss = { previewOpen = false },
+        )
+    }
     val clipboard = LocalClipboard.current
     val reducedMotion = isReducedMotion()
     val c = citation
@@ -464,6 +501,8 @@ private fun ChatTopBar(
     onOpenModel: () -> Unit,
     onOpenInfo: () -> Unit,
     onOpenReview: () -> Unit,
+    onOpenTerminal: () -> Unit,
+    onOpenPreview: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -572,6 +611,17 @@ private fun ChatTopBar(
                                 onRevert()
                             })
                         }
+                        DevinMenuDivider()
+                        // N6.4: terminal console + dev-server preview for
+                        // the bound session's workspace.
+                        DevinMenuItem("终端控制台", onClick = {
+                            menuOpen = false
+                            onOpenTerminal()
+                        })
+                        DevinMenuItem("预览", onClick = {
+                            menuOpen = false
+                            onOpenPreview()
+                        })
                         DevinMenuDivider()
                         DevinMenuItem(
                             "清除会话状态",

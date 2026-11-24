@@ -1370,6 +1370,12 @@ class ConnectionManager private constructor(private val app: Application) {
         return if (tailPending) "局域网不通，Tailscale 未连接" else "bridge 不可达"
     }
 
+    /** The last-dialed bridge as (http base, token) — /pty + /preview share
+     *  the same address and bearer auth as the /fs + /git endpoints. Null
+     *  when the bridge hasn't been dialed yet. */
+    fun bridgeEndpoint(): Pair<String, String?>? =
+        if (dialHost.isBlank()) null else healthUrl(dialHost) to lastToken
+
     private fun wsUrl(host: String): String = when {
         host.startsWith("ws://") || host.startsWith("wss://") ->
             if (host.endsWith("/acp")) host else "$host/acp"
