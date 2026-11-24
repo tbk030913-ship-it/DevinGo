@@ -83,6 +83,12 @@ POST 一条纯文本 `有新审批` / `任务完成`（不带任何会话内容�
   一个 shell、零挂载 15min 自动回收，hub 丢会话即杀）
 - `GET /preview/{port}/` → localhost:{port} 开发服务器反向代理（Bearer 或
   `devingo_prev` cookie 鉴权；`GET /preview-auth?port=N` 先种 cookie 再 302 进隧道）
+- `GET /mcp/list?sessionId|cwd` → `devin mcp list`（`--json` 优先、文本兜底）
+- `POST /mcp/toggle` → `devin mcp enable|disable <name>`（仅 App 用户点开关时调用）
+- `POST /mcp/login` + `GET ?name=` → `devin mcp login` 驻留进程（stdin 手动流，
+  4min 生命周期）；`POST /mcp/authCallback` 回贴 OAuth 回调（仅 loopback URL）
+- `GET /skills|rules|plugins /list`、`/skills|rules/show?name=` → `devin <x>` 只读查看
+- `GET /doctor` → `devin doctor` 诊断输出（90s 上限）
 - `WS  /acp`     → ACP 会话托管（标准 ACP + `_devingo/*` 私有扩展，见下）
 
 行为要点：单条 WS 消息上限 4MiB（默认 32KiB 会断大 payload）；最多 8 个并发 `/acp`
@@ -154,14 +160,19 @@ cd app
 
 - `initialize` / `authenticate` / `session/new` / `session/load` / `session/prompt` /
   `session/cancel` / `session/delete` / `session/close`
-- `session/set_config_option`（mode / model / effort 等统一入口）、`session/list`、
-  `_cognition.ai/session/rename`
+- `session/set_config_option`（mode / model / effort 等统一入口）、`session/list`
+  （`content_search`+`with_message_excerpts` 全文检索，cap `sessionListContentSearch`
+  门控）、`_cognition.ai/session/rename`、`_cognition.ai/session/share`（guest
+  链接，未配置时优雅降级）、`session/close` `_meta cognition.ai/force`（强制接管
+  其他终端锁定的会话）
 - `session/update` 通知：agent 回复流式追加、思考流、tool_call(+update)、plan、
   mode/model 变更、token 用量、上下文压缩
 - `session/request_permission` → App 内审批卡 + 系统通知（锁屏可直接允许/拒绝；
   多会话活动时会聚合成一张卡片，点击直达首要会话，审批多于 1 个时改为计数）
 - Devin 私有扩展：`_cognition.ai/revert/*`（回退步骤列表 + 分叉）、`_cognition.ai/output`
-  （warn/error 级日志）、`available_commands_update`（斜杠命令）
+  （warn/error 级日志）、`available_commands_update`（斜杠命令）、
+  `_cognition.ai/mcp/*`（serversChanged/authorizationRequired/Finished →
+  MCP 面板刷新与授权横幅）
 - 能力协商：`clientCapabilities._meta` 声明全套 `cognition.ai/*` 客户端能力（fs/terminal
   仍为 false，App 无法应答），握手应答的 `agentCapabilities._meta` 解析为 `AgentCaps`
   （`ConnectionManager.agentCaps`）供 UI 按能力门控
@@ -203,3 +214,7 @@ cd app
   仍列出但标灰）
 - 专项 Agent 的 profiled proc 上 `session/list`、`authenticate` 仍走 default proc
   （凭据由网关在 spawn 时注入）；profiled 会话的空闲回收粒度是「无会话无在途」
+- 会话分享：`_cognition.ai/session/share` 未配置 handler 时只导 .md 不附链接；
+  搜索结果摘要按多种键宽容解码（`cognition.ai/messageExcerpts` 优先）
+- MCP 面板不显示「连接耗时」——`devin mcp list` 未上报该字段；额度卡的重置时间
+  不显示——二进制无 reset 线形（真实 quota meta 是 `cognition.ai/acuAmount`）
