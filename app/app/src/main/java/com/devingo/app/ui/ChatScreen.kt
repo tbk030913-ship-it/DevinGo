@@ -73,8 +73,10 @@ import com.devingo.app.ui.terminal.PreviewSheet
 import com.devingo.app.ui.terminal.TerminalSheet
 import com.devingo.app.ui.terminal.detectPreviewPort
 import com.devingo.app.ui.theme.DevinGoColors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.Diff
@@ -123,6 +125,7 @@ fun ChatScreen(
         LazyListState()
     }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     var modelSheet by remember { mutableStateOf(false) }
     var infoSheet by remember { mutableStateOf(false) }
@@ -152,6 +155,10 @@ fun ChatScreen(
     // the agent's detail sheet. Both keyed by session — a switch drops them.
     var subagentListOpen by remember(ui.sessionId) { mutableStateOf(false) }
     var detailSubagentId by remember(ui.sessionId) { mutableStateOf<String?>(null) }
+    // M9.1: the ··· menu's 重命名 sheet — session-keyed like the rest.
+    var renameSheet by remember(ui.sessionId) { mutableStateOf(false) }
+    var renameSubmitting by remember { mutableStateOf(false) }
+    var renameError by remember { mutableStateOf<String?>(null) }
     // Match on the stable toolCallId too — the entry's `id` upgrades when a
     // late frame names the wire agentId, and a sheet keyed on the old id
     // mustn't detach mid-view.
@@ -255,6 +262,25 @@ fun ChatScreen(
             onOpenPreview = {
                 previewPort = detectPreviewPort(model, tail)
                 previewOpen = true
+            },
+            // M9.1: 重命名 (cap-gated) + 分享 / 导出 Markdown.
+            canRename = !agentCaps.metaNegotiated || agentCaps.sessionRename,
+            onRename = { renameSheet = true },
+            onShare = {
+                scope.launch {
+                    val title = ui.sessionTitle?.takeIf { it.isNotBlank() }
+                        ?: ui.sessionId.orEmpty()
+                    val markdown = withContext(Dispatchers.Default) {
+                        vm.exportTranscriptMarkdown()
+                    } ?: return@launch
+                    val shareUrl =
+                        if (!agentCaps.metaNegotiated || agentCaps.sessionShare) {
+                            vm.sessionShareUrl()
+                        } else {
+                            null
+                        }
+                    shareSessionMarkdown(context, title, markdown, shareUrl)
+                }
             },
             onRevert = vm::loadRevertSteps,
             onDisconnect = vm::disconnect,
@@ -579,7 +605,6 @@ fun ChatScreen(
             onDismiss = { detailSubagentId = null },
         )
     }
-    val context = LocalContext.current
     reviewRequest?.let { req ->
         ReviewSheet(
             diffs = model.diffs,
@@ -679,6 +704,29 @@ fun ChatScreen(
             onDismiss = { citationSheet = false },
         )
     }
+    // M9.1: the ··· menu's 重命名 — the VM's wire call also patches the
+    // shared session cache so Home reflects it.
+    if (renameSheet) {
+        RenameSessionSheet(
+            initialTitle = ui.sessionTitle.orEmpty(),
+            submitting = renameSubmitting,
+            error = renameError,
+            onSubmit = { title ->
+                scope.launch {
+                    renameSubmitting = true
+                    renameError = ui.sessionId?.let {
+                        vm.renameSession(it, title)
+                    } ?: "会话未绑定"
+                    renameSubmitting = false
+                    if (renameError == null) renameSheet = false
+                }
+            },
+            onDismiss = {
+                renameSheet = false
+                renameError = null
+            },
+        )
+    }
 }
 
 // ---- top bar ---------------------------------------------------------------------
@@ -704,6 +752,12 @@ private fun ChatTopBar(
     /** W8.2: one-line `branch · n 处改动` shown under the Git menu row. */
     gitSummary: String?,
     onOpenPreview: () -> Unit,
+    /** M9.1: `sessionRename` cap was negotiated (or caps not yet known). */
+    canRename: Boolean,
+    /** M9.1: the 重命名 sheet. */
+    onRename: () -> Unit,
+    /** M9.1: 分享 / 导出 Markdown — FileProvider + ACTION_SEND. */
+    onShare: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -816,6 +870,13 @@ private fun ChatTopBar(
                             menuOpen = false
                             onOpenInfo()
                         })
+                        // M9.1: hidden when `sessionRename` wasn't negotiated.
+                        if (canRename) {
+                            DevinMenuItem("重命名", onClick = {
+                                menuOpen = false
+                                onRename()
+                            })
+                        }
                         // P4: agents without the revert surface get no entry.
                         if (ui.revertSupported) {
                             DevinMenuItem("回退 / 分叉", onClick = {
@@ -853,6 +914,12 @@ private fun ChatTopBar(
                         DevinMenuItem("预览", onClick = {
                             menuOpen = false
                             onOpenPreview()
+                        })
+                        // M9.1: transcript export works locally even when
+                        // `sessionShare` wasn't negotiated (no URL then).
+                        DevinMenuItem("分享 / 导出 Markdown", onClick = {
+                            menuOpen = false
+                            onShare()
                         })
                         DevinMenuDivider()
                         DevinMenuItem(

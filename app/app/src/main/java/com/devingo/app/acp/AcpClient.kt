@@ -492,11 +492,20 @@ class AcpClient(
 
     /**
      * `session/list` — returns the raw result JsonObject so callers can pick
-     * out `_meta` fields (external URLs, working dir, …) themselves.
+     * out `_meta` fields (external URLs, working dir, …) themselves. A
+     * non-blank [contentSearch] is forwarded as `content_search` +
+     * `with_message_excerpts` — full-text matching negotiated via
+     * `cognition.ai/sessionListContentSearch` (M9.1).
      */
-    suspend fun sessionList(cwd: String? = null): JsonObject = request(
+    suspend fun sessionList(cwd: String? = null, contentSearch: String? = null): JsonObject = request(
         AcpMethods.SESSION_LIST,
-        json.encodeToJsonElement(SessionListParams(cwd)),
+        json.encodeToJsonElement(
+            SessionListParams(
+                cwd = cwd,
+                content_search = contentSearch?.ifBlank { null },
+                with_message_excerpts = contentSearch?.isNotBlank() == true,
+            ),
+        ),
     ).let { (it["result"] as? JsonObject) ?: it }
 
     /** `session/list` decoded — lock/plan flags ride flat on each entry. */
@@ -513,22 +522,56 @@ class AcpClient(
                 sessionId = id,
                 title = o.strField("title", "name") ?: meta?.strField("title"),
                 cwd = o.strField("cwd", "workingDirectory", "working_directory"),
-                isLocked = o.boolField("isLocked") ?: meta?.boolField("isLocked") ?: false,
+                // Newer builds nest these under _meta as cognition.ai/<name>
+                // (probe: acptest/probe-logs/02-session-list.log) — the flat
+                // spellings stay first for the 3000.12.x shape.
+                isLocked = o.boolField("isLocked") ?: meta?.boolField("isLocked")
+                    ?: meta?.boolField("cognition.ai/isLocked") ?: false,
                 lockHolderPid = o.longField("lockHolderPid")
-                    ?: meta?.longField("lockHolderPid"),
+                    ?: meta?.longField("lockHolderPid")
+                    ?: meta?.longField("cognition.ai/lockHolderPid"),
                 lockHolderClient = o.strField("lockHolderClient")
-                    ?: meta?.strField("lockHolderClient"),
+                    ?: meta?.strField("lockHolderClient")
+                    ?: meta?.strField("cognition.ai/lockHolderClient"),
                 planFilePath = o.strField("planFilePath")
-                    ?: meta?.strField("planFilePath"),
+                    ?: meta?.strField("planFilePath")
+                    ?: meta?.strField("cognition.ai/planFilePath"),
                 hasUserMessages = o.boolField("hasUserMessages")
-                    ?: meta?.boolField("hasUserMessages") ?: false,
+                    ?: meta?.boolField("hasUserMessages")
+                    ?: meta?.boolField("cognition.ai/hasUserMessages") ?: false,
                 lastActivity = o.strField(
                     "lastActivity", "lastActivityAgo", "last_activity_ago",
                     "updatedAt", "updated_at",
                 ),
                 running = o.boolField("running") ?: false,
                 pendingPermission = o.boolField("pendingPermission") ?: false,
+                excerpts = decodeExcerpts(o["excerpts"])
+                    .ifEmpty { decodeExcerpts(meta?.get("excerpts")) },
             )
+        }
+    }
+
+    /**
+     * `with_message_excerpts` reply decode — each entry carries the matched
+     * line under one of text/snippet/excerpt/content plus a role-ish field;
+     * bare strings count as agent lines.
+     */
+    private fun decodeExcerpts(el: JsonElement?): List<SessionExcerpt> {
+        val arr = el as? JsonArray ?: return emptyList()
+        return arr.mapNotNull { item ->
+            when (item) {
+                is JsonPrimitive -> item.takeIf { it.isString }
+                    ?.let { SessionExcerpt(it.content) }
+                is JsonObject -> {
+                    val text = item.strField(
+                        "text", "snippet", "excerpt", "content", "line", "message",
+                    ) ?: return@mapNotNull null
+                    val role = item.strField("role", "source", "sender", "speaker")
+                        .orEmpty()
+                    SessionExcerpt(text, isUser = role.contains("user", true))
+                }
+                else -> null
+            }
         }
     }
 
@@ -548,10 +591,18 @@ class AcpClient(
     /**
      * `_devingo/sessions` — devin's `session/list` merged with live hub state
      * (`running`, `pendingPermission`), served by the resident process.
+     * [contentSearch] (M9.1) has the hub forward a `content_search` query and
+     * each entry then carries matched-message `excerpts`.
      */
-    suspend fun devingoSessions(cwd: String? = null): List<AcpSession> = request(
+    suspend fun devingoSessions(
+        cwd: String? = null,
+        contentSearch: String? = null,
+    ): List<AcpSession> = request(
         "_devingo/sessions",
-        buildJsonObject { if (!cwd.isNullOrBlank()) put("cwd", cwd) },
+        buildJsonObject {
+            if (!cwd.isNullOrBlank()) put("cwd", cwd)
+            if (!contentSearch.isNullOrBlank()) put("contentSearch", contentSearch)
+        },
     ).let { decodeSessions((it["result"] as? JsonObject) ?: it) }
 
     /**
@@ -578,10 +629,20 @@ class AcpClient(
         buildJsonObject { put("sessionId", sessionId) },
     )
 
-    /** `session/close` — idempotent release of the session lock agent-side. */
-    suspend fun closeSession(sessionId: String) = request(
+    /**
+     * `session/close` — idempotent release of the session lock agent-side.
+     * [force] (M9.1) sends the negotiated `_meta["cognition.ai/force"]` —
+     * advertised under `sessionCapabilities.close._meta` at initialize —
+     * which evicts another client's held lock so a takeover can proceed.
+     */
+    suspend fun closeSession(sessionId: String, force: Boolean = false) = request(
         AcpMethods.SESSION_CLOSE,
-        buildJsonObject { put("sessionId", sessionId) },
+        buildJsonObject {
+            put("sessionId", sessionId)
+            if (force) {
+                put("_meta", buildJsonObject { put("cognition.ai/force", true) })
+            }
+        },
     )
 
     // ---- revert / fork --------------------------------------------------------
@@ -725,6 +786,20 @@ class AcpClient(
         AcpMethods.SESSION_RENAME,
         json.encodeToJsonElement(RenameSessionParams(sessionId, title)),
     )
+
+    /**
+     * `_cognition.ai/session/share` (M9.1) — the agent hands back a
+     * guest-view link when its build/org has a share handler ("no share
+     * handler configured" arrives as a plain error). The URL key varies —
+     * decoded loosely like the other extension payloads.
+     */
+    suspend fun shareSession(sessionId: String): String? = request(
+        AcpMethods.SESSION_SHARE,
+        buildJsonObject { put("sessionId", sessionId) },
+    ).let {
+        val r = (it["result"] as? JsonObject) ?: it
+        r.strField("url", "shareUrl", "share_url", "link", "sessionUrl")
+    }
 
     // ---- @-mention resource lists (A7.3) -------------------------------------
     // Devin advertises rule/skill/plan mention types; these feed the picker's
@@ -1361,6 +1436,7 @@ class AcpClient(
             put("cognition.ai/subagentSupport", true)
             put("cognition.ai/sessionRename", true)
             put("cognition.ai/sessionShare", true)
+            put("cognition.ai/sessionListContentSearch", true)
             // A7.6 — keep in sync with gatewayInitParams (bridge/hub.go).
             put("cognition.ai/terminalLifecycle", true)
             put("cognition.ai/userShellCommand", true)

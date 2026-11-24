@@ -45,6 +45,17 @@
         <receiver
             android:name=".PermissionActionReceiver"
             android:exported="false" />
+        <!-- M9.1: serves the shared transcript Markdown to ACTION_SEND
+             targets (see ui/SessionActions.kt + res/xml/file_paths.xml). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

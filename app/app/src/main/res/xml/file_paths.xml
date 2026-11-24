@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M9.1: transcript Markdown exports live under cacheDir/shared/ and are
+     handed to other apps via ACTION_SEND + FLAG_GRANT_READ_URI_PERMISSION. -->
+<paths>
+    <cache-path name="shared" path="shared/" />
+</paths>

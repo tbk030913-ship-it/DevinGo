@@ -1108,7 +1108,7 @@ func TestForeignClientCannotAnswerPermission(t *testing.T) {
 func TestMidDrainFrameQueuesBehindBacklog(t *testing.T) {
 	stats := setupHub(t, fakeDevin(t))
 	// Bring the resident process up and fully ready (no ws client needed).
-	if _, err := bridgeHub.callSessionList(""); err != nil {
+	if _, err := bridgeHub.callSessionList("", ""); err != nil {
 		t.Fatalf("warm-up session/list: %v", err)
 	}
 
@@ -1307,6 +1307,26 @@ func TestSessionCapSkipsLoadingSessions(t *testing.T) {
 	}
 	if total != maxHostedSessions {
 		t.Fatalf("hub holds %d sessions, want %d (one idle evicted)", total, maxHostedSessions)
+	}
+}
+
+// devin accepts a comma-separated refusal-fallback candidate list
+// (devin-acp(1)) — each item must independently match the model charset.
+func TestModelNameRe(t *testing.T) {
+	for _, ok := range []string{
+		"claude-opus-4.5", "gpt 5.2", "a",
+		"model-a,model-b", "a,b,c/d:e+f",
+	} {
+		if !modelNameRe.MatchString(ok) {
+			t.Errorf("modelNameRe rejected %q", ok)
+		}
+	}
+	for _, bad := range []string{
+		"", ",a", "a,", "a,,b", "a; rm -rf /", "a|b", "$(x)", " a",
+	} {
+		if modelNameRe.MatchString(bad) {
+			t.Errorf("modelNameRe accepted %q", bad)
+		}
 	}
 }
 

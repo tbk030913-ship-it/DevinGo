@@ -2040,6 +2040,123 @@ class SessionStore(
         }
     }
 
+    // ---- rename / share (M9.1) ---------------------------------------------------
+
+    /** Optimistic title after a successful rename — the wire event echoes too. */
+    fun setTitleLocal(title: String) {
+        _ui.update { it.copy(sessionTitle = title) }
+    }
+
+    /**
+     * `_cognition.ai/session/share` — a guest-view URL when the agent
+     * build has a share handler; null when it doesn't ("no share handler
+     * configured" is a normal error, the caller just shares without one).
+     */
+    suspend fun sessionShareUrl(): String? = try {
+        client.shareSession(sessionId)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * The transcript rendered as a clean Markdown document for the share
+     * sheet: user/agent text verbatim, thinking as a blockquote, tool
+     * calls as a summarized bullet list with fenced detail, plans as a
+     * task checklist. Reads [messages] — the model's collapse of
+     * thoughts/tools into WorkRows is presentation-only.
+     */
+    fun exportMarkdown(): String = buildString {
+        val title = _ui.value.sessionTitle?.takeIf { it.isNotBlank() } ?: sessionId
+        appendLine("# $title")
+        appendLine()
+        appendLine("- 会话: `$sessionId`")
+        if (cwd.isNotBlank()) appendLine("- 目录: `$cwd`")
+        appendLine()
+        // The streaming tail holds the freshest text of the last item —
+        // swap it in so a share mid-turn isn't truncated.
+        val tail = _streamingTail.value
+        val items = _messages.value.map {
+            if (tail != null && it.id == tail.id) tail else it
+        }
+        items.forEach { m ->
+            when (m.kind) {
+                Kind.User -> {
+                    appendLine("## 用户")
+                    appendLine()
+                    appendLine(m.text)
+                    if (m.attachmentCount > 0) {
+                        appendLine()
+                        appendLine("*附件: ${m.attachmentCount} 张图片*")
+                    }
+                }
+                Kind.Agent -> {
+                    appendLine("## Devin")
+                    appendLine()
+                    appendLine(m.text)
+                }
+                Kind.Thought -> {
+                    appendLine("> **思考**")
+                    m.text.lineSequence().forEach { appendLine("> $it") }
+                }
+                Kind.Tool -> {
+                    val state = when (m.status) {
+                        "completed" -> ""
+                        null -> ""
+                        else -> " — ${m.status}"
+                    }
+                    appendLine("- **${m.text}**$state")
+                    m.detail?.takeIf { it.isNotBlank() }?.let { d ->
+                        appendLine()
+                        appendFenced(d)
+                        if (m.detailTruncated) appendLine("\n*（输出已截断）*")
+                    }
+                    m.diffs.forEach { diff ->
+                        appendLine()
+                        appendLine("  变更 `${diff.path}`:")
+                        appendFenced(diff.newText)
+                    }
+                    m.exitCode?.let { code -> appendLine("  `exit $code`") }
+                }
+                Kind.ShellCommand -> {
+                    appendLine("- `${m.text}`" +
+                        (m.exitCode?.let { " → exit $it" } ?: ""))
+                    m.detail?.takeIf { it.isNotBlank() }?.let { d ->
+                        appendLine()
+                        appendFenced(d)
+                    }
+                }
+                Kind.Plan -> {
+                    m.planEntries.forEach { e ->
+                        val done = e.status.orEmpty().let {
+                            it.contains("complete", true) || it.contains("done", true)
+                        }
+                        appendLine("- [${if (done) "x" else " "}] ${e.content}")
+                    }
+                }
+                Kind.System -> appendLine("> ${m.text}")
+                Kind.Error -> appendLine("> ⚠ ${m.text}")
+                Kind.Answered -> appendLine("> ${m.text}")
+                Kind.Compaction -> {
+                    appendLine("---")
+                    appendLine("*${m.text}*")
+                    appendLine("---")
+                }
+            }
+            appendLine()
+        }
+    }
+
+    /** Fenced code block whose fence outranks any ``` runs in [text]. */
+    private fun StringBuilder.appendFenced(text: String) {
+        var fence = "```"
+        while (text.contains(fence)) fence += "`"
+        appendLine(fence)
+        appendLine(text.trimEnd())
+        appendLine(fence)
+    }
+
     // ---- revert / fork ---------------------------------------------------------
 
     /** Populate the revert sheet's step list for this session. */

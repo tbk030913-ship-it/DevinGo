@@ -212,10 +212,11 @@ var knownAgentTypes = map[string]bool{
 	"summarizer": true,
 }
 
-// modelNameRe bounds a refusal-fallback model name. It rides the spawn env
-// (DEVIN_REFUSAL_FALLBACK), not a shell, but the charset check keeps junk
-// from silently spawning a doomed process.
-var modelNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._:\-+/]{0,63}$`)
+// modelNameRe bounds a refusal-fallback model name — devin accepts a
+// comma-separated candidate list (devin-acp(1)), so each item must match.
+// It rides the spawn env (DEVIN_REFUSAL_FALLBACK), not a shell, but the
+// charset check keeps junk from silently spawning a doomed process.
+var modelNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._:\-+/]{0,63}(,[A-Za-z0-9][A-Za-z0-9 ._:\-+/]{0,63})*$`)
 
 // spawnProfile reads the _devingo spawn profile out of params._meta:
 // {"devingo/agentType": "review"|"codemap"|"summarizer",
@@ -430,6 +431,9 @@ func gatewayInitParams() map[string]any {
 				"cognition.ai/subagentSupport":    true,
 				"cognition.ai/sessionRename":      true,
 				"cognition.ai/sessionShare":       true,
+				// M9.1: full-text `session/list`
+				// (`content_search` + excerpts).
+				"cognition.ai/sessionListContentSearch": true,
 				// A7.6: lifecycle notifications for shell-manager terminals,
 				// user `!` shell commands, and secret asks/sends.
 				"cognition.ai/terminalLifecycle": true,
@@ -1221,10 +1225,11 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 		return
 	}
 	var params struct {
-		ClientID  string `json:"clientId"`
-		SessionID string `json:"sessionId"`
-		AfterSeq  uint64 `json:"afterSeq"`
-		Cwd       string `json:"cwd"`
+		ClientID      string `json:"clientId"`
+		SessionID     string `json:"sessionId"`
+		AfterSeq      uint64 `json:"afterSeq"`
+		Cwd           string `json:"cwd"`
+		ContentSearch string `json:"contentSearch"`
 	}
 	var raw struct {
 		Params json.RawMessage `json:"params"`
@@ -1264,15 +1269,16 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 			// kept — the result is a fresh snapshot either way, so older
 			// queued calls are superseded, not queued behind it.
 			c.listNext = &sessionListQuery{
-				id:  append(json.RawMessage(nil), head.ID...),
-				cwd: params.Cwd,
+				id:     append(json.RawMessage(nil), head.ID...),
+				cwd:    params.Cwd,
+				search: params.ContentSearch,
 			}
 			h.mu.Unlock()
 			return
 		}
 		c.listBusy = true
 		h.mu.Unlock()
-		go h.devingoSessions(c, head.ID, params.Cwd)
+		go h.devingoSessions(c, head.ID, params.Cwd, params.ContentSearch)
 	case "_devingo/attach":
 		h.attach(c, head.ID, params.SessionID, params.AfterSeq, params.Cwd)
 	case "_devingo/detach":
@@ -1285,8 +1291,10 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 // devingoSessions merges devin's session/list with live hub state. It runs
 // off the read loop because callDevin blocks on the agent. At most one
 // call is in flight per client; a queued next call launches as this one
-// finishes.
-func (h *Hub) devingoSessions(c *Client, id json.RawMessage, cwd string) {
+// finishes. A non-empty search is forwarded as session/list's
+// content_search (M9.1 full-text matching — the reply then carries
+// per-session message excerpts).
+func (h *Hub) devingoSessions(c *Client, id json.RawMessage, cwd, search string) {
 	defer func() {
 		h.mu.Lock()
 		next := c.listNext
@@ -1297,10 +1305,10 @@ func (h *Hub) devingoSessions(c *Client, id json.RawMessage, cwd string) {
 		c.listBusy = next != nil
 		h.mu.Unlock()
 		if next != nil {
-			go h.devingoSessions(c, next.id, next.cwd)
+			go h.devingoSessions(c, next.id, next.cwd, next.search)
 		}
 	}()
-	result, err := h.callSessionList(cwd)
+	result, err := h.callSessionList(cwd, search)
 	if err != nil {
 		h.deliver(c, errorFrame(id, -32000, "session/list: "+err.Error()))
 		return
@@ -1325,14 +1333,18 @@ func (h *Hub) devingoSessions(c *Client, id json.RawMessage, cwd string) {
 			sm["pendingPermission"] = len(s.pending) > 0
 		}
 	}
-	// Hosted sessions devin somehow doesn't list (e.g. brand-new).
-	for sid, s := range h.sessions {
-		if !seen[sid] {
-			parsed.Sessions = append(parsed.Sessions, map[string]any{
-				"sessionId":         sid,
-				"running":           s.running > 0,
-				"pendingPermission": len(s.pending) > 0,
-			})
+	// Hosted sessions devin somehow doesn't list (e.g. brand-new). Skipped
+	// under a content search — an unlisted entry never matched the query,
+	// so appending it would be a false positive in the result list.
+	if search == "" {
+		for sid, s := range h.sessions {
+			if !seen[sid] {
+				parsed.Sessions = append(parsed.Sessions, map[string]any{
+					"sessionId":         sid,
+					"running":           s.running > 0,
+					"pendingPermission": len(s.pending) > 0,
+				})
+			}
 		}
 	}
 	h.mu.Unlock()
@@ -1800,8 +1812,10 @@ func (h *Hub) callDevin(p *devinProc, timeout time.Duration, method string, para
 // callSessionList backs _devingo/sessions — always over the resident process.
 // A failed first handshake buys exactly one respawn; when that proc comes
 // up healthy the list must run on it — falling off the loop would report
-// "unavailable" while a perfectly good process sits idle.
-func (h *Hub) callSessionList(cwd string) (json.RawMessage, error) {
+// "unavailable" while a perfectly good process sits idle. A non-empty
+// search maps to session/list's content_search + with_message_excerpts
+// (M9.1 — snake_case wire fields, devin-strings.txt).
+func (h *Hub) callSessionList(cwd, search string) (json.RawMessage, error) {
 	for attempts := 0; attempts < 2; attempts++ {
 		p := h.ensureProc()
 		if !p.readyClosed() {
@@ -1825,8 +1839,15 @@ func (h *Hub) callSessionList(cwd string) (json.RawMessage, error) {
 			return nil, initErr
 		}
 		var params map[string]any
-		if cwd != "" {
-			params = map[string]any{"cwd": cwd}
+		if cwd != "" || search != "" {
+			params = map[string]any{}
+			if cwd != "" {
+				params["cwd"] = cwd
+			}
+			if search != "" {
+				params["content_search"] = search
+				params["with_message_excerpts"] = true
+			}
 		}
 		return h.callDevin(p, devinCallTimeout, "session/list", params)
 	}

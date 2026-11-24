@@ -34,6 +34,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -46,6 +47,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -75,6 +77,7 @@ import com.devingo.app.tailnet.TailnetState
 import com.devingo.app.ui.theme.DevinGoColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
@@ -146,6 +149,12 @@ internal fun HomeScreen(
     var filterMenu by remember { mutableStateOf<HomeFilterPage?>(null) }
     var showAllGroups by remember { mutableStateOf(setOf<String>()) }
     val snackbarHostState = remember { SnackbarHostState() }
+    // M9.1: the row being renamed / the locked session awaiting takeover.
+    var renameTarget by remember { mutableStateOf<AcpSession?>(null) }
+    var renameSubmitting by remember { mutableStateOf(false) }
+    var renameError by remember { mutableStateOf<String?>(null) }
+    var takeoverTarget by remember { mutableStateOf<AcpSession?>(null) }
+    var takeoverBusy by remember { mutableStateOf(false) }
 
     // hostFlow mirrors prefs.host writes from anywhere — a candidate
     // switch during reconnect refreshes this screen on its own (C5).
@@ -272,8 +281,25 @@ internal fun HomeScreen(
     // The shared `_devingo/sessions` cache is the single source: rows read
     // it instantly, refreshes land here. Badges come from the same manager.
     val badges by vm.badges.collectAsState()
+    // M9.1: negotiated caps gate rename rows + the server content search.
+    val agentCaps by vm.agentCaps.collectAsState()
+    val canRename = !agentCaps.metaNegotiated || agentCaps.sessionRename
+    val contentSearch = agentCaps.sessionListContentSearch
+    val searchResults by vm.searchResults.collectAsState()
     LaunchedEffect(Unit) {
         vm.sessions.collect { if (it != null) homeState.sessions = it }
+    }
+    // Full-text path (M9.1): debounce the query into `_devingo/sessions`;
+    // the client-side filter still covers it while results stream in or
+    // when the cap wasn't negotiated.
+    LaunchedEffect(homeState.query, contentSearch) {
+        val q = homeState.query.trim()
+        if (contentSearch && q.isNotEmpty()) {
+            delay(300)
+            vm.searchSessions(q)
+        } else {
+            vm.searchSessions("")
+        }
     }
     LaunchedEffect(Unit) {
         combine(vm.sessionsLoading, vm.sessionsError) { l, e -> l to e }
@@ -328,15 +354,21 @@ internal fun HomeScreen(
     }
 
     // Filter + sort the flat session list first; grouping then buckets it
-    // while preserving both orders (groups order by latest activity).
+    // while preserving both orders (groups order by latest activity). When
+    // the negotiated content search has answered, its (already filtered)
+    // result list replaces the client-side title match (M9.1).
+    val serverSearch = contentSearch && homeState.query.isNotBlank()
     val visible = remember(
-        homeState.sessions, homeState.query, homeState.hideEmpty, homeState.sortBy,
+        homeState.sessions, searchResults, serverSearch,
+        homeState.query, homeState.hideEmpty, homeState.sortBy,
     ) {
-        homeState.sessions.orEmpty()
+        val serverAnswered = serverSearch && searchResults != null
+        val base = if (serverAnswered) searchResults else homeState.sessions
+        base.orEmpty()
             .filter { s ->
                 (!homeState.hideEmpty ||
                     s.hasUserMessages || !s.title.isNullOrBlank()) &&
-                    (homeState.query.isBlank() ||
+                    (homeState.query.isBlank() || serverAnswered ||
                         s.title.orEmpty().contains(homeState.query, true) ||
                         s.sessionId.contains(homeState.query, true))
             }
@@ -487,20 +519,28 @@ internal fun HomeScreen(
                                                     sess.sessionId == prefs.lastSessionId,
                                                 canDelete = !isCurrent,
                                                 onClick = {
+                                                    // M9.1: a peer-held lock
+                                                    // asks for a force takeover
+                                                    // instead of a warning.
                                                     if (sess.isLocked) {
-                                                        scope.launch {
-                                                            snackbarHostState.showSnackbar(
-                                                                "该会话正被其他客户端占用，可能无法恢复",
-                                                            )
-                                                        }
+                                                        takeoverTarget = sess
+                                                    } else if (drawerMode) {
+                                                        onPickSession(sess)
+                                                    } else {
+                                                        startConnect(
+                                                            sess.sessionId,
+                                                            sess.cwd,
+                                                        )
                                                     }
-                                                    if (drawerMode) onPickSession(sess)
-                                                    else startConnect(
-                                                        sess.sessionId,
-                                                        sess.cwd,
-                                                    )
                                                 },
                                                 onDelete = { removeSessionLocal(sess) },
+                                                onRename = if (canRename) {
+                                                    { renameTarget = sess }
+                                                } else {
+                                                    null
+                                                },
+                                                excerpt = sess.excerpts.firstOrNull(),
+                                                highlightQuery = homeState.query,
                                                 modifier = Modifier.animateItem(
                                                     fadeInSpec = tween(180),
                                                     placementSpec =
@@ -590,6 +630,68 @@ internal fun HomeScreen(
             QrPairingDialog(
                 onPaired = { info -> pairOpen = false; applyPair(info) },
                 onDismiss = { pairOpen = false },
+            )
+        }
+        // M9.1: session-row 重命名 — wire call + list-cache update in the VM.
+        renameTarget?.let { s ->
+            RenameSessionSheet(
+                initialTitle = s.title.orEmpty(),
+                submitting = renameSubmitting,
+                error = renameError,
+                onSubmit = { title ->
+                    scope.launch {
+                        renameSubmitting = true
+                        renameError = vm.renameSession(s.sessionId, title)
+                        renameSubmitting = false
+                        if (renameError == null) renameTarget = null
+                    }
+                },
+                onDismiss = {
+                    renameTarget = null
+                    renameError = null
+                },
+            )
+        }
+        // M9.1: force takeover — close the peer's lock, then the normal open.
+        takeoverTarget?.let { s ->
+            AlertDialog(
+                onDismissRequest = { if (!takeoverBusy) takeoverTarget = null },
+                title = { Text("强制接管会话？") },
+                text = {
+                    val holder = lockHolderLabel(s)
+                    Text(
+                        "该会话正在其他终端打开" +
+                            if (holder.isBlank()) "，是否强制接管？"
+                            else "（$holder），是否强制接管？",
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = !takeoverBusy,
+                        onClick = {
+                            scope.launch {
+                                takeoverBusy = true
+                                val err = vm.forceCloseSession(s.sessionId)
+                                takeoverBusy = false
+                                takeoverTarget = null
+                                if (err == null) {
+                                    if (drawerMode) onPickSession(s)
+                                    else startConnect(s.sessionId, s.cwd)
+                                } else {
+                                    snackbarHostState.showSnackbar(
+                                        "强制接管失败: $err",
+                                    )
+                                }
+                            }
+                        },
+                    ) { Text(if (takeoverBusy) "接管中…" else "强制接管") }
+                },
+                dismissButton = {
+                    TextButton(
+                        enabled = !takeoverBusy,
+                        onClick = { takeoverTarget = null },
+                    ) { Text("取消") }
+                },
             )
         }
         // Settings page slides over Home.

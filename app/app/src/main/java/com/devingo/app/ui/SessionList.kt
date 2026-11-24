@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import com.devingo.app.SessionBadge
 import com.devingo.app.acp.AcpSession
 import com.devingo.app.acp.AgentType
+import com.devingo.app.acp.SessionExcerpt
 import com.devingo.app.ui.theme.DevinGoColors
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
@@ -187,6 +188,12 @@ internal fun SessionRow(
     onClick: () -> Unit,
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
+    /** M9.1: shows 重命名 in the row menu when set. */
+    onRename: (() -> Unit)? = null,
+    /** M9.1: a server content-search match rendered under the meta line. */
+    excerpt: SessionExcerpt? = null,
+    /** The live search query — bolded inside [excerpt]. */
+    highlightQuery: String = "",
 ) {
     val cs = MaterialTheme.colorScheme
     val haptic = LocalHapticFeedback.current
@@ -293,6 +300,22 @@ internal fun SessionRow(
                 if (!compact) {
                     SessionMetaLine(s, lastSession, badge)
                 }
+                excerpt?.let { ex ->
+                    // M9.1: the matched transcript line under the card —
+                    // "你: "/"Devin: " label plus the query-bolded snippet.
+                    Text(
+                        queryHighlighted(
+                            text = "${if (ex.isUser) "你" else "Devin"}: ${ex.text}",
+                            query = highlightQuery,
+                            base = cs.onSurfaceVariant,
+                            highlight = cs.onSurface,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
             }
             // Trailing "…" menu, vertically centered on the row.
             Box(Modifier.align(Alignment.CenterEnd)) {
@@ -310,6 +333,15 @@ internal fun SessionRow(
                     expanded = menuOpen,
                     onDismissRequest = { menuOpen = false },
                 ) {
+                    if (onRename != null) {
+                        DevinMenuItem(
+                            "重命名",
+                            onClick = {
+                                menuOpen = false
+                                onRename()
+                            },
+                        )
+                    }
                     DevinMenuItem(
                         "复制会话 ID",
                         onClick = {

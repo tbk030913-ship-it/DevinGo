@@ -175,6 +175,13 @@ class ConnectionManager private constructor(private val app: Application) {
     /** `_devingo/sessions` cache — null until the first successful load. */
     private val _sessions = MutableStateFlow<List<AcpSession>?>(null)
     val sessions = _sessions.asStateFlow()
+    /**
+     * Server-side content-search results (M9.1): the matched session list
+     * with `excerpts` populated. Null = no active search — Home falls back
+     * to the plain list + its client-side title filter.
+     */
+    private val _searchResults = MutableStateFlow<List<AcpSession>?>(null)
+    val searchResults = _searchResults.asStateFlow()
     private val _sessionsLoading = MutableStateFlow(false)
     val sessionsLoading = _sessionsLoading.asStateFlow()
     private val _sessionsError = MutableStateFlow<String?>(null)
@@ -266,6 +273,7 @@ class ConnectionManager private constructor(private val app: Application) {
     private var openJob: Job? = null
     private var reconnectJob: Job? = null
     private var listJob: Job? = null
+    private var searchJob: Job? = null
     /** Completed to cut short the reconnect loop's current backoff wait. */
     private var reconnectKick: CompletableDeferred<Unit>? = null
     /** Close reason of the last drop — reused when a kick restarts the loop. */
@@ -364,6 +372,8 @@ class ConnectionManager private constructor(private val app: Application) {
         openJob?.cancel()
         reconnectJob?.cancel()
         listJob?.cancel()
+        searchJob?.cancel()
+        _searchResults.value = null
         stores.keys.toList().forEach { dropStore(it) }
     }
 
@@ -452,11 +462,11 @@ class ConnectionManager private constructor(private val app: Application) {
                     // counterpart: stay optimistic and let -32601 decide.
                     revertSupported = !caps.metaNegotiated || caps.revert,
                     subagentSupported = !caps.metaNegotiated || caps.subagentSupport,
-                    // A hello that answered without the flag means a bridge
-                    // too old for spawn profiles; a failed hello stays
-                    // optimistic — the failure tells nothing.
-                    agentTypesSupported = helloCaps == null ||
-                        (helloCaps["agentTypes"] as? JsonPrimitive)
+                    // Only an explicit agentTypes:true earns the mode menu —
+                    // a missing or failed hello means a bridge that would
+                    // forward the _meta and silently spawn a default agent.
+                    agentTypesSupported =
+                        (helloCaps?.get("agentTypes") as? JsonPrimitive)
                             ?.booleanOrNull == true,
                 )
             }
@@ -1139,6 +1149,63 @@ class ConnectionManager private constructor(private val app: Application) {
         dropStore(sessionId, gone = true)
     }
 
+    /**
+     * `_cognition.ai/session/rename` (M9.1) — mirrors the new title into the
+     * shared list cache and the live store's header. Error text on failure,
+     * null on success (the UI's snackbar path, like [forceCloseSession]).
+     */
+    suspend fun renameSession(sessionId: String, title: String): String? = try {
+        client.renameSession(sessionId, title)
+        _sessions.update { list ->
+            list?.map { if (it.sessionId == sessionId) it.copy(title = title) else it }
+        }
+        stores[sessionId]?.setTitleLocal(title)
+        null
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        e.display()
+    }
+
+    /**
+     * `session/close` with `_meta["cognition.ai/force"]` — evicts the lock a
+     * peer client holds so a tap on a locked row can proceed to load (M9.1).
+     * Error text on failure — a failed force-close means the lock is held
+     * hard and the caller must NOT attempt the open anyway.
+     */
+    suspend fun forceCloseSession(sessionId: String): String? = try {
+        client.closeSession(sessionId, force = true)
+        null
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        e.display()
+    }
+
+    /**
+     * `_devingo/sessions?contentSearch` — the server-side full-text search
+     * behind Home's search box (M9.1), used when the agent negotiated
+     * `cognition.ai/sessionListContentSearch`. Each call supersedes the
+     * in-flight one; a blank [query] disarms it and a failure degrades to
+     * the client-side title filter (results = null).
+     */
+    fun searchSessions(query: String) {
+        searchJob?.cancel()
+        if (query.isBlank() || !socketLive) {
+            _searchResults.value = null
+            return
+        }
+        searchJob = scope.launch {
+            try {
+                _searchResults.value = client.devingoSessions(contentSearch = query)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _searchResults.value = null
+            }
+        }
+    }
+
     // ---- disconnect / reconnect ----------------------------------------------
 
     /** Intentional full disconnect (chat menu) — drops the socket and stores. */
@@ -1261,8 +1328,8 @@ class ConnectionManager private constructor(private val app: Application) {
                             revertSupported = !caps.metaNegotiated || caps.revert,
                             subagentSupported = !caps.metaNegotiated ||
                                 caps.subagentSupport,
-                            agentTypesSupported = helloCaps == null ||
-                                (helloCaps["agentTypes"] as? JsonPrimitive)
+                            agentTypesSupported =
+                                (helloCaps?.get("agentTypes") as? JsonPrimitive)
                                     ?.booleanOrNull == true,
                         )
                     }

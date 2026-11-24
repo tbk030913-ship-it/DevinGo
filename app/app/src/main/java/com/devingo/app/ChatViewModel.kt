@@ -244,6 +244,36 @@ class ChatViewModel(
         false
     }
 
+    /**
+     * Server-side full-text search results (M9.1) — null = inactive; Home
+     * shows these rows with `excerpts` under each card.
+     */
+    val searchResults: StateFlow<List<com.devingo.app.acp.AcpSession>?> = cm.searchResults
+
+    /** Home's search box → `_devingo/sessions?contentSearch` (blank disarms). */
+    fun searchSessions(query: String) = cm.searchSessions(query)
+
+    /**
+     * `_cognition.ai/session/rename` — updates the list cache + a live
+     * store's header on success. Error text or null.
+     */
+    suspend fun renameSession(sessionId: String, title: String): String? =
+        cm.renameSession(sessionId, title)
+
+    /**
+     * Locked-session takeover (M9.1): force `session/close` to evict the
+     * peer-held lock. Null on success — the caller then runs the normal
+     * open; error text on failure (do NOT proceed to load).
+     */
+    suspend fun forceCloseSession(sessionId: String): String? =
+        cm.forceCloseSession(sessionId)
+
+    /** The bound transcript as a Markdown document for the share sheet. */
+    fun exportTranscriptMarkdown(): String? = store?.exportMarkdown()
+
+    /** `_cognition.ai/session/share` guest link — null when unshared. */
+    suspend fun sessionShareUrl(): String? = store?.sessionShareUrl()
+
     // ---- bound-session user actions ----------------------------------------------
 
     private val store: SessionStore? get() = cm.currentStore.value

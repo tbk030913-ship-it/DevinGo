@@ -240,8 +240,19 @@ data class SetModelParams(val sessionId: String, val modelId: String)
 @Serializable
 data class SessionDeleteParams(val sessionId: String)
 
+/**
+ * `session/list` params (M9.1): [contentSearch] maps to devin's
+ * `content_search` and turns on full-text matching; [withMessageExcerpts]
+ * asks for the matched transcript snippets back on each session
+ * (`with_message_excerpts` on the wire — both snake_case field names are
+ * visible in the agent binary's struct dump, acptest/devin-strings.txt).
+ */
 @Serializable
-data class SessionListParams(val cwd: String? = null)
+data class SessionListParams(
+    val cwd: String? = null,
+    val content_search: String? = null,
+    val with_message_excerpts: Boolean? = null,
+)
 
 /** Devin's unified config setter (`configId` covers "mode"/"model"/…). */
 @Serializable
@@ -274,6 +285,15 @@ data class AcpSession(
     val running: Boolean = false,
     /** Hub overlay on `_devingo/sessions`: an approval is unanswered. */
     val pendingPermission: Boolean = false,
+    /** Content-search snippets (`with_message_excerpts` reply, M9.1). */
+    val excerpts: List<SessionExcerpt> = emptyList(),
+)
+
+/** One matched transcript line under a `session/list` content search. */
+data class SessionExcerpt(
+    val text: String,
+    /** True when the match sits on a user message (the "你: " label). */
+    val isUser: Boolean = false,
 )
 
 /** `_devingo/attach` result (gateway-private; see bridge/hub.go). */
@@ -413,6 +433,7 @@ object AcpMethods {
     const val SESSION_DELETE = "session/delete"
     const val SESSION_LIST = "session/list"
     const val SESSION_RENAME = "_cognition.ai/session/rename"
+    const val SESSION_SHARE = "_cognition.ai/session/share"
     const val SESSION_UPDATE = "session/update"
     const val SESSION_REQUEST_PERMISSION = "session/request_permission"
     const val SESSION_CLOSE = "session/close"

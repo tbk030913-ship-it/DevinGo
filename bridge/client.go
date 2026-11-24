@@ -31,8 +31,9 @@ type Client struct {
 // sessionListQuery is a _devingo/sessions request waiting for the client's
 // in-flight call to finish.
 type sessionListQuery struct {
-	id  json.RawMessage
-	cwd string
+	id     json.RawMessage
+	cwd    string
+	search string
 }
 
 func newClient(h *Hub, conn *websocket.Conn, ctx context.Context, remote string) *Client {
