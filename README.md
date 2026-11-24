@@ -149,7 +149,8 @@ cd app
   `_cognition.ai/session/rename`
 - `session/update` 通知：agent 回复流式追加、思考流、tool_call(+update)、plan、
   mode/model 变更、token 用量、上下文压缩
-- `session/request_permission` → App 内审批卡 + 系统通知（锁屏可直接允许/拒绝）
+- `session/request_permission` → App 内审批卡 + 系统通知（锁屏可直接允许/拒绝；
+  多会话活动时会聚合成一张卡片，点击直达首要会话，审批多于 1 个时改为计数）
 - Devin 私有扩展：`_cognition.ai/revert/*`（回退步骤列表 + 分叉）、`_cognition.ai/output`
   （warn/error 级日志）、`available_commands_update`（斜杠命令）
 - 未知 agent→client 请求（如 `fs/*`、`terminal/*`）统一回 `method_not_found` —— Devin 会自行完成文件/终端操作
@@ -171,10 +172,11 @@ cd app
 
 - 回退只接了「列表 + 分叉成新会话」：`revert/preview`、`revert/execute`（在本会话内回滚）
   协议常量已留但未接线；agent 不支持 revert 时菜单项自动隐藏
-- 附件只支持图片（压缩后 ≤3MB/条）；`@` 引用靠文本路径推断，没有文件选择器
+- 附件只支持图片（压缩后 ≤3MB/条）；`@` 引用有 `@file:`/`@folder:` 选择器
+  （`/fs/list` 列工作区文件），未列出的路径仍靠文本推断
 - `/models` 只留 id + name（无描述/参数）；模型列表主要靠会话内 `configOptions`，
   `/models` 是兜底
 - `-install` 的计划任务是 Windows schtasks（登录时启动，非系统服务）——未登录的
   Windows 会话里 bridge 不跑
-- `/fs/write` 只写会话 cwd 之内（相对路径 + 符号链接/硬链接不越界）；没有配套的
-  `/fs/list` 文件选择接口，引用芯片只作用于已回复的消息
+- `/fs/write`/`/fs/list`/`/git/diff` 都限定在会话 cwd 之内；`/fs/list` 只覆盖
+  git 跟踪 + 未忽略的未跟踪文件，被 .gitignore 排除的路径选择器里看不到

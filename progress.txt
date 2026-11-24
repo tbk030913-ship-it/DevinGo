@@ -52,3 +52,4 @@
 2026-11-24 07:32 | N6.2 内联@上下文chips+剪贴板图片粘贴（t3code移植）：ComposerEditText原生编辑器/原子删chip/chip点按sheet、@file选择器+bridge /fs/list端点与测试、展开/紧凑共用同一view
 2026-11-24 08:20 | N6.2 原生内联@上下文chip+剪贴板贴图（t3code移植）：ComposerEditText/ChipSpan/原子删除/chip点击sheet、/fs/list端点+文件picker、spec+质量修复（autofill/plaintext粘贴/numpad/folder）
 2026-11-24 08:03 | N6.3 多会话聚合通知（t3-agent-notifications移植）：SessionStore级LiveStatus派生+CM聚合快照、relay串extras重启重建、单会话卡片不变
+2026-11-24 08:21（北京时间）| N6.3双审闭环：spec修复hero深链(卡片点击/打开带EXTRA_SESSION_ID)+标题=项目去重+死常量；质量自审(审查代理空返回，人工核实watchStore生命周期/聚合序/审批身份链/extras编码/promotion门控)——修sticky重启不挂repost定时器+后台startService崩溃边界；README同步聚合通知+/fs/list；bridge测试+assembleDebug绿
