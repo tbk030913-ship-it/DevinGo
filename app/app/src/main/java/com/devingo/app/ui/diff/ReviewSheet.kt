@@ -53,6 +53,7 @@ import kotlinx.coroutines.withContext
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.File01
+import me.rerere.hugeicons.stroke.GitCommit
 import me.rerere.hugeicons.stroke.SlidersHorizontal
 
 /** How the sheet was opened — decides the initial scope. */
@@ -112,6 +113,8 @@ fun ReviewSheet(
     request: ReviewRequest,
     fetchGitDiff: suspend () -> GitDiffResult,
     onSubmitComment: (ReviewSelection, String) -> Unit,
+    /** W8.2: the control-bar Git icon — opens the commit sheet (null hides it). */
+    onOpenCommit: (() -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -320,6 +323,19 @@ fun ReviewSheet(
                         modifier = Modifier.size(18.dp),
                         tint = if (hideTests) cs.primary else cs.onSurfaceVariant,
                     )
+                }
+                // W8.2: the Git icon opens the commit sheet (stacks on top).
+                if (onOpenCommit != null) {
+                    IconButton(
+                        onClick = onOpenCommit,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(
+                            HugeIcons.GitCommit, "提交改动",
+                            modifier = Modifier.size(18.dp),
+                            tint = cs.onSurfaceVariant,
+                        )
+                    }
                 }
                 Box {
                     IconButton(

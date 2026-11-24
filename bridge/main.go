@@ -135,6 +135,12 @@ func main() {
 	mux.HandleFunc("/fs/read", fsReadHandler)
 	mux.HandleFunc("/fs/search", fsSearchHandler)
 	mux.HandleFunc("/git/diff", gitDiffHandler)
+	mux.HandleFunc("/git/status", gitStatusHandler)
+	mux.HandleFunc("/git/branches", gitBranchesHandler)
+	mux.HandleFunc("/git/checkout", gitCheckoutHandler)
+	mux.HandleFunc("/git/commit", gitCommitHandler)
+	mux.HandleFunc("/git/push", gitPushHandler)
+	mux.HandleFunc("/git/pull", gitPullHandler)
 	mux.HandleFunc("/pty", ptyHandler)
 	mux.HandleFunc("/preview/", previewProxyHandler)
 	mux.HandleFunc("/preview-auth", previewAuthHandler)
@@ -151,6 +157,10 @@ func main() {
 		fmt.Fprintln(w, "  GET  /fs/read?sessionId|cwd&path - file content, <=1 MiB ({content|binary})")
 		fmt.Fprintln(w, "  GET  /fs/search?sessionId&q&limit - fuzzy file/dir search of a session workspace")
 		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
+		fmt.Fprintln(w, "  GET  /git/diff?sessionId|cwd&mode=uncommitted|branch&path - same, query form")
+		fmt.Fprintln(w, "  GET  /git/status?sessionId|cwd - branch/ahead/behind/changed files")
+		fmt.Fprintln(w, "  GET  /git/branches?sessionId|cwd - local branches + current + default")
+		fmt.Fprintln(w, "  POST /git/checkout|commit|push|pull - workspace git mutations (W8.2)")
 		fmt.Fprintln(w, "  WS  /pty       - terminal console (ConPTY shell in a session workspace)")
 		fmt.Fprintln(w, "  GET /preview/{port}/ - reverse proxy to a localhost dev server (WebView preview)")
 		fmt.Fprintln(w, "  GET /preview-auth?port=N - mint the preview cookie then redirect into the tunnel")
@@ -578,17 +588,26 @@ func fsWriteHandler(w http.ResponseWriter, r *http.Request) {
 // gitDiffMaxBody bounds the JSON request payload — it only carries a session id.
 const gitDiffMaxBody = 16 << 10
 
-// gitDiffHandler serves a session workspace's uncommitted `git diff`
-// ({sessionId} → {patch, truncated}). Same auth/origin gates as /fs/write;
-// the workspace resolves through the hub's recorded cwd and the git call
-// itself runs under gitDiffTimeout with a 4 MiB output cap (N6.1).
+// gitReqMaxBody bounds POST /git/commit — its file list can name a large
+// selection of paths.
+const gitReqMaxBody = 256 << 10
+
+// gitDiffHandler serves a session workspace's `git diff` two ways:
+//
+//	POST {sessionId}                       → {patch, truncated} — the
+//	                                       original uncommitted mode (N6.1).
+//	GET ?sessionId|cwd&mode=&path=         → same payload: mode=uncommitted
+//	                                       (default) matches POST;
+//	                                       mode=branch diffs the default-
+//	                                       branch merge-base against the
+//	                                       worktree. `path` confines to one
+//	                                       validated file (W8.2).
+//
+// Same auth/origin gates as /fs/write; the workspace resolves through the
+// hub's recorded cwd and the git call itself runs under a timeout with a
+// 4 MiB output cap.
 func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"error":"method not allowed"}`))
-		return
-	}
 	if !authorized(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"unauthorized"}`))
@@ -598,6 +617,20 @@ func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
 		rejectForbiddenOrigin(w)
 		return
 	}
+	switch r.Method {
+	case http.MethodPost:
+		gitDiffPostMode(w, r)
+	case http.MethodGet:
+		gitDiffGet(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+	}
+}
+
+// gitDiffPostMode is the original POST /git/diff — {sessionId} → the
+// session's uncommitted patch.
+func gitDiffPostMode(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID string `json:"sessionId"`
 	}
@@ -614,18 +647,267 @@ func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	patch, truncated, err := bridgeHub.sessionGitDiff(req.SessionID)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, errSessionNotHosted) {
-			status = http.StatusNotFound
-		}
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		writeGitError(w, err)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"patch":     patch,
 		"truncated": truncated,
 	})
+}
+
+// gitDiffGet is GET /git/diff?sessionId|cwd&mode=uncommitted|branch&path=
+// — the W8.2 query form, same {patch, truncated} payload.
+func gitDiffGet(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("sessionId") == "" && q.Get("cwd") == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId or cwd is required"}`))
+		return
+	}
+	pathspec, ok := cleanGitPath(q.Get("path"))
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid path"}`))
+		return
+	}
+	mode := q.Get("mode")
+	if mode != "" && mode != "uncommitted" && mode != "branch" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"unknown mode"}`))
+		return
+	}
+	patch, truncated, err := bridgeHub.sessionGitDiffQuery(
+		q.Get("sessionId"), q.Get("cwd"), mode, pathspec)
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"patch":     patch,
+		"truncated": truncated,
+	})
+}
+
+// writeGitError maps the /git sentinels — shared fs ones (root resolution)
+// plus the git-op classes — to status codes. Sanitized op messages are
+// safe to surface; they never carry absolute paths or credentials.
+func writeGitError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, errSessionNotHosted):
+		status = http.StatusNotFound
+	case errors.Is(err, errPathOutside):
+		status = http.StatusForbidden
+	case errors.Is(err, errGitNotRepo), errors.Is(err, errGitBadRef),
+		errors.Is(err, errGitBadPath), errors.Is(err, errGitNoFiles),
+		errors.Is(err, errGitNoMsg), errors.Is(err, errGitNoBase):
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+}
+
+// gitOpBody is the shared POST envelope the /git mutations extend — the
+// workspace root resolves exactly like the GET ?sessionId|cwd params.
+type gitOpBody struct {
+	SessionID string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+}
+
+// gitStatusHandler is GET /git/status — the Git sheet's summary row:
+// branch, ahead/behind vs upstream and per-file change counts (W8.2).
+func gitStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("sessionId") == "" && q.Get("cwd") == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId or cwd is required"}`))
+		return
+	}
+	st, err := bridgeHub.sessionGitStatus(q.Get("sessionId"), q.Get("cwd"))
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(st)
+}
+
+// gitBranchesHandler is GET /git/branches — local branch names, the
+// checked-out one and the repo's default (W8.2).
+func gitBranchesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("sessionId") == "" && q.Get("cwd") == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId or cwd is required"}`))
+		return
+	}
+	res, err := bridgeHub.sessionGitBranches(q.Get("sessionId"), q.Get("cwd"))
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(res)
+}
+
+// gitCheckoutHandler is POST /git/checkout — {sessionId|cwd, branch} to
+// switch, or {sessionId|cwd, createBranch} to `switch -c`. Names are
+// check-ref-format gated; the command runs argv-only (W8.2).
+func gitCheckoutHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req struct {
+		gitOpBody
+		Branch       string `json:"branch"`
+		CreateBranch string `json:"createBranch"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, gitDiffMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if (req.Branch == "") == (req.CreateBranch == "") {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"exactly one of branch or createBranch is required"}`))
+		return
+	}
+	name, err := bridgeHub.sessionGitCheckout(
+		req.SessionID, req.Cwd, req.Branch, req.CreateBranch)
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "branch": name})
+}
+
+// gitCommitHandler is POST /git/commit — {sessionId|cwd, files, message,
+// createBranch?}: `add -- <files>` then `commit -m`, optionally on a fresh
+// `switch -c` first (W8.2).
+func gitCommitHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req struct {
+		gitOpBody
+		Files        []string `json:"files"`
+		Message      string   `json:"message"`
+		CreateBranch string   `json:"createBranch"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, gitReqMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	branch, sha, err := bridgeHub.sessionGitCommit(
+		req.SessionID, req.Cwd, req.Files, req.Message, req.CreateBranch)
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok": true, "branch": branch, "commit": sha,
+	})
+}
+
+// gitPushHandler / gitPullHandler are POST /git/push|pull —
+// {sessionId|cwd} only; the branch/upstream logic lives in the hub. The
+// confirmation output tail echoes back for the sheet (W8.2).
+func gitPushHandler(w http.ResponseWriter, r *http.Request) {
+	gitSyncHandler(w, r, bridgeHub.sessionGitPush)
+}
+
+func gitPullHandler(w http.ResponseWriter, r *http.Request) {
+	gitSyncHandler(w, r, bridgeHub.sessionGitPull)
+}
+
+// gitSyncHandler is the shared shape for push/pull: auth + origin gates,
+// a {sessionId|cwd} body, then the hub op — {ok, output} on success.
+func gitSyncHandler(w http.ResponseWriter, r *http.Request,
+	op func(sid, cwd string) (string, error)) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	var req gitOpBody
+	r.Body = http.MaxBytesReader(w, r.Body, gitDiffMaxBody)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	out, err := op(req.SessionID, req.Cwd)
+	if err != nil {
+		writeGitError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "output": out})
 }
 
 // fsListMaxBody bounds the JSON request payload — it only carries a session id.
@@ -780,8 +1062,8 @@ func fsReadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	head := data
-	if len(head) > 512 {
-		head = head[:512]
+	if len(head) > 8192 {
+		head = head[:8192]
 	}
 	if isBinaryContent(head) {
 		json.NewEncoder(w).Encode(map[string]any{

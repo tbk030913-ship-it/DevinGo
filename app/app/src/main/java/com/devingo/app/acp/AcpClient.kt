@@ -1377,6 +1377,17 @@ private val JsonPrimitive.numberAsLong: Long?
 
 private val healthJson = Json { ignoreUnknownKeys = true }
 
+/**
+ * One shared client for the bridge's HTTP helpers — a fresh OkHttpClient
+ * per call would abandon the connection pool (every tree expand used to
+ * pay a TCP handshake). Functions needing other timeouts clone via
+ * `newBuilder()` — the pool is still shared.
+ */
+private val bridgeHttpClient = OkHttpClient.Builder()
+    .connectTimeout(8, TimeUnit.SECONDS)
+    .readTimeout(25, TimeUnit.SECONDS)
+    .build()
+
 class AcpException(message: String, val code: Int = -1) : Exception(message)
 
 @Serializable
@@ -1462,10 +1473,7 @@ suspend fun postBridgeGitDiff(
     token: String?,
     sessionId: String,
 ): GitDiffResult = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .build()
+    val client = bridgeHttpClient
     val payload = buildJsonObject {
         put("sessionId", sessionId)
     }
@@ -1505,10 +1513,7 @@ suspend fun postBridgeFsList(
     token: String?,
     sessionId: String,
 ): List<String> = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .build()
+    val client = bridgeHttpClient
     val payload = buildJsonObject {
         put("sessionId", sessionId)
     }
@@ -1551,10 +1556,7 @@ suspend fun getBridgeFsSearch(
     query: String,
     limit: Int = 50,
 ): List<FsSearchItem> = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .build()
+    val client = bridgeHttpClient
     val url = "$baseHttpUrl/fs/search".toHttpUrl().newBuilder()
         .addQueryParameter("sessionId", sessionId)
         .addQueryParameter("q", query)
@@ -1611,10 +1613,7 @@ suspend fun getBridgeFsTree(
     cwd: String,
     path: String,
 ): FsDirListing = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .build()
+    val client = bridgeHttpClient
     val url = "$baseHttpUrl/fs/list".toHttpUrl().newBuilder()
         .addQueryParameter("sessionId", sessionId)
         .addQueryParameter("cwd", cwd)
@@ -1677,10 +1676,7 @@ suspend fun getBridgeFsRead(
     cwd: String,
     path: String,
 ): FsReadResult = withContext(Dispatchers.IO) {
-    val client = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .build()
+    val client = bridgeHttpClient
     val url = "$baseHttpUrl/fs/read".toHttpUrl().newBuilder()
         .addQueryParameter("sessionId", sessionId)
         .addQueryParameter("cwd", cwd)
@@ -1711,6 +1707,202 @@ suspend fun getBridgeFsRead(
         )
     }
 }
+
+// ---- W8.2: Git quick ops ----------------------------------------------------
+
+/** One /git/status file row — the porcelain letter + diffstat counts. */
+data class GitStatusFile(
+    val path: String,
+    val status: String, // A|M|D|R|C|U|?
+    val insertions: Int,
+    val deletions: Int,
+)
+
+/** The bridge's `/git/status` payload — the Git sheet's summary row. */
+data class GitStatus(
+    val isRepo: Boolean,
+    val branch: String,
+    val isDefaultBranch: Boolean,
+    val ahead: Int,
+    val behind: Int,
+    val files: List<GitStatusFile>,
+) {
+    /** Insertions+deletions across the dirty set — the sheet's +x −y. */
+    val insertions: Int get() = files.sumOf { it.insertions }
+    val deletions: Int get() = files.sumOf { it.deletions }
+}
+
+/** The bridge's `/git/branches` payload. */
+data class GitBranches(
+    val current: String,
+    val defaultBranch: String,
+    val branches: List<String>,
+)
+
+/** A /git mutation's ack — whichever fields the op filled. */
+data class GitOpResult(
+    val branch: String = "",
+    val commit: String = "",
+    val output: String = "",
+)
+
+/**
+ * Shared plumbing for the /git/ endpoints (W8.2): bearer auth, query or
+ * JSON-body request, and non-2xx → [AcpException] carrying the server's
+ * `error` field (sanitized git text — safe to show verbatim).
+ */
+private suspend fun bridgeGitJson(
+    baseHttpUrl: String,
+    token: String?,
+    method: String, // "GET" | "POST"
+    path: String,
+    query: List<Pair<String, String>> = emptyList(),
+    body: JsonObject? = null,
+): JsonObject = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        // Mutations get the bridge's own 30s budget plus slack.
+        .readTimeout(35, TimeUnit.SECONDS)
+        .build()
+    val url = "$baseHttpUrl$path".toHttpUrl().newBuilder().apply {
+        query.forEach { (k, v) -> addQueryParameter(k, v) }
+    }.build()
+    val req = Request.Builder().url(url).apply {
+        if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        if (method == "POST") {
+            post((body ?: buildJsonObject {}).toString()
+                .toRequestBody("application/json".toMediaType()))
+        }
+    }.build()
+    client.newCall(req).execute().use { resp ->
+        val text = resp.body?.string().orEmpty()
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                healthJson.parseToJsonElement(text).jsonObject["error"]
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "git HTTP ${resp.code}")
+        }
+        healthJson.parseToJsonElement(text).jsonObject
+    }
+}
+
+/** The bridge's `/git/status` (GET): branch, ahead/behind and per-file
+ *  change counts for the session workspace. Throws [AcpException] on non-2xx. */
+suspend fun getBridgeGitStatus(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+): GitStatus {
+    val obj = bridgeGitJson(baseHttpUrl, token, "GET", "/git/status",
+        listOf("sessionId" to sessionId, "cwd" to cwd))
+    return GitStatus(
+        isRepo = obj.boolField("isRepo") == true,
+        branch = obj.strField("branch").orEmpty(),
+        isDefaultBranch = obj.boolField("isDefaultBranch") == true,
+        ahead = obj.intField("ahead") ?: 0,
+        behind = obj.intField("behind") ?: 0,
+        files = (obj["files"] as? JsonArray)?.mapNotNull { el ->
+            val o = el as? JsonObject ?: return@mapNotNull null
+            GitStatusFile(
+                path = o.strField("path") ?: return@mapNotNull null,
+                status = o.strField("status") ?: "?",
+                insertions = o.intField("insertions") ?: 0,
+                deletions = o.intField("deletions") ?: 0,
+            )
+        } ?: emptyList(),
+    )
+}
+
+/** The bridge's `/git/branches` (GET): local branches + current + default. */
+suspend fun getBridgeGitBranches(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+): GitBranches {
+    val obj = bridgeGitJson(baseHttpUrl, token, "GET", "/git/branches",
+        listOf("sessionId" to sessionId, "cwd" to cwd))
+    return GitBranches(
+        current = obj.strField("current").orEmpty(),
+        defaultBranch = obj.strField("defaultBranch").orEmpty(),
+        branches = (obj["branches"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.content } ?: emptyList(),
+    )
+}
+
+private fun JsonObject.gitOpResult(): GitOpResult = GitOpResult(
+    branch = strField("branch").orEmpty(),
+    commit = strField("commit").orEmpty(),
+    output = strField("output").orEmpty(),
+)
+
+/**
+ * The bridge's `/git/checkout` (POST): exactly one of [branch] (switch) or
+ * [createBranch] (`switch -c`). Throws [AcpException] on non-2xx — the
+ * server's sanitized git stderr rides the message.
+ */
+suspend fun postBridgeGitCheckout(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+    branch: String?,
+    createBranch: String?,
+): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/checkout",
+    body = buildJsonObject {
+        put("sessionId", sessionId)
+        put("cwd", cwd)
+        branch?.let { put("branch", it) }
+        createBranch?.let { put("createBranch", it) }
+    }).gitOpResult()
+
+/**
+ * The bridge's `/git/commit` (POST): `add -- <files>` + `commit -m`,
+ * optionally on a fresh `switch -c [createBranch]` first. Throws
+ * [AcpException] on non-2xx.
+ */
+suspend fun postBridgeGitCommit(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+    files: List<String>,
+    message: String,
+    createBranch: String?,
+): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/commit",
+    body = buildJsonObject {
+        put("sessionId", sessionId)
+        put("cwd", cwd)
+        put("files", JsonArray(files.map { JsonPrimitive(it) }))
+        put("message", message)
+        createBranch?.let { put("createBranch", it) }
+    }).gitOpResult()
+
+/** The bridge's `/git/push` (POST) — `{ok, output}` on success. */
+suspend fun postBridgeGitPush(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/push",
+    body = buildJsonObject {
+        put("sessionId", sessionId)
+        put("cwd", cwd)
+    }).gitOpResult()
+
+/** The bridge's `/git/pull` (POST) — fast-forward only, `{ok, output}`. */
+suspend fun postBridgeGitPull(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/pull",
+    body = buildJsonObject {
+        put("sessionId", sessionId)
+        put("cwd", cwd)
+    }).gitOpResult()
 
 private fun extractModels(el: JsonElement, out: MutableList<SessionModel> = mutableListOf()): List<SessionModel> {
     when (el) {

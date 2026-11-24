@@ -61,6 +61,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.AppVisibility
 import com.devingo.app.ChatViewModel
+import com.devingo.app.acp.GitStatus
 import com.devingo.app.CitationAttachment
 import com.devingo.app.Phase
 import com.devingo.app.RowKind
@@ -138,6 +139,10 @@ fun ChatScreen(
     // switch drops the console socket along with the sheet.
     var terminalOpen by remember(ui.sessionId) { mutableStateOf(false) }
     var previewOpen by remember(ui.sessionId) { mutableStateOf(false) }
+    // W8.2: the Git sheet — the enum picks which page it opens on.
+    var gitSheet by remember(ui.sessionId) { mutableStateOf<GitSheetPage?>(null) }
+    // Lazy summary for the ··· menu's Git row — fetched per menu open.
+    var gitMenuSummary by remember(ui.sessionId) { mutableStateOf<GitStatus?>(null) }
     // Scanned at open time, not per-frame: newest localhost/127.0.0.1 port
     // the transcript mentions (N6.4).
     var previewPort by remember(ui.sessionId) { mutableStateOf<Int?>(null) }
@@ -160,7 +165,7 @@ fun ChatScreen(
     BackHandler(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
             !backgroundSheet && !filesSheet && viewerTarget == null &&
-            !subagentListOpen && detailSubagent == null &&
+            !subagentListOpen && detailSubagent == null && gitSheet == null &&
             reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()
@@ -224,6 +229,25 @@ fun ChatScreen(
             onOpenTerminal = { terminalOpen = true },
             onOpenBackground = { backgroundSheet = true },
             onOpenFiles = { filesSheet = true },
+            // W8.2: Git entry + the menu-open status probe for its subtitle.
+            onOpenGit = { gitSheet = GitSheetPage.Overview },
+            onMenuWillOpen = {
+                if (ui.attached) {
+                    scope.launch {
+                        gitMenuSummary = runCatching { vm.fetchGitStatus() }
+                            .getOrNull()
+                    }
+                }
+            },
+            gitSummary = gitMenuSummary
+                ?.takeIf { it.isRepo }
+                ?.let { s ->
+                    buildString {
+                        append(s.branch.ifBlank { "仓库" })
+                        if (s.files.isNotEmpty()) append(" · ${s.files.size} 处改动")
+                        if (s.ahead > 0) append(" ↑${s.ahead}")
+                    }
+                },
             onOpenPreview = {
                 previewPort = detectPreviewPort(model, tail)
                 previewOpen = true
@@ -570,6 +594,8 @@ fun ChatScreen(
                 )
                 Toast.makeText(context, "已加入草稿", Toast.LENGTH_SHORT).show()
             },
+            // W8.2: the control-bar Git icon opens the commit sheet on top.
+            onOpenCommit = { gitSheet = GitSheetPage.Commit },
             onDismiss = { reviewRequest = null },
         )
     }
@@ -593,6 +619,22 @@ fun ChatScreen(
             httpBase = ep?.first.orEmpty(),
             token = ep?.second,
             onDismiss = { previewOpen = false },
+        )
+    }
+    // W8.2: Git 总览/提交/分支 — one sheet, three pages; the enum picks the
+    // entry page (menu → 总览, ReviewSheet's Git icon → 提交改动).
+    gitSheet?.let { page ->
+        GitSheet(
+            initialPage = page,
+            fetchStatus = vm::fetchGitStatus,
+            fetchBranches = vm::fetchGitBranches,
+            onCheckout = { b, c -> vm.gitCheckout(b, c) },
+            onCommit = { f, m, c -> vm.gitCommit(f, m, c) },
+            onPush = { vm.gitPush() },
+            onPull = { vm.gitPull() },
+            onAskDevinMessage = vm::sendPrompt,
+            onOpenReview = { reviewRequest = ReviewRequest.Session() },
+            onDismiss = { gitSheet = null },
         )
     }
     val clipboard = LocalClipboard.current
@@ -651,6 +693,12 @@ private fun ChatTopBar(
     onOpenBackground: () -> Unit,
     /** W8.1: the workspace files tree. */
     onOpenFiles: () -> Unit,
+    /** W8.2: the Git sheet — the ··· menu's Git row. */
+    onOpenGit: () -> Unit,
+    /** W8.2: fired when the ··· menu opens — refreshes [gitSummary]. */
+    onMenuWillOpen: () -> Unit,
+    /** W8.2: one-line `branch · n 处改动` shown under the Git menu row. */
+    gitSummary: String?,
     onOpenPreview: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
@@ -746,7 +794,10 @@ private fun ChatTopBar(
                     )
                 }
                 Box {
-                    IconButton(onClick = { menuOpen = true }) {
+                    IconButton(onClick = {
+                        onMenuWillOpen()
+                        menuOpen = true
+                    }) {
                         Icon(
                             HugeIcons.MoreHorizontal, "更多",
                             modifier = Modifier.size(22.dp),
@@ -785,6 +836,16 @@ private fun ChatTopBar(
                             menuOpen = false
                             onOpenFiles()
                         })
+                        // W8.2: branch/status sheet — subtitle is the lazy
+                        // `branch · n 处改动` probe refreshed per menu open.
+                        DevinMenuItem(
+                            "Git",
+                            subtitle = gitSummary,
+                            onClick = {
+                                menuOpen = false
+                                onOpenGit()
+                            },
+                        )
                         DevinMenuItem("预览", onClick = {
                             menuOpen = false
                             onOpenPreview()

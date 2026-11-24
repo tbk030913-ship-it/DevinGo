@@ -6,7 +6,10 @@ import com.devingo.app.acp.AgentCaps
 import com.devingo.app.acp.FsDirListing
 import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
+import com.devingo.app.acp.GitBranches
 import com.devingo.app.acp.GitDiffResult
+import com.devingo.app.acp.GitOpResult
+import com.devingo.app.acp.GitStatus
 import com.devingo.app.acp.MentionResource
 import com.devingo.app.acp.RevertPreview
 import com.devingo.app.acp.RevertStep
@@ -461,6 +464,45 @@ class ChatViewModel(
     suspend fun readWorkspaceFile(path: String): FsReadResult =
         store?.readWorkspaceFile(path)
             ?: throw IllegalStateException("no bound session")
+
+    // ---- git quick ops (W8.2) ---------------------------------------------------
+
+    /** `/git/status` for the Git sheet + the menu's branch summary. */
+    suspend fun fetchGitStatus(): GitStatus =
+        store?.fetchGitStatus() ?: throw IllegalStateException("no bound session")
+
+    /** `/git/branches`: local branch list for the branches page. */
+    suspend fun fetchGitBranches(): GitBranches =
+        store?.fetchGitBranches() ?: throw IllegalStateException("no bound session")
+
+    /** `/git/checkout`: switch (branch) or create-and-switch (createBranch). */
+    suspend fun gitCheckout(branch: String?, createBranch: String?): GitOpResult =
+        store?.gitCheckout(branch, createBranch)
+            ?: throw IllegalStateException("no bound session")
+
+    /** `/git/commit`: stage the selected files then `commit -m`. */
+    suspend fun gitCommit(
+        files: List<String>,
+        message: String,
+        createBranch: String?,
+    ): GitOpResult =
+        store?.gitCommit(files, message, createBranch)
+            ?: throw IllegalStateException("no bound session")
+
+    suspend fun gitPush(): GitOpResult =
+        store?.gitPush() ?: throw IllegalStateException("no bound session")
+
+    suspend fun gitPull(): GitOpResult =
+        store?.gitPull() ?: throw IllegalStateException("no bound session")
+
+    /**
+     * A free-text prompt to the bound session — the Git sheet's
+     * 「让 Devin 生成 Commit Message」 request path. Queues behind a running
+     * turn like a normal composer send (W8.2).
+     */
+    fun sendPrompt(text: String) {
+        store?.send(text)
+    }
 
     /**
      * Rules/skills/plans the agent lists for @-mentions. Failures (agent

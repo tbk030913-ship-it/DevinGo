@@ -2224,6 +2224,14 @@ func markIgnored(root string, entries []fsDirEntry) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
 	defer cancel()
+	// Outside a work tree check-ignore only fattals — skip the spawn so a
+	// plain-folder listing doesn't pay a doomed git exec per page (and
+	// rev-parse handles .git files, worktrees and nested roots correctly).
+	inside, err := exec.CommandContext(ctx, "git", "-C", root,
+		"rev-parse", "--is-inside-work-tree").Output()
+	if err != nil || strings.TrimSpace(string(inside)) != "true" {
+		return
+	}
 	// Slash-separated input: git treats '/' as its separator on every OS,
 	// and -z output echoes the input verbatim, so lookups match exactly.
 	var in strings.Builder
@@ -2323,16 +2331,28 @@ func (h *Hub) sessionGitDiff(sid string) (string, bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
 	defer cancel()
+	return workspaceGitDiff(ctx, cwd, "", ".")
+}
 
+// workspaceGitDiff is sessionGitDiff's engine shared with GET /git/diff
+// (W8.2): [base] "" means the uncommitted default (HEAD, or --cached on
+// an unborn HEAD), any other value diffs that ref against the worktree —
+// the branch-review mode. [pathspec] confines the diff inside cwd
+// ("." or a validated single file); untracked files under it still get
+// synthesized all-add sections.
+func workspaceGitDiff(ctx context.Context, cwd, base, pathspec string) (string, bool, error) {
 	args := []string{"-C", cwd, "diff", "--no-color", "--relative"}
-	if err := exec.CommandContext(ctx, "git", "-C", cwd,
-		"rev-parse", "--verify", "-q", "HEAD").Run(); err == nil {
+	switch {
+	case base != "":
+		args = append(args, base)
+	case exec.CommandContext(ctx, "git", "-C", cwd,
+		"rev-parse", "--verify", "-q", "HEAD").Run() == nil:
 		args = append(args, "HEAD")
-	} else {
+	default:
 		// Unborn HEAD: no commit to diff against — the staged tree is it.
 		args = append(args, "--cached")
 	}
-	args = append(args, "--", ".")
+	args = append(args, "--", pathspec)
 
 	var buf bytes.Buffer
 	patch, truncated, err := gitStdout(ctx, gitDiffMaxOutput, args...)
@@ -2343,7 +2363,7 @@ func (h *Hub) sessionGitDiff(sid string) (string, bool, error) {
 
 	// `-z` keeps odd filenames unescaped; ls-files paths are cwd-relative.
 	names, err := gitLines(ctx, "-C", cwd, "ls-files", "-z",
-		"--others", "--exclude-standard", "--", ".")
+		"--others", "--exclude-standard", "--", pathspec)
 	if err == nil {
 		for i, rel := range names {
 			if buf.Len() >= gitDiffMaxOutput || i >= gitUntrackedMaxFiles {
@@ -2490,6 +2510,523 @@ func isBinaryContent(b []byte) bool {
 		n = 8192
 	}
 	return bytes.IndexByte(b[:n], 0) >= 0
+}
+
+// ------------------------------------------------------------ git ops -----
+
+// W8.2: status/branch/commit/push/pull over the same session-cwd
+// confinement as /fs — every op resolves its root through fsBrowseRoot
+// (hosted sessionId, or a ?cwd= proven inside a hosted workspace), runs
+// one exec.CommandContext with args arrays (never a shell), and answers
+// under gitOpTimeout.
+
+const (
+	// gitOpTimeout bounds a whole /git/* request — status fans out into
+	// several cheap git reads that share the one deadline.
+	gitOpTimeout = 30 * time.Second
+	// gitOpMaxOutput caps the combined stdout+stderr a mutation echoes
+	// back for the sheet's confirmation line.
+	gitOpMaxOutput = 8 << 10
+)
+
+// Sentinel errors the /git/* handlers map to status codes.
+var (
+	errGitNotRepo = errors.New("not a git repository")
+	errGitBadRef  = errors.New("invalid branch name")
+	errGitBadPath = errors.New("invalid file path")
+	errGitNoFiles = errors.New("files is required")
+	errGitNoMsg   = errors.New("message is required")
+	errGitNoBase  = errors.New("no merge base with the default branch")
+)
+
+// gitOpEnv disables interactive waits: a push over https must fail fast
+// instead of parking on a credential prompt or a pager the phone can't
+// see.
+var gitOpEnv = append(os.Environ(),
+	"GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "PAGER=cat")
+
+// gitStatusFile is one /git/status row: the porcelain path folded to one
+// letter plus its numstat counts (untracked files count their own lines).
+type gitStatusFile struct {
+	Path       string `json:"path"`
+	Status     string `json:"status"` // A|M|D|R|C|U|?
+	Insertions int    `json:"insertions"`
+	Deletions  int    `json:"deletions"`
+}
+
+// gitStatusResult is the /git/status payload.
+type gitStatusResult struct {
+	IsRepo          bool            `json:"isRepo"`
+	Branch          string          `json:"branch"`
+	IsDefaultBranch bool            `json:"isDefaultBranch"`
+	Ahead           int             `json:"ahead"`
+	Behind          int             `json:"behind"`
+	Files           []gitStatusFile `json:"files"`
+}
+
+// gitBranchesResult is the /git/branches payload.
+type gitBranchesResult struct {
+	Current       string   `json:"current"`
+	DefaultBranch string   `json:"defaultBranch"`
+	Branches      []string `json:"branches"`
+}
+
+// sessionGitStatus reports branch + dirty state inside the workspace. A
+// workspace that isn't a repo answers {isRepo:false} 200 — it's a state,
+// not a failure.
+func (h *Hub) sessionGitStatus(sid, cwdParam string) (*gitStatusResult, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	res := &gitStatusResult{Files: []gitStatusFile{}}
+	if requireGitRepo(ctx, root) != nil {
+		return res, nil
+	}
+	res.IsRepo = true
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
+		"symbolic-ref", "--short", "-q", "HEAD"); err == nil {
+		res.Branch = strings.TrimSpace(string(out))
+	}
+	if res.Branch == "" {
+		// Detached HEAD: the short sha still names where the work sits.
+		if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
+			"rev-parse", "--short", "HEAD"); err == nil {
+			res.Branch = "detached:" + strings.TrimSpace(string(out))
+		}
+	}
+	res.IsDefaultBranch = res.Branch != "" &&
+		res.Branch == gitDefaultBranch(ctx, root)
+	// @{upstream} fails when none is set — ahead/behind stay 0.
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", root, "rev-list",
+		"--left-right", "--count", "HEAD...@{upstream}"); err == nil {
+		fmt.Sscanf(string(out), "%d\t%d", &res.Ahead, &res.Behind)
+	}
+	if files, err := gitStatusFiles(ctx, root); err == nil {
+		res.Files = files
+	}
+	return res, nil
+}
+
+// requireGitRepo gates the mutating ops — checkout/commit/push/pull in a
+// non-repo workspace is a client-visible 400, not a silent no-op.
+func requireGitRepo(ctx context.Context, cwd string) error {
+	out, _, err := gitStdout(ctx, 16<<10, "-C", cwd,
+		"rev-parse", "--is-inside-work-tree")
+	if err != nil || strings.TrimSpace(string(out)) != "true" {
+		return errGitNotRepo
+	}
+	return nil
+}
+
+// gitDefaultBranch names the repo's default branch: origin/HEAD's target
+// when a remote declares one, else whichever of main/master exists.
+func gitDefaultBranch(ctx context.Context, cwd string) string {
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", cwd,
+		"symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"); err == nil {
+		if s := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/"); s != "" {
+			return s
+		}
+	}
+	for _, b := range []string{"main", "master"} {
+		if exec.CommandContext(ctx, "git", "-C", cwd,
+			"show-ref", "--verify", "--quiet", "refs/heads/"+b).Run() == nil {
+			return b
+		}
+	}
+	return "main"
+}
+
+// gitStatusFiles merges `status --porcelain -z` rows with `diff --numstat
+// -z` counts against HEAD (--cached on an unborn HEAD). Both run with the
+// `.` pathspec, so a workspace rooted in a repo subdirectory stays
+// confined to its subtree and paths print cwd-relative.
+func gitStatusFiles(ctx context.Context, cwd string) ([]gitStatusFile, error) {
+	raw, err := gitLines(ctx, "-C", cwd, "status",
+		"--porcelain=v1", "-z", "--", ".")
+	if err != nil {
+		return nil, err
+	}
+	files := []gitStatusFile{}
+	for i := 0; i < len(raw); i++ {
+		e := raw[i]
+		if len(e) < 4 {
+			continue
+		}
+		xy, path := e[:2], e[3:]
+		if strings.ContainsAny(xy, "RC") {
+			i++ // renames/copies carry the source path as the next NUL entry
+		}
+		files = append(files, gitStatusFile{Path: path, Status: porcelainLetter(xy)})
+	}
+
+	// Numstat against HEAD (or the index when HEAD is unborn) fills the
+	// +/− columns; `-z` rename rows read "<ins>\t<del>\t" + old + new.
+	numArgs := []string{"-C", cwd, "diff", "--numstat", "-z"}
+	if exec.CommandContext(ctx, "git", "-C", cwd,
+		"rev-parse", "--verify", "-q", "HEAD").Run() == nil {
+		numArgs = append(numArgs, "HEAD")
+	} else {
+		numArgs = append(numArgs, "--cached")
+	}
+	numArgs = append(numArgs, "--", ".")
+	if ns, err := gitLines(ctx, numArgs...); err == nil {
+		byPath := make(map[string]int, len(files))
+		for i := range files {
+			byPath[files[i].Path] = i
+		}
+		for i := 0; i < len(ns); i++ {
+			parts := strings.SplitN(ns[i], "\t", 3)
+			if len(parts) != 3 {
+				continue
+			}
+			ins, _ := strconv.Atoi(parts[0])
+			del, _ := strconv.Atoi(parts[1])
+			path := parts[2]
+			if path == "" && i+2 < len(ns) {
+				path = ns[i+2] // rename: old then new; the new name is the row
+				i += 2
+			}
+			if idx, ok := byPath[path]; ok {
+				files[idx].Insertions = ins
+				files[idx].Deletions = del
+			}
+		}
+	}
+
+	// Untracked files appear in no diff — their own line count stands in
+	// for insertions, same all-add math untrackedSection uses.
+	for i := range files {
+		if files[i].Status == "?" && files[i].Insertions == 0 {
+			files[i].Insertions = countFileLines(cwd, files[i].Path)
+		}
+	}
+	return files, nil
+}
+
+// porcelainLetter folds a two-column XY status to the single letter the
+// app renders: unmerged states win as U, "??" stays '?' (untracked), else
+// the first real flag.
+func porcelainLetter(xy string) string {
+	if strings.ContainsRune(xy, 'U') || xy == "AA" || xy == "DD" {
+		return "U"
+	}
+	if xy == "??" {
+		return "?"
+	}
+	for _, c := range xy {
+		if c != ' ' && c != '?' {
+			return string(c)
+		}
+	}
+	return "?"
+}
+
+// countFileLines is the numstat substitute for untracked files — the same
+// bounded read untrackedSection caps at.
+func countFileLines(cwd, rel string) int {
+	data, err := os.ReadFile(filepath.Join(cwd, rel))
+	if err != nil || isBinaryContent(data) {
+		return 0
+	}
+	if len(data) > gitUntrackedMaxFile {
+		data = data[:gitUntrackedMaxFile]
+	}
+	n := bytes.Count(data, []byte{'\n'})
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		n++
+	}
+	return n
+}
+
+// sessionGitBranches lists the workspace's local branches + current.
+func (h *Hub) sessionGitBranches(sid, cwdParam string) (*gitBranchesResult, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return nil, err
+	}
+	res := &gitBranchesResult{Branches: []string{}}
+	res.DefaultBranch = gitDefaultBranch(ctx, root)
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
+		"symbolic-ref", "--short", "-q", "HEAD"); err == nil {
+		res.Current = strings.TrimSpace(string(out))
+	}
+	if out, _, err := gitStdout(ctx, 1<<20, "-C", root,
+		"branch", "--format=%(refname:short)"); err == nil {
+		for _, b := range strings.Split(string(out), "\n") {
+			if b = strings.TrimSpace(b); b != "" {
+				res.Branches = append(res.Branches, b)
+			}
+		}
+	}
+	sort.Strings(res.Branches)
+	return res, nil
+}
+
+// gitBranchNameOK is the ref-name gate — `check-ref-format --branch`
+// rejects leading dashes, "..", control chars and friends before the name
+// reaches `switch -c`. Validating a pre-existing name too is harmless.
+func gitBranchNameOK(ctx context.Context, cwd, name string) bool {
+	if name == "" || len(name) > 200 {
+		return false
+	}
+	return exec.CommandContext(ctx, "git", "-C", cwd,
+		"check-ref-format", "--branch", name).Run() == nil
+}
+
+// cleanGitPath validates a client-supplied repo-relative path (diff
+// pathspec or `git add` file): slash-separated, never absolute, never a
+// ".." segment, never a drive letter or flag-shaped name. "" and ". both
+// mean the workspace root.
+func cleanGitPath(p string) (string, bool) {
+	p = strings.TrimSpace(filepath.ToSlash(p))
+	if p == "" || p == "." {
+		return ".", true
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") ||
+		strings.ContainsRune(p, ':') {
+		return "", false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+	return p, true
+}
+
+// sessionGitDiffQuery serves GET /git/diff: mode=uncommitted (default) is
+// the POST body mode over a validated pathspec; mode=branch diffs the
+// merge-base with the default branch against the worktree — everything
+// the branch introduces, committed or not.
+func (h *Hub) sessionGitDiffQuery(sid, cwdParam, mode, pathspec string) (string, bool, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return "", false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if mode == "branch" {
+		base, err := gitMergeBaseDefault(ctx, root)
+		if err != nil {
+			return "", false, err
+		}
+		return workspaceGitDiff(ctx, root, base, pathspec)
+	}
+	return workspaceGitDiff(ctx, root, "", pathspec)
+}
+
+// gitMergeBaseDefault finds `merge-base HEAD <default>`, trying the local
+// default first then origin/<default> for feature-only clones.
+func gitMergeBaseDefault(ctx context.Context, cwd string) (string, error) {
+	def := gitDefaultBranch(ctx, cwd)
+	for _, ref := range []string{def, "origin/" + def} {
+		if exec.CommandContext(ctx, "git", "-C", cwd,
+			"rev-parse", "--verify", "-q", ref).Run() != nil {
+			continue
+		}
+		if out, _, err := gitStdout(ctx, 4<<10, "-C", cwd,
+			"merge-base", "HEAD", ref); err == nil {
+			if mb := strings.TrimSpace(string(out)); mb != "" {
+				return mb, nil
+			}
+		}
+	}
+	return "", errGitNoBase
+}
+
+// sessionGitCheckout switches branches (git switch <name>) or creates one
+// (switch -c). Returns the checked-out name.
+func (h *Hub) sessionGitCheckout(sid, cwdParam, branch, createBranch string) (string, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return "", err
+	}
+	name := branch
+	if createBranch != "" {
+		name = createBranch
+	}
+	if !gitBranchNameOK(ctx, root, name) {
+		return "", errGitBadRef
+	}
+	// `git switch` speaks branches only — a name colliding with a file
+	// can't silently detach into pathspec mode the way checkout can.
+	args := []string{"switch"}
+	if createBranch != "" {
+		args = append(args, "-c")
+	}
+	if _, err := gitOp(ctx, root, append(args, name)...); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// sessionGitCommit stages the selected files (`add --` pathspec separator)
+// then commits with the message as a single argv element — no quoting
+// ever reaches a shell. A createBranch first lands a `switch -c` so the
+// commit never touches the default branch.
+func (h *Hub) sessionGitCommit(sid, cwdParam string, files []string,
+	message, createBranch string) (branch, sha string, err error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return "", "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return "", "", err
+	}
+	if len(files) == 0 {
+		return "", "", errGitNoFiles
+	}
+	if strings.TrimSpace(message) == "" {
+		return "", "", errGitNoMsg
+	}
+	if createBranch != "" {
+		if !gitBranchNameOK(ctx, root, createBranch) {
+			return "", "", errGitBadRef
+		}
+		if _, err := gitOp(ctx, root, "switch", "-c", createBranch); err != nil {
+			return "", "", err
+		}
+	}
+	addArgs := []string{"add", "--"}
+	for _, f := range files {
+		p, ok := cleanGitPath(f)
+		if !ok || p == "." {
+			return "", "", errGitBadPath
+		}
+		addArgs = append(addArgs, p)
+	}
+	if _, err := gitOp(ctx, root, addArgs...); err != nil {
+		return "", "", err
+	}
+	if _, err := gitOp(ctx, root, "commit", "-m", message); err != nil {
+		return "", "", err
+	}
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
+		"rev-parse", "--short", "HEAD"); err == nil {
+		sha = strings.TrimSpace(string(out))
+	}
+	if out, _, err := gitStdout(ctx, 4<<10, "-C", root,
+		"symbolic-ref", "--short", "-q", "HEAD"); err == nil {
+		branch = strings.TrimSpace(string(out))
+	}
+	return branch, sha, nil
+}
+
+// sessionGitPush pushes the current branch — `-u origin HEAD` when no
+// upstream is set yet (the common first-push on a fresh feature branch).
+// Returns git's own output tail for the sheet's confirmation line.
+func (h *Hub) sessionGitPush(sid, cwdParam string) (string, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return "", err
+	}
+	args := []string{"push"}
+	if exec.CommandContext(ctx, "git", "-C", root, "rev-parse",
+		"--abbrev-ref", "--symbolic-full-name", "@{upstream}").Run() != nil {
+		args = []string{"push", "-u", "origin", "HEAD"}
+	}
+	out, err := gitOp(ctx, root, args...)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// sessionGitPull fast-forward-merges the upstream — plain `git pull`
+// could open a merge editor or write conflict state a phone UI can't
+// resolve; a divergence error is the honest answer instead.
+func (h *Hub) sessionGitPull(sid, cwdParam string) (string, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
+	defer cancel()
+	if err := requireGitRepo(ctx, root); err != nil {
+		return "", err
+	}
+	out, err := gitOp(ctx, root, "pull", "--ff-only")
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// gitOp runs one mutating git command inside cwd with stdout+stderr
+// merged into a capped confirmation text. On failure the sanitized text
+// becomes the error — checkout's "would be overwritten" and push's auth
+// failures are exactly what the sheet must show; raw absolute paths and
+// URL-embedded credentials get scrubbed first.
+func gitOp(ctx context.Context, cwd string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = cwd
+	cmd.Env = gitOpEnv
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	out := buf.String()
+	if len(out) > gitOpMaxOutput {
+		out = out[:gitOpMaxOutput] + "…"
+	}
+	if err != nil {
+		msg := sanitizeGitOutput(out, cwd)
+		if msg == "" {
+			msg = "git command failed"
+		}
+		return "", errors.New(msg)
+	}
+	return strings.TrimSpace(sanitizeGitOutput(out, cwd)), nil
+}
+
+// sanitizeGitOutput scrubs the workspace's absolute path and any
+// credentials embedded in remote URLs before git's output rides the wire.
+func sanitizeGitOutput(s, cwd string) string {
+	s = strings.ReplaceAll(s, cwd+string(filepath.Separator), "")
+	s = strings.ReplaceAll(s, cwd, "")
+	var b strings.Builder
+	for {
+		i := strings.Index(s, "://")
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		rest := s[i+3:]
+		// The authority component ends at the first '/', whitespace or quote.
+		end := len(rest)
+		for j, c := range rest {
+			if c == '/' || c == ' ' || c == '\n' || c == '\t' ||
+				c == '\'' || c == '"' {
+				end = j
+				break
+			}
+		}
+		if at := strings.IndexByte(rest[:end], '@'); at >= 0 {
+			rest = rest[at+1:] // user[:pass]@ dropped, host kept
+		}
+		b.WriteString(s[:i+3])
+		s = rest
+	}
 }
 
 // ---------------------------------------------------------------- rpc ----

@@ -22,9 +22,15 @@ import com.devingo.app.acp.fetchBridgeModels
 import com.devingo.app.acp.getBridgeFsRead
 import com.devingo.app.acp.getBridgeFsSearch
 import com.devingo.app.acp.getBridgeFsTree
+import com.devingo.app.acp.getBridgeGitBranches
+import com.devingo.app.acp.getBridgeGitStatus
 import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
+import com.devingo.app.acp.postBridgeGitCheckout
+import com.devingo.app.acp.postBridgeGitCommit
 import com.devingo.app.acp.postBridgeGitDiff
+import com.devingo.app.acp.postBridgeGitPull
+import com.devingo.app.acp.postBridgeGitPush
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.notification.ActivitySnapshot
 import com.devingo.app.notification.DONE_VISIBLE_MS
@@ -683,6 +689,35 @@ class ConnectionManager private constructor(private val app: Application) {
             workspaceSearcher = { query ->
                 getBridgeFsSearch(healthUrl(dialHost), lastToken, sessionId, query)
             },
+            // W8.2: the Git sheet's status/branches and mutations, bound
+            // to this session's recorded cwd.
+            gitStatusFetcher = {
+                getBridgeGitStatus(healthUrl(dialHost), lastToken, sessionId, cwd)
+            },
+            gitBranchesLister = {
+                getBridgeGitBranches(healthUrl(dialHost), lastToken, sessionId, cwd)
+            },
+            gitCheckoutRunner = { branch, create ->
+                postBridgeGitCheckout(
+                    healthUrl(dialHost), lastToken, sessionId, cwd, branch, create)
+            },
+            gitCommitter = { files, message, create ->
+                postBridgeGitCommit(
+                    healthUrl(dialHost), lastToken, sessionId, cwd,
+                    files, message, create)
+            },
+            gitPusher = {
+                postBridgeGitPush(healthUrl(dialHost), lastToken, sessionId, cwd)
+            },
+            gitPuller = {
+                postBridgeGitPull(healthUrl(dialHost), lastToken, sessionId, cwd)
+            },
+            workspaceDirLister = { path ->
+                getBridgeFsTree(healthUrl(dialHost), lastToken, sessionId, cwd, path)
+            },
+            workspaceFileReader = { path ->
+                getBridgeFsRead(healthUrl(dialHost), lastToken, sessionId, cwd, path)
+            },
             // `!` shell prompts ride the negotiated surface (A7.6): absent
             // a meta echo assume support, like revertSupported.
             userShellCommandsEnabled = {
@@ -695,8 +730,10 @@ class ConnectionManager private constructor(private val app: Application) {
         cache.load(sessionId)
             ?.takeIf { it.host == lastHost }
             ?.let { store.restoreFromCache(it) }
-        // C6: a draft that outlived the process comes back with the session.
+        // C6: a draft that outlived the process comes back with the session
+        // — and the verbatim mention refs its spaced paths need (W8.1).
         drafts.load(sessionId)?.let(store::setDraft)
+        store.setMentionRefHints(drafts.loadRefs(sessionId))
         seqStash.remove(sessionId)?.let { store.seedSeq(it) }
         stores[sessionId] = store
         watchStore(store)
@@ -732,7 +769,13 @@ class ConnectionManager private constructor(private val app: Application) {
             // The cancelled draft watcher's debounce may hold the newest
             // text — flush it now so the drop loses nothing. The session
             // still exists hub-side, so its draft does too.
-            scope.launch { runCatching { drafts.save(sessionId, store.draft.value) } }
+            scope.launch {
+                runCatching {
+                    drafts.save(
+                        sessionId, store.draft.value, store.mentionRefHintsSnapshot(),
+                    )
+                }
+            }
         }
         store.drop()
         seqStash.remove(sessionId)
@@ -951,7 +994,11 @@ class ConnectionManager private constructor(private val app: Application) {
             }
             launch {
                 store.draft.debounce(DRAFT_SAVE_DEBOUNCE_MS).collect {
-                    runCatching { drafts.save(store.sessionId, it) }
+                    runCatching {
+                        drafts.save(
+                            store.sessionId, it, store.mentionRefHintsSnapshot(),
+                        )
+                    }
                 }
             }
             launch {
@@ -1031,7 +1078,13 @@ class ConnectionManager private constructor(private val app: Application) {
     fun persistCaches() {
         stores.values.forEach { s ->
             scope.launch { runCatching { cache.save(s.cacheSnapshot(lastHost)) } }
-            scope.launch { runCatching { drafts.save(s.sessionId, s.draft.value) } }
+            scope.launch {
+                runCatching {
+                    drafts.save(
+                        s.sessionId, s.draft.value, s.mentionRefHintsSnapshot(),
+                    )
+                }
+            }
         }
     }
 

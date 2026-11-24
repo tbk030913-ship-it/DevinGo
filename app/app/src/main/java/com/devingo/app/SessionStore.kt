@@ -12,7 +12,10 @@ import com.devingo.app.acp.ElicitationParser
 import com.devingo.app.acp.FsDirListing
 import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
+import com.devingo.app.acp.GitBranches
 import com.devingo.app.acp.GitDiffResult
+import com.devingo.app.acp.GitOpResult
+import com.devingo.app.acp.GitStatus
 import com.devingo.app.acp.InboundEvent
 import com.devingo.app.acp.IncomingRequest
 import com.devingo.app.acp.JSONRPC_METHOD_NOT_FOUND
@@ -117,6 +120,20 @@ class SessionStore(
      * source viewer (W8.1). Null without a bridge URL.
      */
     private val workspaceFileReader: (suspend (String) -> FsReadResult)? = null,
+    /**
+     * Bridge `/git/status` bound to this session — branch, ahead/behind
+     * and per-file counts for the Git sheet (W8.2). Null without a bridge.
+     */
+    private val gitStatusFetcher: (suspend () -> GitStatus)? = null,
+    /** Bridge `/git/branches` for the branch list (W8.2). */
+    private val gitBranchesLister: (suspend () -> GitBranches)? = null,
+    /** Bridge `/git/checkout` — (branch, createBranch), exactly one set. */
+    private val gitCheckoutRunner: (suspend (String?, String?) -> GitOpResult)? = null,
+    /** Bridge `/git/commit` — (files, message, createBranch?). */
+    private val gitCommitter: (suspend (List<String>, String, String?) -> GitOpResult)? = null,
+    /** Bridge `/git/push` and `/git/pull` (W8.2). */
+    private val gitPusher: (suspend () -> GitOpResult)? = null,
+    private val gitPuller: (suspend () -> GitOpResult)? = null,
     /**
      * `cognition.ai/userShellCommand` negotiated — `!` prompts send as
      * user-shell content blocks (A7.6); false keeps the `!` literal.
@@ -1357,6 +1374,54 @@ class SessionStore(
         return reader(path)
     }
 
+    // ---- git quick ops (W8.2) --------------------------------------------------
+
+    /** `/git/status`: branch, ahead/behind and per-file counts — the Git sheet. */
+    suspend fun fetchGitStatus(): GitStatus {
+        val fetcher = gitStatusFetcher
+            ?: throw IllegalStateException("git status unavailable without a bridge")
+        return fetcher()
+    }
+
+    /** `/git/branches`: local branches + current + default. */
+    suspend fun fetchGitBranches(): GitBranches {
+        val lister = gitBranchesLister
+            ?: throw IllegalStateException("git branches unavailable without a bridge")
+        return lister()
+    }
+
+    /** `/git/checkout`: switch ([branch]) or create-and-switch ([createBranch]). */
+    suspend fun gitCheckout(branch: String?, createBranch: String?): GitOpResult {
+        val runner = gitCheckoutRunner
+            ?: throw IllegalStateException("git checkout unavailable without a bridge")
+        return runner(branch, createBranch)
+    }
+
+    /** `/git/commit`: `add --` the selected files then `commit -m`. */
+    suspend fun gitCommit(
+        files: List<String>,
+        message: String,
+        createBranch: String?,
+    ): GitOpResult {
+        val committer = gitCommitter
+            ?: throw IllegalStateException("git commit unavailable without a bridge")
+        return committer(files, message, createBranch)
+    }
+
+    /** `/git/push`: push the current branch (`-u origin HEAD` without upstream). */
+    suspend fun gitPush(): GitOpResult {
+        val pusher = gitPusher
+            ?: throw IllegalStateException("git push unavailable without a bridge")
+        return pusher()
+    }
+
+    /** `/git/pull`: fast-forward pull of the upstream. */
+    suspend fun gitPull(): GitOpResult {
+        val puller = gitPuller
+            ?: throw IllegalStateException("git pull unavailable without a bridge")
+        return puller()
+    }
+
     /**
      * The agent's mentionable resources — devin's
      * `_cognition.ai/{rules,skills,plans}/list` behind one call so the
@@ -1471,6 +1536,14 @@ class SessionStore(
         // Over the cap: evict the oldest — a hint from hundreds of picks
         // ago is likelier stale than recent ones.
         mentionRefHints.remove(mentionRefHints.first())
+    }
+
+    /** Persisted alongside the draft — spaced refs must survive a restart. */
+    fun mentionRefHintsSnapshot(): List<String> = mentionRefHints.toList()
+
+    /** Restore path for [mentionRefHintsSnapshot] (draft round-trip). */
+    fun setMentionRefHints(refs: List<String>) {
+        refs.forEach(::registerMentionRef)
     }
 
     /** Interrupt the running turn with a new instruction right now. */
@@ -1794,7 +1867,13 @@ class SessionStore(
                 if (!looksLikePath) continue
                 buf.append(seg, cur, match.range.first)
                 flushText()
-                blocks += ContentBlock(type = "resource_link", uri = fileUri(ref), name = ref)
+                // A `#L` anchor is client-side chrome — the agent resolves
+                // the path literally, so strip it out of the URI (W8.1).
+                blocks += ContentBlock(
+                    type = "resource_link",
+                    uri = fileUri(ref.substringBefore('#')),
+                    name = ref,
+                )
                 cur = match.range.last + 1
             }
             buf.append(seg, cur, seg.length)
@@ -1847,14 +1926,21 @@ class SessionStore(
             "image" -> "file"
             else -> kind
         }
+        // `@file:path#L10-L25` quotes carry the anchor for the composer;
+        // the wire needs the plain path — devin resolves it literally.
+        val wireRef = if (linkType == "file" || linkType == "directory") {
+            ref.substringBefore('#')
+        } else {
+            ref
+        }
         val uri = when (linkType) {
-            "file", "directory" -> fileUri(ref)
+            "file", "directory" -> fileUri(wireRef)
             "url", "web" -> ref
             else -> "cognition://$linkType/$ref"
         }
         val meta = buildJsonObject {
             put("cognition.ai/resource-link-type", linkType)
-            put("cognition.ai/mention-path", ref)
+            put("cognition.ai/mention-path", wireRef)
             put("cognition.ai/mention-text", source)
             when (linkType) {
                 "conversation" -> put("cognition.ai/session-id", ref)
