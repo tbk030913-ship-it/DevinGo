@@ -132,6 +132,7 @@ func main() {
 	mux.HandleFunc("/models", modelsHandler)
 	mux.HandleFunc("/fs/write", fsWriteHandler)
 	mux.HandleFunc("/fs/list", fsListHandler)
+	mux.HandleFunc("/fs/read", fsReadHandler)
 	mux.HandleFunc("/fs/search", fsSearchHandler)
 	mux.HandleFunc("/git/diff", gitDiffHandler)
 	mux.HandleFunc("/pty", ptyHandler)
@@ -146,6 +147,8 @@ func main() {
 		fmt.Fprintln(w, "  GET /models    - cached model list (`devin models list`, refreshed periodically)")
 		fmt.Fprintln(w, "  POST /fs/write - write a file inside a session workspace")
 		fmt.Fprintln(w, "  POST /fs/list  - list files inside a session workspace")
+		fmt.Fprintln(w, "  GET  /fs/list?sessionId|cwd&path - one directory level ({entries,truncated})")
+		fmt.Fprintln(w, "  GET  /fs/read?sessionId|cwd&path - file content, <=1 MiB ({content|binary})")
 		fmt.Fprintln(w, "  GET  /fs/search?sessionId&q&limit - fuzzy file/dir search of a session workspace")
 		fmt.Fprintln(w, "  POST /git/diff - uncommitted git diff of a session workspace")
 		fmt.Fprintln(w, "  WS  /pty       - terminal console (ConPTY shell in a session workspace)")
@@ -628,18 +631,19 @@ func gitDiffHandler(w http.ResponseWriter, r *http.Request) {
 // fsListMaxBody bounds the JSON request payload — it only carries a session id.
 const fsListMaxBody = 16 << 10
 
-// fsListHandler serves the session workspace's file list for the composer's
-// @file picker ({sessionId} → {files, truncated}). Same auth/origin gates as
-// /fs/write and /git/diff; the hub resolves the recorded cwd and `git
-// ls-files` prints cwd-relative paths confined to the workspace subtree
-// (N6.2).
+// fsListHandler serves two shapes off one route (W8.1):
+//
+//	POST {sessionId}              → {files, truncated} — the composer's
+//	                              @file picker (N6.2's flat `git ls-files`).
+//	GET ?sessionId|cwd&path=      → {entries, path, truncated} — the 文件
+//	                              sheet's lazy tree, ONE directory level.
+//	GET ?sessionId (no path key)  → the same flat list over the query.
+//
+// Same auth/origin gates as /fs/write and /git/diff. The workspace root
+// resolves through the recorded session cwd — or an explicit ?cwd= proven
+// inside a hosted workspace; never a bare client path.
 func fsListHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte(`{"error":"method not allowed"}`))
-		return
-	}
 	if !authorized(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		w.Write([]byte(`{"error":"unauthorized"}`))
@@ -649,6 +653,58 @@ func fsListHandler(w http.ResponseWriter, r *http.Request) {
 		rejectForbiddenOrigin(w)
 		return
 	}
+	switch r.Method {
+	case http.MethodGet:
+		fsListGet(w, r)
+	case http.MethodPost:
+		fsListFlatPost(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+	}
+}
+
+// fsListGet is GET /fs/list: `path` key present (even empty) → dir mode;
+// absent → flat mode, both over sessionId-or-cwd root resolution.
+func fsListGet(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sid, cwd := q.Get("sessionId"), q.Get("cwd")
+	if _, dirMode := q["path"]; dirMode {
+		entries, truncated, err := bridgeHub.sessionFsDir(sid, cwd, q.Get("path"))
+		if err != nil {
+			writeFsError(w, err)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"entries":   entries,
+			"path":      q.Get("path"),
+			"truncated": truncated,
+		})
+		return
+	}
+	if sid == "" && cwd == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId or cwd is required"}`))
+		return
+	}
+	root, err := bridgeHub.fsBrowseRoot(sid, cwd)
+	if err != nil {
+		writeFsError(w, err)
+		return
+	}
+	files, truncated, err := fsListFlat(root)
+	if err != nil {
+		writeFsError(w, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"files":     files,
+		"truncated": truncated,
+	})
+}
+
+// fsListFlatPost is POST /fs/list — the original flat mode, body-only.
+func fsListFlatPost(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID string `json:"sessionId"`
 	}
@@ -665,16 +721,77 @@ func fsListHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	files, truncated, err := bridgeHub.sessionFsList(req.SessionID)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, errSessionNotHosted) {
-			status = http.StatusNotFound
-		}
-		w.WriteHeader(status)
-		json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+		writeFsError(w, err)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"files":     files,
+		"truncated": truncated,
+	})
+}
+
+// writeFsError maps the shared /fs sentinels to status codes — the raw
+// message is safe to surface (fixed strings, never server paths).
+func writeFsError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, errSessionNotHosted), errors.Is(err, errFsNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, errPathOutside):
+		status = http.StatusForbidden
+	case errors.Is(err, errFsNotDir), errors.Is(err, errFsNotFile):
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+}
+
+// fsReadHandler serves the source viewer (W8.1): up to 1 MiB of one file
+// inside the session workspace — {content, truncated} for text,
+// {binary, mime} for binaries. Same auth/origin gates and sessionId-or-cwd
+// root resolution as /fs/list's dir mode.
+func fsReadHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte(`{"error":"method not allowed"}`))
+		return
+	}
+	if !authorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+		return
+	}
+	if !validOrigin(r) {
+		rejectForbiddenOrigin(w)
+		return
+	}
+	q := r.URL.Query()
+	path := q.Get("path")
+	if path == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"path is required"}`))
+		return
+	}
+	data, truncated, err := bridgeHub.sessionFsRead(
+		q.Get("sessionId"), q.Get("cwd"), path)
+	if err != nil {
+		writeFsError(w, err)
+		return
+	}
+	head := data
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	if isBinaryContent(head) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"binary": true,
+			"mime":   http.DetectContentType(head),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"content":   string(data),
 		"truncated": truncated,
 	})
 }

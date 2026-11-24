@@ -19,7 +19,9 @@ import com.devingo.app.acp.BRIDGE_PROBE_TIMEOUT_MS
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.fetchBridgeHealth
 import com.devingo.app.acp.fetchBridgeModels
+import com.devingo.app.acp.getBridgeFsRead
 import com.devingo.app.acp.getBridgeFsSearch
+import com.devingo.app.acp.getBridgeFsTree
 import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitDiff
@@ -889,12 +891,13 @@ class ConnectionManager private constructor(private val app: Application) {
                 combine(
                     store.pendingPermission,
                     store.pendingElicitation,
+                    store.pendingSecret,
                     store.ui,
                     store.unread,
-                ) { p, e, u, unread ->
+                ) { p, e, s, u, unread ->
                     SessionBadge(
                         pendingPermission = p != null,
-                        pendingInput = e != null,
+                        pendingInput = e != null || s != null,
                         running = u.running,
                         unread = unread,
                     )
@@ -909,13 +912,17 @@ class ConnectionManager private constructor(private val app: Application) {
                 combine(
                     store.pendingPermission,
                     store.pendingElicitation,
-                ) { p, e -> (p != null) to (e != null) }
+                    store.pendingSecret,
+                ) { p, e, s -> Triple(p != null, e != null, s != null) }
                     .distinctUntilChanged()
-                    .collect { (hasP, hasE) ->
-                        if (!hasP && !hasE) return@collect
+                    .collect { (hasP, hasE, hasS) ->
+                        if (!hasP && !hasE && !hasS) return@collect
                         if (store === _currentStore.value) return@collect
-                        val needsUser =
-                            if (hasP) "需要你的授权" else "有问题需要你回答"
+                        val needsUser = when {
+                            hasP -> "需要你的授权"
+                            hasS -> "需要你提供密钥"
+                            else -> "有问题需要你回答"
+                        }
                         val title =
                             store.ui.value.sessionTitle?.takeIf { it.isNotBlank() }
                                 ?: store.cwd
@@ -930,7 +937,8 @@ class ConnectionManager private constructor(private val app: Application) {
                 combine(
                     store.pendingPermissionCount,
                     store.pendingElicitationCount,
-                ) { p, e -> p + e }.collect { n ->
+                    store.pendingSecretCount,
+                ) { p, e, s -> p + e + s }.collect { n ->
                     _permissionCounts.update {
                         if (n == 0) it - store.sessionId else it + (store.sessionId to n)
                     }
@@ -1385,7 +1393,7 @@ class ConnectionManager private constructor(private val app: Application) {
     private fun AcpEvent.marksUnread(): Boolean = when (this) {
         is AcpEvent.AgentChunk, is AcpEvent.UserChunk, is AcpEvent.ThoughtChunk,
         is AcpEvent.ToolCall, is AcpEvent.ToolCallUpdate, is AcpEvent.PlanUpdate,
-        is AcpEvent.SubagentUpdate,
+        is AcpEvent.SubagentUpdate, is AcpEvent.SecretRequested,
         is AcpEvent.SessionTitle, is AcpEvent.Failure, is AcpEvent.RemoteTurnEnd -> true
         else -> false
     }

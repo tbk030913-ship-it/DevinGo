@@ -785,12 +785,13 @@ class AcpClient(
         secretType: String? = null,
         saveScope: String? = null,
         shellId: String? = null,
+        sensitive: Boolean = true,
     ) = request(
         AcpMethods.SECRET_CREATE,
         buildJsonObject {
             put("sessionId", sessionId)
             put("secret_value", value)
-            put("sensitive", true)
+            put("sensitive", sensitive)
             secretName?.let { put("secret_name", it) }
             secretType?.let { put("secret_type", it) }
             saveScope?.let { put("save_scope", it) }
@@ -1581,6 +1582,133 @@ suspend fun getBridgeFsSearch(
             val rel = o.strField("relPath", "path") ?: return@mapNotNull null
             FsSearchItem(rel, o.strField("kind", "type") == "directory")
         } ?: emptyList()
+    }
+}
+
+/** One /fs/list dir-mode entry — a single level of the workspace tree (W8.1). */
+data class FsDirEntry(
+    val name: String,
+    val relPath: String,
+    val isDir: Boolean,
+    val size: Long,
+    val ignored: Boolean,
+)
+
+/** The bridge's /fs/list dir-mode payload — one level, capped server-side. */
+data class FsDirListing(val entries: List<FsDirEntry>, val truncated: Boolean)
+
+/**
+ * The bridge's `/fs/list` dir mode (GET): one directory level of the
+ * session workspace — the 文件 sheet's lazy tree (W8.1). `path` "" lists
+ * the root; `cwd` is the session's recorded working dir, used only when
+ * the hub no longer resolves the sessionId. Throws [AcpException] on
+ * non-2xx.
+ */
+suspend fun getBridgeFsTree(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+    path: String,
+): FsDirListing = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+    val url = "$baseHttpUrl/fs/list".toHttpUrl().newBuilder()
+        .addQueryParameter("sessionId", sessionId)
+        .addQueryParameter("cwd", cwd)
+        .addQueryParameter("path", path)
+        .build()
+    val req = Request.Builder()
+        .url(url)
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "fs/list HTTP ${resp.code}")
+        }
+        val body = resp.body?.string().orEmpty()
+        val obj = healthJson.parseToJsonElement(body).jsonObject
+        val arr = obj["entries"] as? JsonArray
+        FsDirListing(
+            entries = arr?.mapNotNull { el ->
+                val o = el as? JsonObject ?: return@mapNotNull null
+                val name = o.strField("name") ?: return@mapNotNull null
+                FsDirEntry(
+                    name = name,
+                    relPath = o.strField("relPath", "path") ?: name,
+                    isDir = o.strField("kind", "type") == "directory",
+                    size = o.longField("size") ?: 0L,
+                    ignored = o.boolField("ignored") == true,
+                )
+            } ?: emptyList(),
+            truncated = (obj["truncated"] as? JsonPrimitive)?.booleanOrNull == true,
+        )
+    }
+}
+
+/** The bridge's `/fs/read` payload — text content or the binary marker. */
+data class FsReadResult(
+    /** Binary marker — [content] is null and [mime] carries the guess. */
+    val binary: Boolean,
+    val mime: String?,
+    val content: String?,
+    /** True when the file exceeded the bridge's 1 MiB cap. */
+    val truncated: Boolean,
+)
+
+/**
+ * The bridge's `/fs/read` (GET): up to 1 MiB of one workspace file — the
+ * source viewer's feed (W8.1). Binaries answer `{binary, mime}` instead of
+ * content. Throws [AcpException] on non-2xx.
+ */
+suspend fun getBridgeFsRead(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String,
+    cwd: String,
+    path: String,
+): FsReadResult = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
+        .build()
+    val url = "$baseHttpUrl/fs/read".toHttpUrl().newBuilder()
+        .addQueryParameter("sessionId", sessionId)
+        .addQueryParameter("cwd", cwd)
+        .addQueryParameter("path", path)
+        .build()
+    val req = Request.Builder()
+        .url(url)
+        .apply {
+            if (!token.isNullOrBlank()) header("Authorization", "Bearer $token")
+        }
+        .build()
+    client.newCall(req).execute().use { resp ->
+        if (!resp.isSuccessful) {
+            val detail = runCatching {
+                resp.body?.string()
+                    ?.let { healthJson.parseToJsonElement(it).jsonObject["error"] }
+                    ?.jsonPrimitive?.content
+            }.getOrNull()
+            throw AcpException(detail ?: "fs/read HTTP ${resp.code}")
+        }
+        val body = resp.body?.string().orEmpty()
+        val obj = healthJson.parseToJsonElement(body).jsonObject
+        FsReadResult(
+            binary = obj.boolField("binary") == true,
+            mime = obj.strField("mime"),
+            content = obj.strField("content"),
+            truncated = (obj["truncated"] as? JsonPrimitive)?.booleanOrNull == true,
+        )
     }
 }
 

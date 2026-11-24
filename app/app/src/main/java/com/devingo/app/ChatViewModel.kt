@@ -3,6 +3,8 @@ package com.devingo.app
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.devingo.app.acp.AgentCaps
+import com.devingo.app.acp.FsDirListing
+import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
 import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.MentionResource
@@ -449,6 +451,16 @@ class ChatViewModel(
     /** The bridge's fuzzy file+dir search — the @-picker's typed feed (A7.3). */
     suspend fun searchWorkspace(query: String): List<FsSearchItem> =
         store?.searchWorkspace(query) ?: emptyList()
+
+    /** One workspace dir level for the 文件 sheet's lazy tree (W8.1). */
+    suspend fun listWorkspaceDir(path: String): FsDirListing =
+        store?.listWorkspaceDir(path)
+            ?: throw IllegalStateException("no bound session")
+
+    /** Workspace file content for the source viewer (W8.1). */
+    suspend fun readWorkspaceFile(path: String): FsReadResult =
+        store?.readWorkspaceFile(path)
+            ?: throw IllegalStateException("no bound session")
 
     /**
      * Rules/skills/plans the agent lists for @-mentions. Failures (agent

@@ -77,6 +77,7 @@ import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronDown
 import me.rerere.hugeicons.stroke.Diff
+import me.rerere.hugeicons.stroke.Folder01
 import me.rerere.hugeicons.stroke.MoreHorizontal
 
 /**
@@ -128,6 +129,9 @@ fun ChatScreen(
     var citationSheet by remember { mutableStateOf(false) }
     // A7.6: the 后台命令 sheet — session-keyed so a switch drops it.
     var backgroundSheet by remember(ui.sessionId) { mutableStateOf(false) }
+    // W8.1: the 文件 sheet + source viewer — session-keyed like the rest.
+    var filesSheet by remember(ui.sessionId) { mutableStateOf(false) }
+    var viewerTarget by remember(ui.sessionId) { mutableStateOf<SourceTarget?>(null) }
     // N6.1: which review the sheet shows — a turn scope, or the session's.
     var reviewRequest by remember { mutableStateOf<ReviewRequest?>(null) }
     // N6.4: terminal + preview sheets — keyed by session so a session
@@ -155,7 +159,8 @@ fun ChatScreen(
     // consumes back first (dismisses itself).
     BackHandler(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
-            !backgroundSheet && !subagentListOpen && detailSubagent == null &&
+            !backgroundSheet && !filesSheet && viewerTarget == null &&
+            !subagentListOpen && detailSubagent == null &&
             reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()
@@ -218,6 +223,7 @@ fun ChatScreen(
             onOpenReview = { reviewRequest = ReviewRequest.Session() },
             onOpenTerminal = { terminalOpen = true },
             onOpenBackground = { backgroundSheet = true },
+            onOpenFiles = { filesSheet = true },
             onOpenPreview = {
                 previewPort = detectPreviewPort(model, tail)
                 previewOpen = true
@@ -439,6 +445,35 @@ fun ChatScreen(
             onDismiss = { backgroundSheet = false },
         )
     }
+    // W8.1: the workspace tree — a file tap opens the source viewer.
+    if (filesSheet) {
+        WorkspaceFilesSheet(
+            onSearch = vm::searchWorkspace,
+            onListDir = vm::listWorkspaceDir,
+            onOpenFile = { viewerTarget = SourceTarget(it) },
+            onDismiss = { filesSheet = false },
+        )
+    }
+    viewerTarget?.let { t ->
+        val toastCtx = LocalContext.current
+        SourceFileViewer(
+            target = t,
+            onLoad = vm::readWorkspaceFile,
+            onQuote = { path, lo, hi ->
+                // `@file:` token verbatim — a path with spaces needs the
+                // verbatim hint the @-picker also registers (N6.2).
+                val ref = if (lo == hi) "$path#L$lo" else "$path#L$lo-L$hi"
+                vm.registerMentionRef(ref)
+                val cur = input
+                val sep = if (cur.isEmpty() || cur.last().isWhitespace()) "" else " "
+                vm.setDraft("$cur$sep@file:$ref ")
+                viewerTarget = null
+                filesSheet = false
+                Toast.makeText(toastCtx, "已加入草稿", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { viewerTarget = null },
+        )
+    }
     if (modelSheet) {
         ModelSheet(
             ui = ui,
@@ -614,6 +649,8 @@ private fun ChatTopBar(
     onOpenTerminal: () -> Unit,
     /** A7.6: the background-shell sheet (user `!` + agent background). */
     onOpenBackground: () -> Unit,
+    /** W8.1: the workspace files tree. */
+    onOpenFiles: () -> Unit,
     onOpenPreview: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
@@ -700,6 +737,14 @@ private fun ChatTopBar(
                         }
                     }
                 }
+                // W8.1: the workspace file tree.
+                IconButton(onClick = onOpenFiles) {
+                    Icon(
+                        HugeIcons.Folder01, "文件",
+                        modifier = Modifier.size(20.dp),
+                        tint = cs.onSurface,
+                    )
+                }
                 Box {
                     IconButton(onClick = { menuOpen = true }) {
                         Icon(
@@ -734,6 +779,11 @@ private fun ChatTopBar(
                         DevinMenuItem("后台命令", onClick = {
                             menuOpen = false
                             onOpenBackground()
+                        })
+                        // W8.1: the workspace file tree + viewer.
+                        DevinMenuItem("文件", onClick = {
+                            menuOpen = false
+                            onOpenFiles()
                         })
                         DevinMenuItem("预览", onClick = {
                             menuOpen = false

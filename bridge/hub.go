@@ -1831,6 +1831,12 @@ func (h *Hub) sessionFsList(sid string) ([]string, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	return fsListFlat(cwd)
+}
+
+// fsListFlat is sessionFsList's git half, shared by GET /fs/list's flat
+// mode where the root resolved through sessionId-or-cwd instead (W8.1).
+func fsListFlat(cwd string) ([]string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
 	defer cancel()
 	names, err := gitLines(ctx, "-C", cwd, "ls-files", "-z",
@@ -2008,6 +2014,283 @@ func isSubsequence(needle, haystack string) bool {
 		}
 	}
 	return i == len(needle)
+}
+
+// ------------------------------------------------------------- fs/tree ---
+
+// Sentinel errors for /fs/list's dir mode and /fs/read (W8.1) — the
+// handlers map them like errSessionNotHosted/errPathOutside above.
+var (
+	errFsNotFound = errors.New("path not found")
+	errFsNotDir   = errors.New("not a directory")
+	errFsNotFile  = errors.New("not a regular file")
+)
+
+// fsDirEntry is one /fs/list dir-mode row: a single level of the workspace
+// tree. Ignored is one batched `git check-ignore` verdict per listing.
+type fsDirEntry struct {
+	Name    string `json:"name"`
+	RelPath string `json:"relPath"`
+	Kind    string `json:"kind"` // "file" | "directory"
+	Size    int64  `json:"size"`
+	Ignored bool   `json:"ignored"`
+}
+
+// fsDirMaxEntries caps one listing — a pathological directory must not pin
+// the request goroutine or bury the client.
+const fsDirMaxEntries = 2000
+
+// fsBrowseRoot resolves the workspace root a /fs request operates inside:
+// a hosted sessionId's recorded cwd wins; otherwise a client-supplied
+// ?cwd= is honoured only inside a hosted session's workspace — a raw path
+// must never let a bearer holder roam the server's filesystem (W8.1).
+func (h *Hub) fsBrowseRoot(sid, cwdParam string) (string, error) {
+	if sid != "" {
+		if root, err := h.sessionCwd(sid); err == nil {
+			return root, nil
+		}
+		// An unknown sid falls through: the explicit cwd still names a
+		// workspace when some hosted session records the same tree.
+	}
+	if cwdParam == "" {
+		return "", errSessionNotHosted
+	}
+	resolved, err := filepath.Abs(cwdParam)
+	if err != nil {
+		return "", errPathOutside
+	}
+	if resolved, err = filepath.EvalSymlinks(resolved); err != nil {
+		return "", errSessionNotHosted // workspace no longer exists
+	}
+	h.mu.Lock()
+	var roots []string
+	for _, s := range h.sessions {
+		if s.cwd != "" {
+			roots = append(roots, s.cwd)
+		}
+	}
+	h.mu.Unlock()
+	for _, r := range roots {
+		rr, err := filepath.Abs(r)
+		if err != nil {
+			continue
+		}
+		if rr, err = filepath.EvalSymlinks(rr); err != nil {
+			continue
+		}
+		if rel, err := filepath.Rel(rr, resolved); err == nil &&
+			rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return resolved, nil
+		}
+	}
+	return "", errPathOutside
+}
+
+// fsResolveTarget maps a client relPath inside root to its canonical
+// absolute path: the literal-clean check kills "."-padded traversals and
+// EvalSymlinks resolves the full target, so a mid-path symlink can't
+// smuggle reads outside the workspace — the same two-step containment
+// /fs/write enforces.
+func fsResolveTarget(root, relPath string) (string, error) {
+	clean := filepath.Clean(relPath)
+	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" ||
+		clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errPathOutside
+	}
+	target := filepath.Join(root, clean)
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", errFsNotFound
+		}
+		return "", errPathOutside
+	}
+	if rel, err := filepath.Rel(root, resolved); err != nil ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errPathOutside
+	}
+	return resolved, nil
+}
+
+// sessionFsDir lists ONE directory level inside the resolved workspace —
+// the 文件 sheet's lazy tree (W8.1). relPath "" / "." lists the root; the
+// .git entry is dropped like t3code's browse. Folders sort first, then
+// case-insensitive alpha, matching the client's tree order.
+func (h *Hub) sessionFsDir(sid, cwdParam, relPath string) ([]fsDirEntry, bool, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return nil, false, err
+	}
+	if root, err = filepath.Abs(root); err != nil {
+		return nil, false, errSessionNotHosted
+	}
+	if root, err = filepath.EvalSymlinks(root); err != nil {
+		return nil, false, errSessionNotHosted
+	}
+	target, err := fsResolveTarget(root, relPath)
+	if err != nil {
+		return nil, false, err
+	}
+	fi, err := os.Stat(target)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, errFsNotFound
+		}
+		return nil, false, errFsNotFound
+	}
+	if !fi.IsDir() {
+		return nil, false, errFsNotDir
+	}
+	// The entry relPaths clients quote back at us stay request-relative.
+	base := filepath.ToSlash(filepath.Clean(relPath))
+	if base == "." {
+		base = ""
+	}
+	dirents, err := os.ReadDir(target)
+	if err != nil {
+		return nil, false, errFsNotFound
+	}
+	entries := make([]fsDirEntry, 0, len(dirents))
+	truncated := false
+	for _, d := range dirents {
+		name := d.Name()
+		if name == ".git" {
+			continue
+		}
+		kind := "file"
+		var size int64
+		switch {
+		case d.IsDir():
+			kind = "directory"
+		case d.Type()&fs.ModeSymlink != 0:
+			// A link surviving the containment check adopts its target's
+			// kind; links escaping the root (or dangling) are hidden —
+			// they'd 403 on expand/read anyway.
+			resolved, rerr := filepath.EvalSymlinks(filepath.Join(target, name))
+			if rerr != nil {
+				continue
+			}
+			if rel, rerr := filepath.Rel(root, resolved); rerr != nil ||
+				rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				continue
+			}
+			st, serr := os.Stat(resolved)
+			if serr != nil {
+				continue
+			}
+			if st.IsDir() {
+				kind = "directory"
+			} else if st.Mode().IsRegular() {
+				size = st.Size()
+			} else {
+				continue
+			}
+		case d.Type().IsRegular():
+			if info, ierr := d.Info(); ierr == nil {
+				size = info.Size()
+			}
+		default:
+			continue // fifos, sockets, devices — nothing to list or read
+		}
+		rel := name
+		if base != "" {
+			rel = base + "/" + name
+		}
+		entries = append(entries, fsDirEntry{
+			Name: name, RelPath: rel, Kind: kind, Size: size,
+		})
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if (a.Kind == "directory") != (b.Kind == "directory") {
+			return a.Kind == "directory"
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+	if len(entries) > fsDirMaxEntries {
+		entries = entries[:fsDirMaxEntries]
+		truncated = true
+	}
+	markIgnored(root, entries)
+	return entries, truncated, nil
+}
+
+// markIgnored sets Ignored via ONE `git check-ignore -z --stdin` batch —
+// t3code's classification: exit 0 lists ignored inputs verbatim, exit 1
+// means none, anything else (no git, no repo) leaves entries unflagged.
+func markIgnored(root string, entries []fsDirEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitDiffTimeout)
+	defer cancel()
+	// Slash-separated input: git treats '/' as its separator on every OS,
+	// and -z output echoes the input verbatim, so lookups match exactly.
+	var in strings.Builder
+	for _, e := range entries {
+		in.WriteString(e.RelPath)
+		in.WriteByte(0)
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", root,
+		"check-ignore", "-z", "--stdin")
+	cmd.Stdin = strings.NewReader(in.String())
+	out, err := cmd.Output()
+	if err != nil {
+		return // exit 1 (none ignored) and real failures share the zero map
+	}
+	ignored := map[string]bool{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		ignored[p] = true
+	}
+	for i := range entries {
+		entries[i].Ignored = ignored[entries[i].RelPath]
+	}
+}
+
+// fsReadMaxBytes caps /fs/read payloads — the viewer never pages (W8.1).
+const fsReadMaxBytes = 1 << 20
+
+// sessionFsRead returns up to fsReadMaxBytes of a workspace file —
+// binary detection and mime stay the handler's call.
+func (h *Hub) sessionFsRead(sid, cwdParam, relPath string) ([]byte, bool, error) {
+	root, err := h.fsBrowseRoot(sid, cwdParam)
+	if err != nil {
+		return nil, false, err
+	}
+	if root, err = filepath.Abs(root); err != nil {
+		return nil, false, errSessionNotHosted
+	}
+	if root, err = filepath.EvalSymlinks(root); err != nil {
+		return nil, false, errSessionNotHosted
+	}
+	target, err := fsResolveTarget(root, relPath)
+	if err != nil {
+		return nil, false, err
+	}
+	fi, err := os.Stat(target)
+	if err != nil {
+		return nil, false, errFsNotFound
+	}
+	if fi.IsDir() {
+		return nil, false, errFsNotFile
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, false, errFsNotFile
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		return nil, false, errFsNotFound
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, fsReadMaxBytes+1))
+	if err != nil {
+		return nil, false, errFsNotFound
+	}
+	truncated := len(data) > fsReadMaxBytes
+	if truncated {
+		data = data[:fsReadMaxBytes]
+	}
+	return data, truncated, nil
 }
 
 // ---------------------------------------------------------------- git -----

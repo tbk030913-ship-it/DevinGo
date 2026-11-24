@@ -124,7 +124,8 @@ func TestFsListEndpoint(t *testing.T) {
 		t.Fatalf("subdir files = %v, want [in.txt]", files)
 	}
 
-	// Unknown session → 404; missing sessionId → 400; GET → 405.
+	// Unknown session → 404; missing sessionId → 400. GET with no
+	// params is the flat mode missing its root → 400 (W8.1 dual-mode).
 	st, _ = fsListPost(t, srv, "", `{"sessionId":"NOPE"}`)
 	if st != http.StatusNotFound {
 		t.Fatalf("unknown session status = %d", st)
@@ -139,7 +140,7 @@ func TestFsListEndpoint(t *testing.T) {
 		t.Fatalf("get /fs/list: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
+	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("GET status = %d", resp.StatusCode)
 	}
 }

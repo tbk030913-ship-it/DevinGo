@@ -9,6 +9,8 @@ import com.devingo.app.acp.AttachResult
 import com.devingo.app.acp.ConfigOption
 import com.devingo.app.acp.ContentBlock
 import com.devingo.app.acp.ElicitationParser
+import com.devingo.app.acp.FsDirListing
+import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
 import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.InboundEvent
@@ -105,6 +107,16 @@ class SessionStore(
      * for the @-picker's typed query (A7.3). Null without a bridge URL.
      */
     private val workspaceSearcher: (suspend (String) -> List<FsSearchItem>)? = null,
+    /**
+     * Bridge `/fs/list` dir mode bound to this session — one tree level
+     * for the 文件 sheet's lazy listing (W8.1). Null without a bridge URL.
+     */
+    private val workspaceDirLister: (suspend (String) -> FsDirListing)? = null,
+    /**
+     * Bridge `/fs/read` bound to this session — file content for the
+     * source viewer (W8.1). Null without a bridge URL.
+     */
+    private val workspaceFileReader: (suspend (String) -> FsReadResult)? = null,
     /**
      * `cognition.ai/userShellCommand` negotiated — `!` prompts send as
      * user-shell content blocks (A7.6); false keeps the `!` literal.
@@ -237,6 +249,10 @@ class SessionStore(
     private val _pendingSecret = MutableStateFlow<PendingSecret?>(null)
     val pendingSecret = _pendingSecret.asStateFlow()
 
+    /** Same aggregate-notification contract as [pendingElicitationCount]. */
+    private val _pendingSecretCount = MutableStateFlow(0)
+    val pendingSecretCount = _pendingSecretCount.asStateFlow()
+
     /**
      * Shell-manager terminals seen via terminalLifecycle (A7.6) — the
      * 后台命令 sheet's rows. Capped: a finished entry beyond the cap drops
@@ -253,9 +269,10 @@ class SessionStore(
 
     /**
      * `!` commands sent but not yet matched by a commandStarted — cmd →
-     * the echo's itemId. commandStarted binds tid onto that item.
+     * FIFO of echo itemIds (two identical `!`s must bind in send order).
+     * commandStarted binds tid onto the oldest pending item.
      */
-    private val pendingShellCommands = LinkedHashMap<String, Long>()
+    private val pendingShellCommands = LinkedHashMap<String, ArrayDeque<Long>>()
     /**
      * Sheet rows seeded by a background-flagged tool call (keyed by
      * shellId/toolCallId) — a commandStarted with the same command re-keys
@@ -855,6 +872,10 @@ class SessionStore(
                         detailTruncated = detail?.headTruncated == true,
                         exitCode = exitCodeOf(ev.call),
                     )
+                    // A background-flagged call first seen via `tool_call`
+                    // must still reach the 后台命令 sheet — not only via
+                    // a later tool_call_update (A7.6 review).
+                    trackBackgroundShell(ev.call)
                 }
             }
             is AcpEvent.ToolCallUpdate -> {
@@ -944,7 +965,7 @@ class SessionStore(
                 }
             }
             is AcpEvent.CompactionUpdate -> onCompaction(ev)
-            is AcpEvent.TerminalCommandStarted -> onShellStarted(ev)
+            is AcpEvent.TerminalCommandStarted -> onShellStarted(ev, isLive(seq))
             is AcpEvent.TerminalCommandCompleted -> onShellCompleted(ev)
             is AcpEvent.SecretRequested -> {
                 // A notification/update-sourced ask (A7.6): replayed frames
@@ -1017,14 +1038,20 @@ class SessionStore(
     private fun failInflightTools() {
         mutateMessages { list ->
             list.map {
-                if (it.kind == Kind.Tool &&
-                    (it.status == "in_progress" || it.status == "pending")
+                if ((it.kind == Kind.Tool || it.kind == Kind.ShellCommand) &&
+                    (it.status == "in_progress" || it.status == "pending" ||
+                        it.status == "running")
                 ) {
                     it.copy(status = "failed")
                 } else {
                     it
                 }
             }
+        }
+        // Same contract for sheet rows — an attach replay heals any shell
+        // that actually finished while we were away.
+        _backgroundShells.update { list ->
+            list.map { if (it.running) it.copy(status = "failed") else it }
         }
     }
 
@@ -1316,6 +1343,20 @@ class SessionStore(
     suspend fun searchWorkspace(query: String): List<FsSearchItem> =
         workspaceSearcher?.invoke(query) ?: emptyList()
 
+    /** One directory level of the workspace tree — the 文件 sheet (W8.1). */
+    suspend fun listWorkspaceDir(path: String): FsDirListing {
+        val lister = workspaceDirLister
+            ?: throw IllegalStateException("dir listing unavailable without a bridge")
+        return lister(path)
+    }
+
+    /** File content for the source viewer — text or the binary marker (W8.1). */
+    suspend fun readWorkspaceFile(path: String): FsReadResult {
+        val reader = workspaceFileReader
+            ?: throw IllegalStateException("file read unavailable without a bridge")
+        return reader(path)
+    }
+
     /**
      * The agent's mentionable resources — devin's
      * `_cognition.ai/{rules,skills,plans}/list` behind one call so the
@@ -1368,7 +1409,8 @@ class SessionStore(
         ) {
             val cmd = trimmed.substring(1).trim()
             if (cmd.isNotEmpty()) {
-                if (mergeCitation) _draftCitation.value = null
+                // The pinned citation was never sent — keep it for the
+                // next prompt rather than silently dropping it (A7.6).
                 sendShellCommand(cmd)
                 return true
             }
@@ -1439,7 +1481,6 @@ class SessionStore(
         if (userShellCommandsEnabled?.invoke() == true && trimmed.startsWith("!")) {
             val cmd = trimmed.substring(1).trim()
             if (cmd.isNotEmpty()) {
-                _draftCitation.value = null
                 sendShellCommand(cmd)
                 return
             }
@@ -2285,10 +2326,18 @@ class SessionStore(
         popSecret(entry.pending)
         synchronized(requestLock) { openSecrets.remove(entry.pending.requestId, entry) }
         if (entry.resolvedByPeer) return
+        // Mirror the notification path's transcript record — same action
+        // must read the same whichever surface answered it (A7.6 review).
         if (reply == null) {
             entry.req?.respond(secretResult("decline", entry.pending, null))
+            withContext(scope.coroutineContext) {
+                append(Kind.Answered, "已拒绝提供密钥 ${entry.pending.label}")
+            }
         } else {
             entry.req?.respond(secretResult("save", entry.pending, reply.value))
+            withContext(scope.coroutineContext) {
+                append(Kind.Answered, "已发送密钥 ${entry.pending.label}")
+            }
         }
     }
 
@@ -2309,6 +2358,7 @@ class SessionStore(
             openSecrets[requestId] = entry
             secretQueue.addLast(pending)
             _pendingSecret.value = secretQueue.firstOrNull()
+            _pendingSecretCount.value = secretQueue.size
         }
         notifier.notifyPermissionPending(
             "Devin 请求密钥 ${pending.label}",
@@ -2321,14 +2371,22 @@ class SessionStore(
                 val reply = choice.await()
                 popSecret(pending)
                 synchronized(requestLock) { openSecrets.remove(requestId, entry) }
-                if (entry.resolvedByPeer || reply == null) return@launch
+                if (entry.resolvedByPeer) return@launch
+                if (reply == null) {
+                    withContext(scope.coroutineContext) {
+                        append(Kind.Answered, "已拒绝提供密钥 ${pending.label}")
+                    }
+                    return@launch
+                }
                 try {
                     client.createSecret(
                         sessionId,
                         reply.value,
-                        secretName = pending.envVarName ?: pending.label,
+                        secretName = pending.envVarName ?: pending.secretName,
                         secretType = pending.secretType,
                         saveScope = pending.saveScope,
+                        shellId = pending.shellId,
+                        sensitive = pending.sensitive,
                     )
                     withContext(scope.coroutineContext) {
                         append(Kind.Answered, "已发送密钥 ${pending.label}")
@@ -2377,7 +2435,12 @@ class SessionStore(
         if (label == null && reason == null) return null
         return PendingSecret(
             label = label ?: "密钥",
+            secretName = pick("cognition.ai/secretName", "secretName"),
             envVarName = pick("cognition.ai/envVarName", "envVarName"),
+            shellId = pick(
+                "cognition.ai/shellId", "shellId",
+                "cognition.ai/terminalId", "terminalId",
+            ),
             reason = reason,
             secretType = pick("cognition.ai/secretType", "secretType", "secret_type"),
             saveScope = pick("cognition.ai/saveScope", "saveScope", "save_scope"),
@@ -2405,18 +2468,22 @@ class SessionStore(
         }
         putJsonObject("_meta") {
             put("cognition.ai/action", action)
-            (pending.envVarName ?: pending.label).let {
+            // The "密钥" fallback label is a display placeholder — never
+            // echo it as the stored credential's name (A7.6 review).
+            (pending.envVarName ?: pending.secretName)?.let {
                 put("cognition.ai/envVarName", it)
                 put("cognition.ai/secretName", it)
             }
             pending.secretType?.let { put("cognition.ai/secretType", it) }
             pending.saveScope?.let { put("cognition.ai/saveScope", it) }
+            pending.shellId?.let { put("cognition.ai/shellId", it) }
         }
     }
 
     private fun popSecret(p: PendingSecret) = synchronized(requestLock) {
         secretQueue.remove(p)
         _pendingSecret.value = secretQueue.firstOrNull()
+        _pendingSecretCount.value = secretQueue.size
     }
 
     /**
@@ -2429,6 +2496,7 @@ class SessionStore(
         secretQueue.clear()
         openSecrets.clear()
         _pendingSecret.value = null
+        _pendingSecretCount.value = 0
     }
 
     // ---- user shell commands + background shells (A7.6) -------------------------
@@ -2442,10 +2510,12 @@ class SessionStore(
     private fun sendShellCommand(command: String) {
         val item = append(Kind.ShellCommand, "$ $command", status = "pending")
         synchronized(pendingShellCommands) {
-            pendingShellCommands[command] = item.id
+            pendingShellCommands.getOrPut(command) { ArrayDeque() }.addLast(item.id)
             // Lifecycle-less agents never resolve these — bound the map.
-            while (pendingShellCommands.size > 50) {
-                pendingShellCommands.remove(pendingShellCommands.keys.first())
+            while (pendingShellCommands.values.sumOf { it.size } > 50) {
+                val first = pendingShellCommands.entries.first()
+                first.value.removeFirst()
+                if (first.value.isEmpty()) pendingShellCommands.remove(first.key)
             }
         }
         scope.launch {
@@ -2466,7 +2536,10 @@ class SessionStore(
                 throw e
             } catch (e: Exception) {
                 synchronized(pendingShellCommands) {
-                    pendingShellCommands.remove(command)
+                    pendingShellCommands[command]?.let { q ->
+                        q.remove(item.id)
+                        if (q.isEmpty()) pendingShellCommands.remove(command)
+                    }
                 }
                 mutateMessages { list ->
                     list.map {
@@ -2485,10 +2558,20 @@ class SessionStore(
      * `_cognition.ai/terminal/commandStarted`: upsert the shell row and bind
      * a matching `!` echo's terminalId. An agent background shell whose
      * tool call already registered a row re-keys onto the wire terminalId.
+     * [live] gates the echo bind — a replayed start frame must not steal a
+     * pending `!` entry whose own start hasn't arrived yet.
      */
-    private fun onShellStarted(ev: AcpEvent.TerminalCommandStarted) {
-        val echoId = synchronized(pendingShellCommands) {
-            pendingShellCommands.remove(ev.command)
+    private fun onShellStarted(ev: AcpEvent.TerminalCommandStarted, live: Boolean) {
+        val echoId = if (live) {
+            synchronized(pendingShellCommands) {
+                pendingShellCommands[ev.command]?.removeFirstOrNull()?.also {
+                    if (pendingShellCommands[ev.command]?.isEmpty() == true) {
+                        pendingShellCommands.remove(ev.command)
+                    }
+                }
+            }
+        } else {
+            null
         }
         if (echoId != null) {
             mutateMessages { list ->
@@ -2551,21 +2634,29 @@ class SessionStore(
                 itemId = old?.itemId ?: -1L,
             ),
         )
-        old?.itemId?.takeIf { it >= 0 }?.let { itemId ->
-            val status = _backgroundShells.value
-                .firstOrNull { it.terminalId == ev.terminalId }?.status
-            mutateMessages { list ->
-                list.map {
-                    if (it.id == itemId) {
-                        it.copy(
-                            status = status,
-                            exitCode = ev.exitCode,
-                            detail = ev.output?.takeLast(SHELL_OUTPUT_CAP)
-                                ?: it.detail,
-                        )
-                    } else {
-                        it
-                    }
+        val echoId = old?.itemId?.takeIf { it >= 0 }
+        val status = _backgroundShells.value
+            .firstOrNull { it.terminalId == ev.terminalId }?.status
+        mutateMessages { list ->
+            list.map {
+                // The itemId bind can be lost to a cache restore — the
+                // echo's toolCallId (terminalId) survives, match on it.
+                val match = if (echoId != null) {
+                    it.id == echoId
+                } else {
+                    it.kind == Kind.ShellCommand && it.toolCallId == ev.terminalId
+                }
+                if (match) {
+                    it.copy(
+                        status = status,
+                        exitCode = ev.exitCode,
+                        detail = ev.output?.takeLast(SHELL_OUTPUT_CAP)
+                            ?: it.detail,
+                        detailTruncated = (ev.output?.length ?: 0) >
+                            SHELL_OUTPUT_CAP,
+                    )
+                } else {
+                    it
                 }
             }
         }
@@ -2656,10 +2747,10 @@ class SessionStore(
             } else {
                 list.toMutableList().apply { set(idx, merged) }
             }
-            // Finished rows beyond the cap drop oldest-first; running rows
-            // and tool-sourced keys always stay.
+            // Finished rows beyond the cap drop oldest-first — killed rows
+            // are terminal too, only running rows and tool keys stay.
             val finished = next.withIndex()
-                .filter { !it.value.running && it.value.status != "killed" }
+                .filter { !it.value.running }
                 .map { it.index }
             val extra = finished.size - MAX_SHELLS
             if (extra <= 0) {
@@ -2706,9 +2797,17 @@ class SessionStore(
     private fun updateCompactionItem(status: String, before: Long?, after: Long?) {
         val detail = compactionDetail(before, after)
         mutateMessages { list ->
-            val idx = compactionItemId?.let { target ->
+            var idx = compactionItemId?.let { target ->
                 list.indexOfLast { it.id == target && it.kind == Kind.Compaction }
             } ?: -1
+            if (idx < 0) {
+                // A restored divider lost compactionItemId — heal IT rather
+                // than appending a second divider for the same compaction.
+                idx = list.indexOfLast {
+                    it.kind == Kind.Compaction &&
+                        (it.status == "in_progress" || it.status == "failed")
+                }
+            }
             if (idx >= 0) {
                 val old = list[idx]
                 list.toMutableList().apply {
@@ -3135,8 +3234,17 @@ class SessionStore(
 
     private fun restoreItem(c: TranscriptCache.CachedItem): ChatItem? {
         val kind = runCatching { Kind.valueOf(c.kind) }.getOrNull() ?: return null
+        // Non-terminal statuses don't survive a restore: the pending/binding
+        // state that would resolve them lives in memory only, so a cached
+        // "running" row would shimmer forever (A7.6 review).
+        val status = when {
+            kind == Kind.ShellCommand &&
+                (c.status == "pending" || c.status == "running") -> "failed"
+            kind == Kind.Compaction && c.status == "in_progress" -> "failed"
+            else -> c.status
+        }
         return ChatItem(
-            id = c.id, kind = kind, text = c.text, status = c.status,
+            id = c.id, kind = kind, text = c.text, status = status,
             toolCallId = c.toolCallId, toolKind = c.toolKind, detail = c.detail,
             detailTruncated = c.detailTruncated, exitCode = c.exitCode,
             diffs = c.diffs.map { ToolDiff(it.path, it.oldText, it.newText) },
