@@ -1168,7 +1168,7 @@ private fun ShellCommandLine(m: ChatItem, modifier: Modifier = Modifier) {
                     color = cs.onSurfaceVariant,
                     maxLines = 1,
                 )
-                failed -> Text(
+                failed && !expanded -> Text(
                     if (m.exitCode != null) "exit ${m.exitCode}" else "失败",
                     style = monoText(MaterialTheme.typography.labelSmall),
                     color = cs.error,

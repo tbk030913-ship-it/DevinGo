@@ -199,7 +199,7 @@ internal fun Composer(
     // queue/steer menu — the shell runs it right away. Attachments can't
     // ride the shell path, so with images pinned `!` stays literal text.
     val shellCommand = userShellCommands && attachments.isEmpty() &&
-        input.startsWith("!")
+        input.startsWith("!") && input.drop(1).isNotBlank()
 
     // The one native editor both layers share — text/selection/chips live on
     // the view; `input` and `selectionEnd` are its Compose mirrors.

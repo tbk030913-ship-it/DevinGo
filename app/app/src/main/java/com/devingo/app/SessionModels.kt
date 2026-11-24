@@ -220,7 +220,11 @@ data class ElicitationReply(
 data class PendingSecret(
     /** Display name — `label`/`secretName`/`envVarName`/`title`. */
     val label: String,
+    /** Wire `secretName` when it named the stored credential. */
+    val secretName: String? = null,
     val envVarName: String? = null,
+    /** Shell-scoped ask — echoes back so the agent binds the value. */
+    val shellId: String? = null,
     /** Why the agent needs it (`reason`/`secretInstructions`). */
     val reason: String? = null,
     /** `plain`/`totp` — echoed back with the answer. */
