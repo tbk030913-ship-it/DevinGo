@@ -172,8 +172,21 @@ internal fun buildTranscriptModel(
     messages: List<ChatItem>,
     running: Boolean,
     queued: List<QueuedPrompt> = emptyList(),
+    /**
+     * A7.4: turn keys owning ≥1 subagent. A pure-delegation turn has no
+     * work rows — without this its card would vanish once the turn settles
+     * (subagents are diverted out of `messages`).
+     */
+    subagentTurnIds: Set<Long> = emptySet(),
 ): TranscriptModel {
     val turns = buildTurns(messages)
+    // Orphan subagents park on the latest turn, same as Transcript's
+    // subagentsByTurn fallback.
+    val turnKeys = turns.mapTo(HashSet()) { it.key }
+    val latestKey = turns.lastOrNull()?.key
+    val subagentKeys = subagentTurnIds.mapNotNullTo(HashSet()) {
+        if (it in turnKeys) it else latestKey
+    }
     val rows = buildList {
         if (messages.isNotEmpty() || queued.isNotEmpty()) add(RowKind.Status)
         // U5.4: parked prompts preview directly above the status line —
@@ -181,7 +194,9 @@ internal fun buildTranscriptModel(
         queued.forEachIndexed { i, p -> add(RowKind.Queue(i, p.id)) }
         turns.asReversed().forEachIndexed { revIdx, turn ->
             val isLast = revIdx == 0
-            if (turn.work.isNotEmpty() || (isLast && running)) {
+            if (turn.work.isNotEmpty() || turn.key in subagentKeys ||
+                (isLast && running)
+            ) {
                 add(RowKind.Work(turn.key, isLast && running))
             }
             turn.body.asReversed().forEach { item ->

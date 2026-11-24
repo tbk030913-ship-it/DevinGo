@@ -18,7 +18,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.devingo.app.Subagent
 import com.devingo.app.ui.theme.DevinGoColors
@@ -43,6 +42,8 @@ import me.rerere.hugeicons.stroke.UserGroup
 @Composable
 internal fun SubagentListSheet(
     subagents: List<Subagent>,
+    /** Negotiated `_cognition.ai/subagent/…` surface — hides action chips. */
+    actionsEnabled: Boolean,
     onOpen: (Subagent) -> Unit,
     onBackground: (Subagent) -> Unit,
     onForeground: (Subagent) -> Unit,
@@ -80,10 +81,10 @@ internal fun SubagentListSheet(
                 subagents.forEach { agent ->
                     SubagentRow(
                         agent = agent,
+                        actionsEnabled = actionsEnabled,
                         onClick = { onOpen(agent) },
                         onBackground = { onBackground(agent) },
                         onForeground = { onForeground(agent) },
-                        onCancel = { onCancel(agent) },
                     )
                 }
             }
@@ -97,6 +98,8 @@ internal fun SubagentDetailSheet(
     agent: Subagent,
     /** The child session carries a pending permission (hub routes by id). */
     childPendingApproval: Boolean,
+    /** Negotiated `_cognition.ai/subagent/…` surface — hides the actions. */
+    actionsEnabled: Boolean,
     onBackground: () -> Unit,
     onForeground: () -> Unit,
     onCancel: () -> Unit,
@@ -171,7 +174,7 @@ internal fun SubagentDetailSheet(
                     .padding(top = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                if (agent.live) {
+                if (agent.live && actionsEnabled) {
                     if (agent.status == "background") {
                         OutlinePillButton(
                             "切前台", onForeground,

@@ -182,6 +182,8 @@ internal fun Transcript(
     onSavePlan: (ChatItem) -> Unit,
     /** A7.4: session subagents + the card/sheet callbacks. */
     subagents: List<Subagent> = emptyList(),
+    /** Negotiated `_cognition.ai/subagent/…` surface — hides action chips. */
+    subagentActionsEnabled: Boolean = true,
     onSubagentOpen: (Subagent) -> Unit = {},
     onSubagentBackground: (Subagent) -> Unit = {},
     onSubagentForeground: (Subagent) -> Unit = {},
@@ -347,6 +349,7 @@ internal fun Transcript(
                                     onReviewDiff(turn.key, path)
                                 },
                                 subagents = subagentsByTurn[turn.key].orEmpty(),
+                                subagentActionsEnabled = subagentActionsEnabled,
                                 onSubagentOpen = onSubagentOpen,
                                 onSubagentBackground = onSubagentBackground,
                                 onSubagentForeground = onSubagentForeground,
@@ -437,6 +440,7 @@ private fun WorkRow(
     onShowDiff: () -> Unit,
     onReviewDiff: (String) -> Unit,
     subagents: List<Subagent>,
+    subagentActionsEnabled: Boolean,
     onSubagentOpen: (Subagent) -> Unit,
     onSubagentBackground: (Subagent) -> Unit,
     onSubagentForeground: (Subagent) -> Unit,
@@ -667,6 +671,7 @@ private fun WorkRow(
         if (subagents.isNotEmpty()) {
             ThreadSubagentGroupCard(
                 subagents = subagents,
+                actionsEnabled = subagentActionsEnabled,
                 onOpen = onSubagentOpen,
                 onBackground = onSubagentBackground,
                 onForeground = onSubagentForeground,

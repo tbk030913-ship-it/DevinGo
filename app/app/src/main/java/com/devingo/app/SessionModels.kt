@@ -77,6 +77,12 @@ data class UiState(
      * it off and the menu entry hides.
      */
     val revertSupported: Boolean = false,
+    /**
+     * Same negotiate-then-probe contract as [revertSupported] but for the
+     * `_cognition.ai/subagent/…` control surface (A7.4) — gates the cards'
+     * 切后台/切前台/停止 chips.
+     */
+    val subagentSupported: Boolean = false,
 )
 
 enum class Kind { User, Agent, Thought, Tool, Plan, System, Error, Answered }

@@ -67,6 +67,8 @@ import me.rerere.hugeicons.stroke.ChevronRight
 @Composable
 internal fun ThreadSubagentGroupCard(
     subagents: List<Subagent>,
+    /** Negotiated `_cognition.ai/subagent/…` surface — hides action chips. */
+    actionsEnabled: Boolean,
     onOpen: (Subagent) -> Unit,
     onBackground: (Subagent) -> Unit,
     onForeground: (Subagent) -> Unit,
@@ -173,10 +175,10 @@ internal fun ThreadSubagentGroupCard(
                 subagents.forEach { agent ->
                     SubagentRow(
                         agent = agent,
+                        actionsEnabled = actionsEnabled,
                         onClick = { onOpen(agent) },
                         onBackground = { onBackground(agent) },
                         onForeground = { onForeground(agent) },
-                        onCancel = { onCancel(agent) },
                     )
                 }
             }
@@ -188,10 +190,10 @@ internal fun ThreadSubagentGroupCard(
 @Composable
 internal fun SubagentRow(
     agent: Subagent,
+    actionsEnabled: Boolean,
     onClick: () -> Unit,
     onBackground: () -> Unit,
     onForeground: () -> Unit,
-    onCancel: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     val tone = subagentTone(agent.status)
@@ -260,18 +262,16 @@ internal fun SubagentRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            if (agent.live) {
+            if (agent.live && actionsEnabled) {
+                // Only reversible actions ride the row — a stray scroll tap
+                // on a one-tap 停止 would kill in-flight work; that lives on
+                // the detail sheet behind a deliberate open.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (agent.status == "background") {
                         SubagentActionChip("切前台", onClick = onForeground)
                     } else {
                         SubagentActionChip("切后台", onClick = onBackground)
                     }
-                    SubagentActionChip(
-                        "停止",
-                        onClick = onCancel,
-                        tint = cs.error,
-                    )
                 }
             }
         }
@@ -473,7 +473,9 @@ internal fun subagentCardDetail(agent: Subagent): String? {
         return null
     }
     if (detail.length > 280) {
-        detail = detail.substring(0, 280).trimEnd() + "…"
+        // Back off one char rather than split a surrogate pair mid-glyph.
+        val cut = if (detail[279].isHighSurrogate()) 279 else 280
+        detail = detail.substring(0, cut).trimEnd() + "…"
     }
     return detail.ifBlank { null }
 }

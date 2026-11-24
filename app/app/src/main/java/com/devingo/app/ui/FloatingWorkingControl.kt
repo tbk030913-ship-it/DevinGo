@@ -76,7 +76,7 @@ private enum class CapsuleStatus { Connection, Running }
  * The floating work capsule above the composer: a frosted pill whose
  * segments compose by priority — connection (reconnect countdown, tap =
  * retry now) beats running (pulsing hexagon + live action + 停止), then
- * subagents (stub for A7.3) and the queue. The circular ↓ button slides
+ * subagents (live count → list sheet, A7.4) and the queue. The circular ↓ button slides
  * out from beneath the pill's right edge while the transcript isn't at
  * bottom; the whole overlay fades when there's nothing to say.
  */
