@@ -56,7 +56,7 @@ func fsGetEntries(t *testing.T, m rpcMsg) []rpcMsg {
 // never descends on its own.
 func TestFsListDirMode(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	seed := func(rel, content string) {
@@ -260,7 +260,7 @@ func TestFsReadEndpoint(t *testing.T) {
 // hosted workspace → 403.
 func TestFsCwdParam(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"),

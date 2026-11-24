@@ -701,7 +701,8 @@ func writeGitError(w http.ResponseWriter, err error) {
 		status = http.StatusForbidden
 	case errors.Is(err, errGitNotRepo), errors.Is(err, errGitBadRef),
 		errors.Is(err, errGitBadPath), errors.Is(err, errGitNoFiles),
-		errors.Is(err, errGitNoMsg), errors.Is(err, errGitNoBase):
+		errors.Is(err, errGitNoMsg), errors.Is(err, errGitNoBase),
+		errors.Is(err, errGitTooMany):
 		status = http.StatusBadRequest
 	}
 	w.WriteHeader(status)
@@ -713,6 +714,18 @@ func writeGitError(w http.ResponseWriter, err error) {
 type gitOpBody struct {
 	SessionID string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
+}
+
+// gitRequireRoot 400s a mutation body naming no workspace — the same
+// early rejection the GET handlers give a missing ?sessionId= (W8.2
+// spec review: empty-body POSTs used to fall through to a 404).
+func gitRequireRoot(w http.ResponseWriter, b gitOpBody) bool {
+	if b.SessionID == "" && b.Cwd == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"sessionId or cwd is required"}`))
+		return false
+	}
+	return true
 }
 
 // gitStatusHandler is GET /git/status — the Git sheet's summary row:
@@ -814,6 +827,9 @@ func gitCheckoutHandler(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"error":"exactly one of branch or createBranch is required"}`))
 		return
 	}
+	if !gitRequireRoot(w, req.gitOpBody) {
+		return
+	}
 	name, err := bridgeHub.sessionGitCheckout(
 		req.SessionID, req.Cwd, req.Branch, req.CreateBranch)
 	if err != nil {
@@ -852,6 +868,9 @@ func gitCommitHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if !gitRequireRoot(w, req.gitOpBody) {
 		return
 	}
 	branch, sha, err := bridgeHub.sessionGitCommit(
@@ -900,6 +919,9 @@ func gitSyncHandler(w http.ResponseWriter, r *http.Request,
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"error":"invalid request body"}`))
+		return
+	}
+	if !gitRequireRoot(w, req) {
 		return
 	}
 	out, err := op(req.SessionID, req.Cwd)

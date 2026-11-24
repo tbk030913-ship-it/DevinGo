@@ -54,7 +54,7 @@ func fsListFiles(t *testing.T, m rpcMsg) []string {
 // session rooted in a subdirectory only sees its own subtree.
 func TestFsListEndpoint(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"),

@@ -63,6 +63,9 @@ sealed interface ReviewRequest {
 
     /** A turn's diff pill: scoped to that turn. */
     data class Turn(val turnKey: Long, val filePath: String? = null) : ReviewRequest
+
+    /** W8.2: the Git sheet's "查看未提交改动" — repo worktree, not tool diffs. */
+    data object Git : ReviewRequest
 }
 
 private sealed interface ReviewScope {
@@ -131,6 +134,7 @@ fun ReviewSheet(
                         ReviewScope.Session
                     }
                 is ReviewRequest.Session -> ReviewScope.Session
+                is ReviewRequest.Git -> ReviewScope.Git
             },
         )
     }
@@ -151,6 +155,7 @@ fun ReviewSheet(
     val initialFilePath = when (request) {
         is ReviewRequest.Session -> request.filePath
         is ReviewRequest.Turn -> request.filePath
+        is ReviewRequest.Git -> null
     }
 
     // Scope switch also clears per-file folds/selection — the new scope has

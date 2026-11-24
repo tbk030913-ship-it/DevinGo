@@ -244,7 +244,11 @@ fun ChatScreen(
                 ?.let { s ->
                     buildString {
                         append(s.branch.ifBlank { "仓库" })
-                        if (s.files.isNotEmpty()) append(" · ${s.files.size} 处改动")
+                        if (s.files.isNotEmpty()) {
+                            append(" · ${s.files.size} 处改动")
+                        } else {
+                            append(" · Clean")
+                        }
                         if (s.ahead > 0) append(" ↑${s.ahead}")
                     }
                 },
@@ -633,7 +637,7 @@ fun ChatScreen(
             onPush = { vm.gitPush() },
             onPull = { vm.gitPull() },
             onAskDevinMessage = vm::sendPrompt,
-            onOpenReview = { reviewRequest = ReviewRequest.Session() },
+            onOpenReview = { reviewRequest = ReviewRequest.Git },
             onDismiss = { gitSheet = null },
         )
     }

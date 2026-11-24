@@ -22,7 +22,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -90,7 +89,7 @@ fun GitSheet(
     onPush: suspend () -> GitOpResult,
     onPull: suspend () -> GitOpResult,
     /** 「让 Devin 生成 Commit Message」 — sends the request into this session. */
-    onAskDevinMessage: (prompt: String) -> Unit,
+    onAskDevinMessage: (prompt: String) -> Boolean,
     onOpenReview: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -133,7 +132,11 @@ fun GitSheet(
     }
 
     /** One mutating op: busy latch, inline error, status refresh on success. */
-    fun runOp(success: (GitOpResult) -> String, block: suspend () -> GitOpResult) {
+    fun runOp(
+        success: (GitOpResult) -> String,
+        block: suspend () -> GitOpResult,
+        afterSuccess: () -> Unit = {},
+    ) {
         if (busy) return
         busy = true
         opError = null
@@ -141,6 +144,7 @@ fun GitSheet(
         scope.launch {
             try {
                 notice = success(block())
+                afterSuccess()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -208,19 +212,26 @@ fun GitSheet(
             )
             GitSheetPage.Commit -> GitCommitPage(
                 status = status,
+                statusError = statusError,
                 busy = busy,
                 notice = notice,
                 opError = opError,
+                onRetry = { refreshStatus() },
                 onAskDevinMessage = { prompt ->
-                    onAskDevinMessage(prompt)
-                    notice = "已发送给 Devin，回复会出现在会话中"
+                    notice = if (onAskDevinMessage(prompt)) {
+                        "已发送给 Devin，回复会出现在会话中"
+                    } else {
+                        "发送失败"
+                    }
                 },
                 onSubmit = { files, message, createBranch ->
+                    // Navigate only on success — a failed commit keeps the
+                    // typed message and file selection for the retry.
                     runOp(
                         { r -> "已提交 ${r.commit}".trim() },
                         { onCommit(files, message, createBranch) },
+                        { page = GitSheetPage.Overview },
                     )
-                    page = GitSheetPage.Overview
                 },
             )
             GitSheetPage.Branches -> GitBranchesPage(
@@ -229,12 +240,13 @@ fun GitSheet(
                 busy = busy,
                 notice = notice,
                 opError = opError,
+                onRetry = { refreshBranches() },
                 onCheckout = { branch, create ->
                     runOp(
                         { "已切换到 ${it.branch}" },
                         { onCheckout(branch, create) },
+                        { refreshBranches() },
                     )
-                    refreshBranches()
                 },
             )
         }
@@ -415,9 +427,11 @@ private fun GitOverviewPage(
 @Composable
 private fun GitCommitPage(
     status: GitStatus?,
+    statusError: String?,
     busy: Boolean,
     notice: String?,
     opError: String?,
+    onRetry: () -> Unit,
     onAskDevinMessage: (prompt: String) -> Unit,
     onSubmit: (files: List<String>, message: String, createBranch: String?) -> Unit,
 ) {
@@ -612,12 +626,21 @@ private fun GitCommitPage(
             }
             if (files.isEmpty()) {
                 item("empty") {
-                    Text(
-                        if (status == null) "正在读取…" else "没有待提交的文件",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = cs.onSurfaceVariant,
-                        modifier = Modifier.padding(16.dp),
-                    )
+                    // A failed status fetch must not masquerade as a forever
+                    // "正在读取…" — the sheet can open straight onto this page
+                    // from ReviewSheet (W8.2 quality review I5).
+                    when {
+                        status == null && statusError != null -> InlineRetry(
+                            text = statusError,
+                            onRetry = onRetry,
+                        )
+                        else -> Text(
+                            if (status == null) "正在读取…" else "没有待提交的文件",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = cs.onSurfaceVariant,
+                            modifier = Modifier.padding(16.dp),
+                        )
+                    }
                 }
             }
         }
@@ -669,6 +692,7 @@ private fun GitBranchesPage(
     busy: Boolean,
     notice: String?,
     opError: String?,
+    onRetry: () -> Unit,
     onCheckout: (branch: String?, createBranch: String?) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -738,14 +762,20 @@ private fun GitBranchesPage(
         LazyColumn(Modifier.fillMaxWidth().weight(1f).padding(top = 4.dp)) {
             when {
                 branches == null -> item("loading") {
-                    Row(
-                        Modifier.padding(vertical = 20.dp).fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center,
-                    ) {
-                        CircularProgressIndicator(
-                            Modifier.size(18.dp), strokeWidth = 2.dp,
-                            color = cs.onSurfaceVariant,
-                        )
+                    // A failed first fetch shows the retry row instead of
+                    // spinning forever (W8.2 quality review).
+                    if (opError != null) {
+                        InlineRetry(text = opError, onRetry = onRetry)
+                    } else {
+                        Row(
+                            Modifier.padding(vertical = 20.dp).fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center,
+                        ) {
+                            CircularProgressIndicator(
+                                Modifier.size(18.dp), strokeWidth = 2.dp,
+                                color = cs.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
                 branches.branches.isEmpty() -> item("empty") {
@@ -758,6 +788,7 @@ private fun GitBranchesPage(
                 }
                 else -> items(branches.branches, key = { it }) { b ->
                     val current = b == branches.current
+                    val isDefault = b == branches.defaultBranch
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -791,6 +822,14 @@ private fun GitBranchesPage(
                                 .weight(1f)
                                 .padding(horizontal = 10.dp),
                         )
+                        if (isDefault) {
+                            Text(
+                                "默认",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = cs.onSurfaceVariant,
+                                modifier = Modifier.padding(end = 6.dp),
+                            )
+                        }
                         if (current) {
                             Icon(
                                 HugeIcons.CheckmarkCircle02, "当前分支",

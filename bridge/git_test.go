@@ -54,13 +54,13 @@ func plantSessionCwd(t *testing.T, hub *Hub, sid, dir string) {
 	t.Helper()
 	hub.mu.Lock()
 	defer hub.mu.Unlock()
-	s := hub.getSessionLocked(sid)
+	s := hub.getSessionLocked(sid, "")
 	s.cwd = dir
 }
 
 func TestGitDiffEndpoint(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
@@ -134,7 +134,7 @@ func TestGitDiffEndpoint(t *testing.T) {
 // confined to that subtree (paths print cwd-relative).
 func TestGitDiffUntrackedAndSubdir(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	// A root-level edit OUTSIDE the session's subtree must not leak in.
@@ -200,7 +200,7 @@ func TestGitDiffUntrackedAndSubdir(t *testing.T) {
 // An unborn HEAD still reports the staged tree via `git diff --cached`.
 func TestGitDiffUnbornHead(t *testing.T) {
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "x.txt"),
@@ -265,7 +265,7 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 func gitSeedRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
-	gitRun(t, repo, "init")
+	gitRun(t, repo, "init", "-b", "main")
 	gitRun(t, repo, "config", "user.email", "t@t")
 	gitRun(t, repo, "config", "user.name", "t")
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
@@ -613,6 +613,10 @@ func TestGitPathAndPorcelain(t *testing.T) {
 		{"/abs", "", false},
 		{"C:/x", "", false},
 		{"-p", "", false},
+		// Glob metachars: `--` stops option parsing, not pathspec
+		// fnmatch — a literal a*b name would sweep siblings (W8.2 review).
+		{"a*b", "", false},
+		{"x?[y]", "", false},
 	} {
 		got, ok := cleanGitPath(tc.in)
 		if ok != tc.ok || (ok && got != tc.want) {
@@ -627,5 +631,111 @@ func TestGitPathAndPorcelain(t *testing.T) {
 		if got := porcelainLetter(xy); got != want {
 			t.Fatalf("porcelainLetter(%q) = %q, want %q", xy, got, want)
 		}
+	}
+}
+
+// A file staged OUTSIDE the selection must not ride into the commit —
+// `commit -m` alone would sweep the whole index (W8.2 quality review I1).
+func TestGitCommitLeavesUnselectedStaged(t *testing.T) {
+	repo := gitSeedRepo(t)
+	// Stage c.txt, modify a.txt unstaged — the index holds work the
+	// user did NOT select.
+	if err := os.WriteFile(filepath.Join(repo, "c.txt"),
+		[]byte("staged-elsewhere\n"), 0o644); err != nil {
+		t.Fatalf("seed c: %v", err)
+	}
+	gitRun(t, repo, "add", "c.txt")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatalf("modify a: %v", err)
+	}
+
+	swapGitHub(t, "SID", repo)
+	srv := httptest.NewServer(http.HandlerFunc(gitCommitHandler))
+	defer srv.Close()
+	st, m := gitPostJSON(t, srv,
+		`{"sessionId":"SID","files":["a.txt"],"message":"test: only a"}`)
+	if st != http.StatusOK || m["ok"] != true {
+		t.Fatalf("commit = %d, %v", st, m)
+	}
+	// HEAD contains a.txt's edit but NOT c.txt; c.txt remains staged.
+	if names := gitOut(t, repo, "diff-tree", "--no-commit-id",
+		"--name-only", "-r", "HEAD"); names != "a.txt" {
+		t.Fatalf("committed files = %q, want only a.txt", names)
+	}
+	staged := gitOut(t, repo, "diff", "--cached", "--name-only")
+	if staged != "c.txt" {
+		t.Fatalf("staged = %q, want c.txt untouched", staged)
+	}
+}
+
+// Validation happens before `switch -c`: a bad file in the request must
+// not leave the worktree sitting on the half-created branch.
+func TestGitCommitBadFileNoBranchSwitch(t *testing.T) {
+	repo := gitSeedRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatalf("modify: %v", err)
+	}
+	swapGitHub(t, "SID", repo)
+	srv := httptest.NewServer(http.HandlerFunc(gitCommitHandler))
+	defer srv.Close()
+	st, _ := gitPostJSON(t, srv,
+		`{"sessionId":"SID","files":["../x"],"message":"m","createBranch":"oops"}`)
+	if st != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", st)
+	}
+	if cur := gitOut(t, repo, "symbolic-ref", "--short", "HEAD"); cur != "main" {
+		t.Fatalf("branch after failed commit = %q, want main", cur)
+	}
+	if b := gitOut(t, repo, "branch", "--list", "oops"); b != "" {
+		t.Fatalf("branch 'oops' exists after rejected commit")
+	}
+}
+
+// First push on a fresh repo takes the `-u origin HEAD` path; a second
+// clone's commit then pulls clean via --ff-only.
+func TestGitPushPullHappyPath(t *testing.T) {
+	repo := gitSeedRepo(t)
+	bare := t.TempDir()
+	gitRun(t, bare, "init", "--bare", "-b", "main")
+	gitRun(t, repo, "remote", "add", "origin", bare)
+
+	swapGitHub(t, "SID", repo)
+	push := httptest.NewServer(http.HandlerFunc(gitPushHandler))
+	defer push.Close()
+	st, m := gitPostJSON(t, push, `{"sessionId":"SID"}`)
+	if st != http.StatusOK || m["ok"] != true {
+		t.Fatalf("push = %d, %v", st, m)
+	}
+	if ref := gitOut(t, bare, "rev-parse", "--verify", "main"); ref == "" {
+		t.Fatalf("bare remote missing main after push")
+	}
+	if _, err := exec.Command("git", "-C", repo,
+		"rev-parse", "--verify", "@{upstream}").Output(); err != nil {
+		t.Fatalf("upstream not set after first push: %v", err)
+	}
+
+	// A second clone advances the remote; /git/pull fast-forwards repo.
+	clone := t.TempDir()
+	gitRun(t, clone, "clone", "-q", bare, ".")
+	gitRun(t, clone, "config", "user.email", "t@t")
+	gitRun(t, clone, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(clone, "z.txt"),
+		[]byte("z\n"), 0o644); err != nil {
+		t.Fatalf("clone write: %v", err)
+	}
+	gitRun(t, clone, "add", "z.txt")
+	gitRun(t, clone, "commit", "-q", "-m", "remote add")
+	gitRun(t, clone, "push", "-q", "origin", "main")
+
+	pull := httptest.NewServer(http.HandlerFunc(gitPullHandler))
+	defer pull.Close()
+	st, m = gitPostJSON(t, pull, `{"sessionId":"SID"}`)
+	if st != http.StatusOK || m["ok"] != true {
+		t.Fatalf("pull = %d, %v", st, m)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "z.txt")); err != nil {
+		t.Fatalf("z.txt missing after pull: %v", err)
 	}
 }
