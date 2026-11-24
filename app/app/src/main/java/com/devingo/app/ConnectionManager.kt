@@ -776,21 +776,27 @@ class ConnectionManager private constructor(private val app: Application) {
         if (!socketLive) return
         if (reloadJobs[store.sessionId]?.isActive == true) return
         reloadJobs[store.sessionId] = scope.launch {
-            store.attachMutex.withLock {
-                store.beginReplay()
-                try {
-                    // session/load doesn't carry the turn state — keep the
-                    // one the store currently shows so a running turn
-                    // survives the rebuild.
-                    loadInto(store, store.ui.value.running)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.w(TAG, "transcript reload ${store.sessionId}: ${e.message}")
-                } finally {
-                    store.endReplay()
-                    store.drainDeferred().forEach { route(it) }
+            try {
+                store.attachMutex.withLock {
+                    store.beginReplay()
+                    try {
+                        // session/load doesn't carry the turn state — keep the
+                        // one the store currently shows so a running turn
+                        // survives the rebuild.
+                        loadInto(store, store.ui.value.running)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "transcript reload ${store.sessionId}: ${e.message}")
+                    } finally {
+                        store.endReplay()
+                        store.drainDeferred().forEach { route(it) }
+                    }
                 }
+            } finally {
+                // Dead jobs mustn't park in the map — the dedup check needs
+                // isActive, and a stale entry would hide it forever.
+                reloadJobs.remove(store.sessionId)
             }
         }
     }

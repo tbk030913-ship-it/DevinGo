@@ -58,3 +58,4 @@
 2026-11-24 10:05（北京时间）| A7.1双审闭环提交837c5d7（BuildConfig版本同步+metaNegotiated旧桥optimistic回退+caps生命周期）；N6.4 spec审查迟回PASS补提交fba671c+077858d（closeOnce幂等ConPTY/鉴权序/detail扫描/MIT署名）；A7.2 elicitation问答卡提交ac8dfa9（ElicitationParser移植parseElicitationForm、pendingElicitation队列、PendingUserInputCard双态、INPUT通知相位）
 2026-11-24 11:20（北京时间）| A7.2双审闭环3 commits（ac8dfa9+c859517+37b09f0）：修Default线程append转录（崩溃路径）、回放complete误关活卡、幽灵卡误答、NaN非法JSON、幻影提醒→watchStore推送沿、锁分裂；A7.3提交a5d3c01——/fs/search+ComposerCommandPopover统一浮层替换CommandSuggestions/MentionHint、9类@引用→resource_link+_meta、acp层误入37b09f0已注明
 2026-11-24 11:01（北京时间）| A7.3质量修复提交2db203d+A7.4子代理折叠卡/详情抽屉提交83e1b65（混合文件交错已注明）；A7.4双审+A7.5实现并行中
+2026-11-24 11:40（北京时间）| A7.4双审闭环（a84a18f+f9a2c1c内交错修复）：线形对齐t3 devinAcp对象标记、subagent_context复用帧路由、能力门、终态不回退、buildBlocks吞跨崩溃、steerJob死锁修复；A7.5 revert预览+原地/分叉双模式提交f9a2c1c；A7.5双审+A7.6实现并行中
