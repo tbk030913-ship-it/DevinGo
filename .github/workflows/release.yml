@@ -1,0 +1,199 @@
+# Release workflow — manual dispatch only.
+#
+# 发版前必须先在 app/app/build.gradle.kts 升 versionName（tag 取 v<versionName>）
+# 和 versionCode；check job 发现 tag/Release 已存在或缺签名 Secrets 会直接失败。
+# 签名材料走 Secrets（见 check job 门禁列出的四个名字），构建时还原成本地
+# 已有的 signing.properties + devingo-release.jks 布局，绝不出未签名包。
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "本次更新说明（可选，置于发布说明最前）"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: 版本 / tag / 签名材料门禁
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 读取版本号并推导 tag
+        id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/app/build.gradle.kts | head -1)
+          if [ -z "$VER" ]; then
+            echo "::error::无法从 app/app/build.gradle.kts 读取 versionName"
+            exit 1
+          fi
+          TAG="v$VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG 已存在——先升 versionName/versionCode 再发版"
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::同名 Release $TAG 已存在——先升版本号再发版"
+            exit 1
+          fi
+          echo "tag $TAG 可用"
+
+      - name: 签名材料门禁
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=""
+          [ -z "$KS_B64" ] && missing="$missing ANDROID_KEYSTORE_BASE64"
+          [ -z "$KS_PW" ] && missing="$missing ANDROID_KEYSTORE_PASSWORD"
+          [ -z "$KS_ALIAS" ] && missing="$missing ANDROID_KEY_ALIAS"
+          [ -z "$KEY_PW" ] && missing="$missing ANDROID_KEY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 Secrets:$missing —— Settings → Secrets and variables → Actions 配齐后再发版"
+            exit 1
+          fi
+          echo "signing secrets OK"
+
+  build:
+    name: 构建 release APK + bridge exe
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bridge/go.mod
+          cache-dependency-path: bridge/go.sum
+
+      - name: Android SDK platform
+        run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-37"
+
+      - name: 还原 release 签名材料
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          printf '%s' "$KS_B64" | base64 -d > app/app/devingo-release.jks
+          {
+            echo "storeFile=devingo-release.jks"
+            echo "storePassword=$KS_PW"
+            echo "keyAlias=$KS_ALIAS"
+            echo "keyPassword=$KEY_PW"
+          } > app/app/signing.properties
+          chmod 600 app/app/signing.properties app/app/devingo-release.jks
+
+      - name: 构建 release APK（按 ABI 分包）
+        run: |
+          chmod +x app/gradlew
+          cd app && ./gradlew :app:assembleRelease --stacktrace
+
+      - name: 构建 Windows bridge（无 cgo，直接交叉编译）
+        run: cd bridge && GOOS=windows GOARCH=amd64 go build -o devingo-bridge.exe .
+
+      - name: 收集产物
+        run: |
+          if ls app/app/build/outputs/apk/release/*-unsigned.apk >/dev/null 2>&1; then
+            echo "::error::产出包含未签名 APK——签名材料未生效，拒绝发布"
+            exit 1
+          fi
+          mkdir -p release-artifacts
+          cp app/app/build/outputs/apk/release/*.apk release-artifacts/
+          cp bridge/devingo-bridge.exe release-artifacts/
+          ls -la release-artifacts
+          [ "$(find release-artifacts -type f | wc -l)" -gt 0 ] || {
+            echo "::error::没有收集到任何产物"; exit 1;
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: release-artifacts/
+          if-no-files-found: error
+
+  release:
+    name: 创建 GitHub Release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts/
+
+      - name: 生成发布说明
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          {
+            if [ -n "$NOTES" ]; then
+              printf '%s\n\n' "$NOTES"
+            fi
+            echo "## 更新内容"
+            echo ""
+            PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              git log --no-merges --format='%s' "$PREV"..HEAD | sed 's/^/- /'
+            else
+              echo "- 首个发布"
+            fi
+            echo ""
+            echo "## 发布包"
+            echo ""
+            for f in artifacts/*; do
+              b=$(basename "$f")
+              case "$b" in
+                *arm64-v8a*.apk)   d="Android 手机包（arm64-v8a，绝大多数机型）" ;;
+                *x86_64*.apk)      d="Android x86_64 包（模拟器 / ChromeOS）" ;;
+                *universal*.apk)   d="Android 通用包（全 ABI，体积最大）" ;;
+                devingo-bridge.exe) d="Windows 端 bridge（在跑 Devin 的电脑上启动）" ;;
+                *)                 d="" ;;
+              esac
+              if [ -n "$d" ]; then echo "- \`$b\` —— $d"; else echo "- \`$b\`"; fi
+            done
+          } > notes.md
+          cat notes.md
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: >-
+          gh release create "$TAG" artifacts/*
+          --title "DevinGo $TAG"
+          --notes-file notes.md
+          --target "$GITHUB_SHA"
