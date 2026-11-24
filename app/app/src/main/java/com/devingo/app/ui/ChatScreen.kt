@@ -98,6 +98,10 @@ fun ChatScreen(
     val revertSteps by vm.revertSteps.collectAsState()
     val pendingPermission by vm.pendingPermission.collectAsState()
     val pendingElicitation by vm.pendingElicitation.collectAsState()
+    // A7.6: the secret card + background-shell sheet feeds + `!` composer cap.
+    val pendingSecret by vm.pendingSecret.collectAsState()
+    val backgroundShells by vm.backgroundShells.collectAsState()
+    val userShellCommands by vm.userShellCommands.collectAsState()
     // Draft + per-turn timings live in the session store — they survive
     // switching away and back, which Compose-local state never did.
     val input by vm.draft.collectAsState()
@@ -122,6 +126,8 @@ fun ChatScreen(
     var infoSheet by remember { mutableStateOf(false) }
     var queueSheet by remember { mutableStateOf(false) }
     var citationSheet by remember { mutableStateOf(false) }
+    // A7.6: the 后台命令 sheet — session-keyed so a switch drops it.
+    var backgroundSheet by remember(ui.sessionId) { mutableStateOf(false) }
     // N6.1: which review the sheet shows — a turn scope, or the session's.
     var reviewRequest by remember { mutableStateOf<ReviewRequest?>(null) }
     // N6.4: terminal + preview sheets — keyed by session so a session
@@ -149,7 +155,7 @@ fun ChatScreen(
     // consumes back first (dismisses itself).
     BackHandler(
         enabled = !modelSheet && !infoSheet && !queueSheet && !citationSheet &&
-            !subagentListOpen && detailSubagent == null &&
+            !backgroundSheet && !subagentListOpen && detailSubagent == null &&
             reviewRequest == null && revertSteps == null,
     ) {
         vm.leaveSession()
@@ -211,6 +217,7 @@ fun ChatScreen(
             onOpenInfo = { infoSheet = true },
             onOpenReview = { reviewRequest = ReviewRequest.Session() },
             onOpenTerminal = { terminalOpen = true },
+            onOpenBackground = { backgroundSheet = true },
             onOpenPreview = {
                 previewPort = detectPreviewPort(model, tail)
                 previewOpen = true
@@ -249,6 +256,7 @@ fun ChatScreen(
                     ui = ui,
                     pendingPermission = pendingPermission,
                     pendingElicitation = pendingElicitation,
+                    pendingSecret = pendingSecret,
                     timings = turnTimes,
                     expandedWork = expandedWork,
                     queued = queuedPrompts,
@@ -335,9 +343,10 @@ fun ChatScreen(
             )
         }
         // Context warning chip once usage passes 80% — hidden while a
-        // permission/elicitation card owns the bottom slot.
+        // permission/elicitation/secret card owns the bottom slot.
         if (contextFrac >= 0.8f && ui.contextSize > 0 &&
-            pendingPermission == null && pendingElicitation == null
+            pendingPermission == null && pendingElicitation == null &&
+            pendingSecret == null
         ) {
             ContextChip(
                 pct = contextFrac,
@@ -365,6 +374,17 @@ fun ChatScreen(
             running = ui.running,
             onResolve = vm::resolveElicitation,
             onStop = vm::cancelTurn,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .widthIn(max = 720.dp)
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 8.dp),
+        )
+        // A7.6: the secret card shares the bottom slot — save/decline goes
+        // back over `_cognition.ai/secret/create`.
+        SecretRequestCard(
+            pending = pendingSecret,
+            onResolve = vm::resolveSecret,
             modifier = Modifier
                 .align(Alignment.CenterHorizontally)
                 .widthIn(max = 720.dp)
@@ -409,6 +429,14 @@ fun ChatScreen(
             onSearchWorkspace = vm::searchWorkspace,
             onMentionResources = vm::mentionResources,
             onMentionInsert = vm::registerMentionRef,
+            userShellCommands = userShellCommands,
+        )
+    }
+    if (backgroundSheet) {
+        BackgroundWorkSheet(
+            shells = backgroundShells,
+            onKill = vm::killBackgroundShell,
+            onDismiss = { backgroundSheet = false },
         )
     }
     if (modelSheet) {
@@ -584,6 +612,8 @@ private fun ChatTopBar(
     onOpenInfo: () -> Unit,
     onOpenReview: () -> Unit,
     onOpenTerminal: () -> Unit,
+    /** A7.6: the background-shell sheet (user `!` + agent background). */
+    onOpenBackground: () -> Unit,
     onOpenPreview: () -> Unit,
     onRevert: () -> Unit,
     onDisconnect: () -> Unit,
@@ -699,6 +729,11 @@ private fun ChatTopBar(
                         DevinMenuItem("终端控制台", onClick = {
                             menuOpen = false
                             onOpenTerminal()
+                        })
+                        // A7.6: running/finished shell-manager terminals.
+                        DevinMenuItem("后台命令", onClick = {
+                            menuOpen = false
+                            onOpenBackground()
                         })
                         DevinMenuItem("预览", onClick = {
                             menuOpen = false

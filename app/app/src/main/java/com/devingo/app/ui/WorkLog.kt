@@ -616,7 +616,7 @@ private const val COMMAND_OUT_MAX_LINES = 200
  * resumes. A non-zero exit prints a red `exit N` line.
  */
 @Composable
-private fun CommandOutputBox(
+internal fun CommandOutputBox(
     item: ChatItem,
     detail: String,
     modifier: Modifier = Modifier,

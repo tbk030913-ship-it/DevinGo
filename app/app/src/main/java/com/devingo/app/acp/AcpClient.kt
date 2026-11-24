@@ -75,8 +75,37 @@ interface AcpEvent {
         val outputTokens: Long? = null,
         val cacheReadTokens: Long? = null,
     ) : AcpEvent
-    /** Devin extension `_cognition.ai/compaction`: started/completed/failed/cancelled. */
-    data class CompactionUpdate(val status: String) : AcpEvent
+    /**
+     * Devin extension `_cognition.ai/compaction`: started/completed/failed/
+     * cancelled. [tokensBefore]/[tokensAfter] carry the wire's context
+     * counts when the frame reports them (A7.6's divider).
+     */
+    data class CompactionUpdate(
+        val status: String,
+        val tokensBefore: Long? = null,
+        val tokensAfter: Long? = null,
+    ) : AcpEvent
+    /**
+     * `_cognition.ai/terminal/commandStarted` — a shell-manager terminal
+     * began running [command] (user `!` commands and background shells).
+     */
+    data class TerminalCommandStarted(
+        val terminalId: String,
+        val command: String,
+    ) : AcpEvent
+    /** `_cognition.ai/terminal/commandCompleted` — the terminal exited. */
+    data class TerminalCommandCompleted(
+        val terminalId: String,
+        val exitCode: Int?,
+        val output: String?,
+    ) : AcpEvent
+    /**
+     * A secret ask that arrived WITHOUT a pending wire request — a
+     * `_cognition.ai/secret/create` notification or a `request_secret`
+     * session update (A7.6). Answers go out as a client->agent
+     * `cognition.ai/secret/create` call; [params] is the raw frame.
+     */
+    data class SecretRequested(val params: JsonObject) : AcpEvent
     /** `_cognition.ai/revert/stepsUpdated` — the revert step list changed. */
     data class RevertStepsUpdated(val params: JsonObject) : AcpEvent
     /**
@@ -740,6 +769,47 @@ class AcpClient(
             },
         )
 
+    // ---- secrets + background shells (A7.6) ----------------------------------
+
+    /**
+     * `cognition.ai/secret/create` client->agent — answers a secret ask
+     * that arrived without a pending wire request (notification or
+     * `request_secret` update). Keys follow SecretCreateParams (A7.6):
+     * `secret_name`/`secret_value`/`secret_type`/`save_scope` + camel
+     * `sessionId`/`shellId`.
+     */
+    suspend fun createSecret(
+        sessionId: String,
+        value: String,
+        secretName: String? = null,
+        secretType: String? = null,
+        saveScope: String? = null,
+        shellId: String? = null,
+    ) = request(
+        AcpMethods.SECRET_CREATE,
+        buildJsonObject {
+            put("sessionId", sessionId)
+            put("secret_value", value)
+            put("sensitive", true)
+            secretName?.let { put("secret_name", it) }
+            secretType?.let { put("secret_type", it) }
+            saveScope?.let { put("save_scope", it) }
+            shellId?.let { put("shellId", it) }
+        },
+    )
+
+    /** `_cognition.ai/terminal/killBackgroundShell` — stop a running shell. */
+    suspend fun killBackgroundShell(sessionId: String, shellId: String) = request(
+        AcpMethods.TERMINAL_KILL_BACKGROUND_SHELL,
+        buildJsonObject {
+            put("sessionId", sessionId)
+            // Terminal ids and shell ids name the same manager entry —
+            // send both spellings so either param name lands.
+            put("shellId", shellId)
+            put("terminalId", shellId)
+        },
+    )
+
     private fun notify(method: String, params: JsonElement) {
         send(
             buildJsonObject {
@@ -956,9 +1026,57 @@ class AcpClient(
                 val status = (p["status"] as? JsonPrimitive)?.textOrNull
                     ?: (p["state"] as? JsonPrimitive)?.textOrNull
                 if (status != null) {
-                    emit(sessionId, seq, AcpEvent.CompactionUpdate(status))
+                    // Token counts ride flat keys or nested under `summary`
+                    // — before/after naming varies across builds (A7.6).
+                    val summary = p["summary"] as? JsonObject
+                    emit(
+                        sessionId, seq,
+                        AcpEvent.CompactionUpdate(
+                            status,
+                            tokensBefore = firstLong(
+                                p, summary, "tokensBefore", "tokens_before",
+                                "beforeTokens", "numTokensPreceding",
+                                "num_tokens_preceding", "before", "used",
+                            ),
+                            tokensAfter = firstLong(
+                                p, summary, "tokensAfter", "tokens_after",
+                                "afterTokens", "after", "remaining",
+                            ),
+                        ),
+                    )
                 }
             }
+            AcpMethods.TERMINAL_COMMAND_STARTED,
+            "cognition.ai/terminal/commandStarted" -> {
+                // TerminalCommandStartedParams: sessionId + terminalId +
+                // commandLine (binary field table, A7.6).
+                val terminalId = p.strField("terminalId", "terminal_id", "id")
+                    ?: return
+                emit(
+                    sessionId, seq,
+                    AcpEvent.TerminalCommandStarted(
+                        terminalId,
+                        p.strField("commandLine", "command", "cmd") ?: "",
+                    ),
+                )
+            }
+            AcpMethods.TERMINAL_COMMAND_COMPLETED,
+            "cognition.ai/terminal/commandCompleted" -> {
+                val terminalId = p.strField("terminalId", "terminal_id", "id")
+                    ?: return
+                emit(
+                    sessionId, seq,
+                    AcpEvent.TerminalCommandCompleted(
+                        terminalId,
+                        exitCode = p.intField("exitCode", "exit_code", "code"),
+                        output = p.strField("output", "stdout", "result"),
+                    ),
+                )
+            }
+            // A secret ask arriving as a notification — no wire request id
+            // to answer, so it surfaces as SecretRequested (A7.6).
+            AcpMethods.SECRET_CREATE, "cognition.ai/secret/create" ->
+                emit(sessionId, seq, AcpEvent.SecretRequested(p))
             AcpMethods.REVERT_STEPS_UPDATED, "cognition.ai/revert/stepsUpdated" ->
                 emit(sessionId, seq, AcpEvent.RevertStepsUpdated(p))
             // Devin registers these under `cognition.ai/*`; both spellings
@@ -1124,8 +1242,22 @@ class AcpClient(
                     )
                 }
             }
+            "request_secret", "secret_request" ->
+                // Devin's RequestSecret event variant — the ask rides the
+                // update object itself (A7.6); answered via secret/create.
+                emit(sessionId, seq, AcpEvent.SecretRequested(update))
             else -> Log.w(TAG, "Unknown sessionUpdate kind: $kind")
         }
+    }
+
+    /** First [keys] hit across [a] then [b] as a lenient long. */
+    private fun firstLong(
+        a: JsonObject?,
+        b: JsonObject?,
+        vararg keys: String,
+    ): Long? = keys.firstNotNullOfOrNull { k ->
+        ((a?.get(k) ?: b?.get(k)) as? JsonPrimitive)
+            ?.let { it.longOrNull ?: it.doubleOrNull?.toLong() }
     }
 
     private fun JsonObject.textOfContent(): String? =
@@ -1201,6 +1333,10 @@ class AcpClient(
             put("cognition.ai/subagentSupport", true)
             put("cognition.ai/sessionRename", true)
             put("cognition.ai/sessionShare", true)
+            // A7.6 — keep in sync with gatewayInitParams (bridge/hub.go).
+            put("cognition.ai/terminalLifecycle", true)
+            put("cognition.ai/userShellCommand", true)
+            put("cognition.ai/secretSend", true)
         }
 
         /** `inferenceToolName` values that spawn a subagent (A7.4). */

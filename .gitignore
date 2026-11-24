@@ -32,6 +32,7 @@ app/app/signing.properties
 app/app/*.jks
 app/tailnet/build/
 bridge/acptest/probe-logs/
+bridge/acptest/devin-strings.txt
 /shot-*.png
 
 hs_err_pid*.log

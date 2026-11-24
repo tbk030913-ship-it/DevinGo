@@ -48,6 +48,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -104,6 +105,11 @@ class SessionStore(
      * for the @-picker's typed query (A7.3). Null without a bridge URL.
      */
     private val workspaceSearcher: (suspend (String) -> List<FsSearchItem>)? = null,
+    /**
+     * `cognition.ai/userShellCommand` negotiated — `!` prompts send as
+     * user-shell content blocks (A7.6); false keeps the `!` literal.
+     */
+    private val userShellCommandsEnabled: (() -> Boolean)? = null,
 ) {
 
     private companion object {
@@ -138,6 +144,10 @@ class SessionStore(
         const val MAX_DRAFT_CHARS = 64_000
         /** Per-tool detail cap; exec output keeps its tail within this. */
         const val TOOL_DETAIL_CAP = 4_000
+        /** Finished shell rows kept in the 后台命令 sheet (A7.6). */
+        const val MAX_SHELLS = 30
+        /** Output tail kept on a completed shell row / echo detail. */
+        const val SHELL_OUTPUT_CAP = 2_000
         /** Subagent statuses that must never regress to a live one (A7.4). */
         private val SUBAGENT_TERMINAL = setOf("completed", "failed", "stopped")
         /** Default workspace path the plan card's 保存到工作区 writes. */
@@ -222,6 +232,36 @@ class SessionStore(
 
     private val _pendingElicitationCount = MutableStateFlow(0)
     val pendingElicitationCount = _pendingElicitationCount.asStateFlow()
+
+    /** The secret card on screen (A7.6; queue head like [pendingPermission]). */
+    private val _pendingSecret = MutableStateFlow<PendingSecret?>(null)
+    val pendingSecret = _pendingSecret.asStateFlow()
+
+    /**
+     * Shell-manager terminals seen via terminalLifecycle (A7.6) — the
+     * 后台命令 sheet's rows. Capped: a finished entry beyond the cap drops
+     * the oldest finished one.
+     */
+    private val _backgroundShells = MutableStateFlow<List<BackgroundShell>>(emptyList())
+    val backgroundShells = _backgroundShells.asStateFlow()
+
+    /** Live `_cognition.ai/compaction` item — updated in place through
+     *  started→completed/failed; the next usage_update fills its "after". */
+    private var compactionItemId: Long? = null
+    private var compactionBefore: Long? = null
+    private var compactionAfterPending = false
+
+    /**
+     * `!` commands sent but not yet matched by a commandStarted — cmd →
+     * the echo's itemId. commandStarted binds tid onto that item.
+     */
+    private val pendingShellCommands = LinkedHashMap<String, Long>()
+    /**
+     * Sheet rows seeded by a background-flagged tool call (keyed by
+     * shellId/toolCallId) — a commandStarted with the same command re-keys
+     * the row onto the real terminalId instead of duplicating it.
+     */
+    private val toolShellIds = mutableSetOf<String>()
 
     private val _queuedPrompts = MutableStateFlow<List<QueuedPrompt>>(emptyList())
     val queuedPrompts = _queuedPrompts.asStateFlow()
@@ -328,6 +368,8 @@ class SessionStore(
     private val openRequests = mutableMapOf<Long, PermEntry>()
     private val elicitationQueue = ArrayDeque<PendingElicitation>()
     private val openElicitations = mutableMapOf<Long, ElicEntry>()
+    private val secretQueue = ArrayDeque<PendingSecret>()
+    private val openSecrets = mutableMapOf<Long, SecretEntry>()
     /**
      * Unique negative keys for requests whose wire id isn't an integer —
      * a shared -1 would collapse every keyless request onto one entry and
@@ -346,6 +388,19 @@ class SessionStore(
         var req: IncomingRequest,
         val pending: PendingElicitation,
         /** Peer answer or `elicitation/complete` — respond nothing. */
+        var resolvedByPeer: Boolean = false,
+    )
+
+    /**
+     * A secret ask's answer channel (A7.6): [req] is set on the
+     * agent->client request path (respond `{action:…}`); null on the
+     * notification/`request_secret` path, where a save goes out as a
+     * client->agent `cognition.ai/secret/create` call instead.
+     */
+    private class SecretEntry(
+        var req: IncomingRequest?,
+        val pending: PendingSecret,
+        /** Peer answer or store teardown — respond nothing. */
         var resolvedByPeer: Boolean = false,
     )
 
@@ -701,6 +756,7 @@ class SessionStore(
         steerJob?.cancel()
         clearPermissions()
         clearElicitations()
+        clearSecrets()
         deferredLive.clear()
         scope.coroutineContext[Job]?.cancel()
     }
@@ -870,16 +926,31 @@ class SessionStore(
             is AcpEvent.ModeChanged -> _ui.update { it.copy(currentModeId = ev.modeId) }
             is AcpEvent.ConfigOptionsUpdated -> applyConfigOptions(ev.options)
             is AcpEvent.SessionTitle -> _ui.update { it.copy(sessionTitle = ev.title) }
-            is AcpEvent.UsageUpdate -> _ui.update {
-                it.copy(
-                    contextUsed = ev.used,
-                    contextSize = ev.size,
-                    usageInput = ev.inputTokens ?: 0,
-                    usageOutput = ev.outputTokens ?: 0,
-                    usageCacheRead = ev.cacheReadTokens ?: 0,
-                )
+            is AcpEvent.UsageUpdate -> {
+                _ui.update {
+                    it.copy(
+                        contextUsed = ev.used,
+                        contextSize = ev.size,
+                        usageInput = ev.inputTokens ?: 0,
+                        usageOutput = ev.outputTokens ?: 0,
+                        usageCacheRead = ev.cacheReadTokens ?: 0,
+                    )
+                }
+                // The first usage after a completed compaction IS its
+                // "after" count — patch the divider's label with it (A7.6).
+                if (compactionAfterPending) {
+                    compactionAfterPending = false
+                    updateCompactionItem("completed", compactionBefore, ev.used)
+                }
             }
-            is AcpEvent.CompactionUpdate -> append(Kind.System, compactionText(ev.status))
+            is AcpEvent.CompactionUpdate -> onCompaction(ev)
+            is AcpEvent.TerminalCommandStarted -> onShellStarted(ev)
+            is AcpEvent.TerminalCommandCompleted -> onShellCompleted(ev)
+            is AcpEvent.SecretRequested -> {
+                // A notification/update-sourced ask (A7.6): replayed frames
+                // never re-ask — a live one shows the card.
+                if (isLive(seq)) presentSecret(ev.params, req = null)
+            }
             is AcpEvent.RevertStepsUpdated -> {
                 // Step list changed underneath us — refresh if the sheet is open.
                 if (_revertSteps.value != null) loadRevertSteps()
@@ -916,7 +987,17 @@ class SessionStore(
         deferredLive.clear()
         clearPermissions()
         clearElicitations()
+        clearSecrets()
         remoteTurn = false
+        // A shimmering divider must not hang through the outage — mark it
+        // failed; a replayed completion on re-attach heals the same item.
+        compactionAfterPending = false
+        if (currentMessages.lastOrNull {
+                it.id == compactionItemId && it.kind == Kind.Compaction
+            }?.status == "in_progress"
+        ) {
+            updateCompactionItem("failed", compactionBefore, null)
+        }
         // A mid-replay drop — or a drop while a committed attach's backlog
         // is still staged — leaves the cursor past frames that only ever
         // reached the staged copy: rewind so the reconnect attach re-covers
@@ -1279,6 +1360,19 @@ class SessionStore(
         val citation = if (mergeCitation) _draftCitation.value else null
         val trimmed = text.trimEnd()
         if (trimmed.isBlank() && attachments.isEmpty() && citation == null) return false
+        // `!` lines are user shell commands (A7.6): no citation merge, no
+        // queue behind a running turn — the shell runs them right away.
+        // Without the negotiated cap the `!` stays literal prompt text.
+        if (attachments.isEmpty() && trimmed.startsWith("!") &&
+            userShellCommandsEnabled?.invoke() == true
+        ) {
+            val cmd = trimmed.substring(1).trim()
+            if (cmd.isNotEmpty()) {
+                if (mergeCitation) _draftCitation.value = null
+                sendShellCommand(cmd)
+                return true
+            }
+        }
         val total = attachments.sumOf { it.bytes.size.toLong() }
         if (total > MAX_ATTACHMENT_BYTES) {
             append(Kind.Error, "图片合计超过 3MB，未发送")
@@ -1340,6 +1434,16 @@ class SessionStore(
     /** Interrupt the running turn with a new instruction right now. */
     fun steer(text: String) {
         val trimmed = text.trimEnd()
+        // `!` mid-turn: a shell command isn't a turn instruction — it runs
+        // in the shell without interrupting the agent.
+        if (userShellCommandsEnabled?.invoke() == true && trimmed.startsWith("!")) {
+            val cmd = trimmed.substring(1).trim()
+            if (cmd.isNotEmpty()) {
+                _draftCitation.value = null
+                sendShellCommand(cmd)
+                return
+            }
+        }
         val merged = mergedWithCitation(trimmed, _draftCitation.value).trimEnd()
         // Blank text + a blanked quote = nothing to steer; keep the draft.
         if (merged.isBlank()) return
@@ -1892,6 +1996,10 @@ class SessionStore(
                 dismissElicitation(elicitationIdFrom(req.params))
                 req.respond(buildJsonObject {})
             }
+            // The secret ask as a request (A7.6) — the notification/
+            // `request_secret` spellings surface via SecretRequested.
+            AcpMethods.SECRET_CREATE, "cognition.ai/secret/create" ->
+                handleSecret(req)
             else -> req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
         }
     }
@@ -1959,6 +2067,10 @@ class SessionStore(
                 return
             }
             openElicitations[requestId]?.let {
+                it.resolvedByPeer = true
+                it.pending.choice.complete(null)
+            }
+            openSecrets[requestId]?.let {
                 it.resolvedByPeer = true
                 it.pending.choice.complete(null)
             }
@@ -2151,6 +2263,495 @@ class SessionStore(
         p.choice.complete(option?.optionId)
     }
 
+    // ---- secrets (A7.6) ---------------------------------------------------------
+
+    /**
+     * `_cognition.ai/secret/create` as an agent->client request: the card
+     * queue works exactly like elicitation (re-delivery dedupe, peer
+     * resolution, teardown without a response). An unparseable ask declines
+     * rather than leaving the request open.
+     */
+    private suspend fun handleSecret(req: IncomingRequest) {
+        // Same wire id = the same pending card after an attach re-delivery.
+        synchronized(requestLock) {
+            openSecrets.entries.firstOrNull { it.value.req?.rpcId == req.rpcId }
+                ?.let { it.value.req = req; return }
+        }
+        val entry = req.params?.let { presentSecret(it, req) } ?: run {
+            req.respondError(-32602, "invalid params")
+            return
+        }
+        val reply = entry.pending.choice.await()
+        popSecret(entry.pending)
+        synchronized(requestLock) { openSecrets.remove(entry.pending.requestId, entry) }
+        if (entry.resolvedByPeer) return
+        if (reply == null) {
+            entry.req?.respond(secretResult("decline", entry.pending, null))
+        } else {
+            entry.req?.respond(secretResult("save", entry.pending, reply.value))
+        }
+    }
+
+    /**
+     * Enqueue the secret card — shared by the request path ([req] set) and
+     * the notification/`request_secret` path (null: a save goes out as a
+     * client->agent `secret/create` call, matching SecretCreateParams).
+     * Returns the [SecretEntry], null when the ask has nothing to ask with.
+     */
+    private fun presentSecret(params: JsonObject, req: IncomingRequest?): SecretEntry? {
+        val requestId = req?.requestKey ?: syntheticRequestKey.getAndDecrement()
+        val choice = CompletableDeferred<SecretReply?>()
+        val pending = parseSecret(params, choice, requestId) ?: return null
+        val entry = SecretEntry(req, pending)
+        // One lock covers map + queue — a teardown between them would
+        // orphan the card.
+        synchronized(requestLock) {
+            openSecrets[requestId] = entry
+            secretQueue.addLast(pending)
+            _pendingSecret.value = secretQueue.firstOrNull()
+        }
+        notifier.notifyPermissionPending(
+            "Devin 请求密钥 ${pending.label}",
+            sessionId,
+            id = Notifier.ID_SECRET,
+            headline = "DevinGo 需要密钥",
+        )
+        if (req == null) {
+            scope.launch {
+                val reply = choice.await()
+                popSecret(pending)
+                synchronized(requestLock) { openSecrets.remove(requestId, entry) }
+                if (entry.resolvedByPeer || reply == null) return@launch
+                try {
+                    client.createSecret(
+                        sessionId,
+                        reply.value,
+                        secretName = pending.envVarName ?: pending.label,
+                        secretType = pending.secretType,
+                        saveScope = pending.saveScope,
+                    )
+                    withContext(scope.coroutineContext) {
+                        append(Kind.Answered, "已发送密钥 ${pending.label}")
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    append(Kind.Error, "密钥发送失败: ${e.display()}")
+                }
+            }
+        }
+        return entry
+    }
+
+    /**
+     * The card's save/dismiss; null = declined. The rendered card's identity
+     * is passed in — an exit-animation ghost must not resolve a new head.
+     */
+    fun resolveSecret(p: PendingSecret, reply: SecretReply?) {
+        if (_pendingSecret.value === p) p.choice.complete(reply)
+    }
+
+    /**
+     * SecretPromptMeta rides the ask's `_meta` (flat keys tolerated too) —
+     * `cognition.ai/secretName|envVarName|secretType|saveScope|sensitive|
+     * secretInstructions`. A card with neither a name nor a reason is
+     * unaskable.
+     */
+    private fun parseSecret(
+        params: JsonObject,
+        choice: CompletableDeferred<SecretReply?>,
+        requestId: Long,
+    ): PendingSecret? {
+        val meta = params["_meta"] as? JsonObject
+        fun pick(vararg keys: String): String? = keys.firstNotNullOfOrNull { k ->
+            ((meta?.get(k) ?: params[k]) as? JsonPrimitive)?.contentOrNull
+        }
+        val label = pick(
+            "cognition.ai/secretName", "cognition.ai/envVarName",
+            "secretName", "envVarName", "label", "title", "name", "key",
+        )
+        val reason = pick(
+            "cognition.ai/secretInstructions", "secretInstructions",
+            "reason", "message", "instructions", "description", "prompt",
+        )
+        if (label == null && reason == null) return null
+        return PendingSecret(
+            label = label ?: "密钥",
+            envVarName = pick("cognition.ai/envVarName", "envVarName"),
+            reason = reason,
+            secretType = pick("cognition.ai/secretType", "secretType", "secret_type"),
+            saveScope = pick("cognition.ai/saveScope", "saveScope", "save_scope"),
+            sensitive = pick("cognition.ai/sensitive", "sensitive")
+                ?.toBooleanStrictOrNull() ?: true,
+            choice = choice,
+            requestId = requestId,
+        )
+    }
+
+    /**
+     * The request-path result: `action` save/decline plus the typed value,
+     * echoed under both flat and SecretPromptMeta `_meta` spellings — the
+     * two agent builds read different keys.
+     */
+    private fun secretResult(
+        action: String,
+        pending: PendingSecret,
+        value: String?,
+    ): JsonObject = buildJsonObject {
+        put("action", action)
+        value?.let {
+            put("secretValue", it)
+            put("secret_value", it)
+        }
+        putJsonObject("_meta") {
+            put("cognition.ai/action", action)
+            (pending.envVarName ?: pending.label).let {
+                put("cognition.ai/envVarName", it)
+                put("cognition.ai/secretName", it)
+            }
+            pending.secretType?.let { put("cognition.ai/secretType", it) }
+            pending.saveScope?.let { put("cognition.ai/saveScope", it) }
+        }
+    }
+
+    private fun popSecret(p: PendingSecret) = synchronized(requestLock) {
+        secretQueue.remove(p)
+        _pendingSecret.value = secretQueue.firstOrNull()
+    }
+
+    /**
+     * Same contract as [clearPermissions]: a teardown never answers — the
+     * ask's TTL expires agent-side and the frame re-arrives after attach.
+     */
+    private fun clearSecrets() = synchronized(requestLock) {
+        openSecrets.values.forEach { it.resolvedByPeer = true }
+        secretQueue.forEach { it.choice.complete(null) }
+        secretQueue.clear()
+        openSecrets.clear()
+        _pendingSecret.value = null
+    }
+
+    // ---- user shell commands + background shells (A7.6) -------------------------
+
+    /**
+     * `!cmd` → a single text block flagged `_meta.userShellCommand` (devin
+     * rejects prompts carrying more than one). The transcript echo is a
+     * [Kind.ShellCommand] `$ cmd` line; a matching `commandStarted` binds
+     * its terminalId so the completion can stamp the exit badge.
+     */
+    private fun sendShellCommand(command: String) {
+        val item = append(Kind.ShellCommand, "$ $command", status = "pending")
+        synchronized(pendingShellCommands) {
+            pendingShellCommands[command] = item.id
+            // Lifecycle-less agents never resolve these — bound the map.
+            while (pendingShellCommands.size > 50) {
+                pendingShellCommands.remove(pendingShellCommands.keys.first())
+            }
+        }
+        scope.launch {
+            try {
+                client.promptBlocks(
+                    sessionId,
+                    listOf(
+                        ContentBlock(
+                            type = "text",
+                            text = command,
+                            _meta = buildJsonObject {
+                                put("cognition.ai/userShellCommand", true)
+                            },
+                        ),
+                    ),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                synchronized(pendingShellCommands) {
+                    pendingShellCommands.remove(command)
+                }
+                mutateMessages { list ->
+                    list.map {
+                        if (it.id == item.id) {
+                            it.copy(status = "failed", detail = e.display())
+                        } else {
+                            it
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * `_cognition.ai/terminal/commandStarted`: upsert the shell row and bind
+     * a matching `!` echo's terminalId. An agent background shell whose
+     * tool call already registered a row re-keys onto the wire terminalId.
+     */
+    private fun onShellStarted(ev: AcpEvent.TerminalCommandStarted) {
+        val echoId = synchronized(pendingShellCommands) {
+            pendingShellCommands.remove(ev.command)
+        }
+        if (echoId != null) {
+            mutateMessages { list ->
+                list.map {
+                    if (it.id == echoId) {
+                        it.copy(toolCallId = ev.terminalId, status = "running")
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+        // A tool-sourced row for the same running command IS this shell —
+        // re-key it to the lifecycle id instead of listing the shell twice.
+        val rekey = _backgroundShells.value.firstOrNull {
+            it.terminalId != ev.terminalId && it.running &&
+                it.command == ev.command && it.terminalId in toolShellIds
+        }
+        if (rekey != null) {
+            toolShellIds.remove(rekey.terminalId)
+            _backgroundShells.update { list ->
+                list.map {
+                    if (it.terminalId == rekey.terminalId) {
+                        it.copy(
+                            terminalId = ev.terminalId,
+                            startedAt = System.currentTimeMillis(),
+                        )
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+        upsertShell(
+            BackgroundShell(
+                terminalId = ev.terminalId,
+                command = ev.command,
+                status = "running",
+                startedAt = System.currentTimeMillis(),
+                userShell = echoId != null,
+                itemId = echoId ?: -1L,
+            ),
+        )
+    }
+
+    /** `_cognition.ai/terminal/commandCompleted` — stamp code + output tail. */
+    private fun onShellCompleted(ev: AcpEvent.TerminalCommandCompleted) {
+        val old = _backgroundShells.value.firstOrNull { it.terminalId == ev.terminalId }
+        upsertShell(
+            BackgroundShell(
+                terminalId = ev.terminalId,
+                command = old?.command ?: "",
+                status = if (old?.status == "killed") "killed"
+                else if (ev.exitCode != null && ev.exitCode != 0) "failed"
+                else "completed",
+                exitCode = ev.exitCode,
+                output = ev.output?.takeLast(SHELL_OUTPUT_CAP),
+                startedAt = old?.startedAt ?: 0L,
+                userShell = old?.userShell ?: false,
+                itemId = old?.itemId ?: -1L,
+            ),
+        )
+        old?.itemId?.takeIf { it >= 0 }?.let { itemId ->
+            val status = _backgroundShells.value
+                .firstOrNull { it.terminalId == ev.terminalId }?.status
+            mutateMessages { list ->
+                list.map {
+                    if (it.id == itemId) {
+                        it.copy(
+                            status = status,
+                            exitCode = ev.exitCode,
+                            detail = ev.output?.takeLast(SHELL_OUTPUT_CAP)
+                                ?: it.detail,
+                        )
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Sheet's 终止 → `_cognition.ai/terminal/killBackgroundShell`. Marks the
+     * row killed once the call lands; the completion event then freezes it
+     * (a nonzero exit there doesn't flip "killed" back to "failed").
+     */
+    fun killBackgroundShell(terminalId: String) {
+        scope.launch {
+            try {
+                client.killBackgroundShell(sessionId, terminalId)
+                _backgroundShells.update { list ->
+                    list.map {
+                        if (it.terminalId == terminalId && it.running) {
+                            it.copy(status = "killed")
+                        } else {
+                            it
+                        }
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                append(Kind.Error, "终止后台命令失败: ${e.display()}")
+            }
+        }
+    }
+
+    /**
+     * A tool call flagged background (`_meta` `cognition.ai/background*` or
+     * `rawInput` `background_shell`/`is_background`) IS a shell-manager
+     * terminal — mirror it into the sheet keyed by its shell/toolCall id.
+     * A later commandStarted for the same command re-keys onto terminalId.
+     */
+    private fun trackBackgroundShell(call: ToolCallInfo) {
+        val meta = call._meta
+        val raw = call.rawInput as? JsonObject
+        fun truthy(o: JsonObject?, vararg keys: String): Boolean =
+            keys.any { k ->
+                (o?.get(k) as? JsonPrimitive)?.let {
+                    it.booleanOrNull == true || it.contentOrNull == "true"
+                } == true
+            }
+        val flagged = truthy(
+            meta, "cognition.ai/background", "cognition.ai/backgroundRequested",
+        ) || truthy(raw, "is_background", "background", "background_shell")
+        if (!flagged) return
+        val shellId = meta?.strField("cognition.ai/backgroundShellId")
+            ?: raw?.strField("shell_id", "shellId", "terminal_id", "terminalId")
+            ?: call.toolCallId
+        toolShellIds += shellId
+        upsertShell(
+            BackgroundShell(
+                terminalId = shellId,
+                command = meta?.strField("cognition.ai/backgroundCommand")
+                    ?: raw?.strField("command")
+                    ?: toolTitleOf(call) ?: call.toolCallId,
+                status = when (call.status) {
+                    "completed" -> "completed"
+                    "failed" -> "failed"
+                    else -> "running"
+                },
+                exitCode = exitCodeOf(call),
+                startedAt = System.currentTimeMillis(),
+            ),
+        )
+    }
+
+    private fun upsertShell(shell: BackgroundShell) {
+        _backgroundShells.update { list ->
+            val idx = list.indexOfFirst { it.terminalId == shell.terminalId }
+            val merged = if (idx >= 0) {
+                val old = list[idx]
+                shell.copy(
+                    command = shell.command.ifEmpty { old.command },
+                    startedAt = if (old.startedAt > 0) old.startedAt else shell.startedAt,
+                    userShell = old.userShell || shell.userShell,
+                    itemId = if (shell.itemId >= 0) shell.itemId else old.itemId,
+                )
+            } else {
+                shell
+            }
+            val next = if (idx < 0) {
+                list + merged
+            } else {
+                list.toMutableList().apply { set(idx, merged) }
+            }
+            // Finished rows beyond the cap drop oldest-first; running rows
+            // and tool-sourced keys always stay.
+            val finished = next.withIndex()
+                .filter { !it.value.running && it.value.status != "killed" }
+                .map { it.index }
+            val extra = finished.size - MAX_SHELLS
+            if (extra <= 0) {
+                next
+            } else {
+                val drop = finished.take(extra).toSet()
+                val dropped = next.filterIndexed { i, _ -> i in drop }
+                toolShellIds.removeAll(dropped.map { it.terminalId })
+                next.filterIndexed { i, _ -> i !in drop }
+            }
+        }
+    }
+
+    // ---- compaction divider (A7.6) ----------------------------------------------
+
+    /**
+     * `_cognition.ai/compaction` → one transcript divider updated in place:
+     * `started` appends the shimmering row, `completed/failed/cancelled`
+     * freezes it. When the frame carries no after-count the next
+     * `usage_update` fills it (see onNonChunkEvent).
+     */
+    private fun onCompaction(ev: AcpEvent.CompactionUpdate) {
+        if (ev.tokensBefore != null) compactionBefore = ev.tokensBefore
+        when (compactionStatusOf(ev.status)) {
+            "in_progress" -> {
+                compactionAfterPending = false
+                compactionItemId = append(
+                    Kind.Compaction,
+                    compactionText(ev.status),
+                    status = "in_progress",
+                    detail = compactionDetail(ev.tokensBefore, null),
+                ).id
+            }
+            else -> {
+                val status = compactionStatusOf(ev.status)
+                updateCompactionItem(status, compactionBefore, ev.tokensAfter)
+                // No wire count — the next usage_update IS the after count.
+                compactionAfterPending =
+                    status == "completed" && ev.tokensAfter == null
+            }
+        }
+    }
+
+    private fun updateCompactionItem(status: String, before: Long?, after: Long?) {
+        val detail = compactionDetail(before, after)
+        mutateMessages { list ->
+            val idx = compactionItemId?.let { target ->
+                list.indexOfLast { it.id == target && it.kind == Kind.Compaction }
+            } ?: -1
+            if (idx >= 0) {
+                val old = list[idx]
+                list.toMutableList().apply {
+                    set(
+                        idx,
+                        old.copy(
+                            text = compactionText(status),
+                            status = status,
+                            detail = detail ?: old.detail,
+                        ),
+                    )
+                }
+            } else {
+                capMessages(
+                    list + ChatItem(
+                        nextItemId++, Kind.Compaction, compactionText(status),
+                        status = status, detail = detail,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun compactionStatusOf(status: String?): String {
+        val s = status?.lowercase().orEmpty()
+        return when {
+            s.contains("fail") || s.contains("error") -> "failed"
+            s.contains("cancel") -> "cancelled"
+            s.contains("complete") || s.contains("done") ||
+                s.contains("finish") || s.contains("success") -> "completed"
+            else -> "in_progress"
+        }
+    }
+
+    /** "128k → 40k" label, or null when the wire reported neither count. */
+    private fun compactionDetail(before: Long?, after: Long?): String? {
+        if (before == null && after == null) return null
+        fun fmt(n: Long?) = n?.let {
+            if (it >= 1000) "${it / 1000}k" else it.toString()
+        } ?: "?"
+        return "${fmt(before)} → ${fmt(after)}"
+    }
+
     // ---- transcript assembly ---------------------------------------------------
 
     /**
@@ -2321,6 +2922,9 @@ class SessionStore(
     }
 
     private fun updateTool(call: ToolCallInfo) {
+        // A background-flagged exec call is also a shell-manager terminal —
+        // mirror it into the 后台命令 sheet (A7.6).
+        trackBackgroundShell(call)
         // A subagent call can lose its kind/_meta on later updates — keep
         // routing it to the subagent list instead of surfacing a stray row.
         if (_subagents.value.any { it.toolCallId == call.toolCallId }) {

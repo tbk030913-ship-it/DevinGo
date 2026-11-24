@@ -36,6 +36,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -69,6 +70,7 @@ import com.devingo.app.ChatItem
 import com.devingo.app.Kind
 import com.devingo.app.PendingElicitation
 import com.devingo.app.PendingPermission
+import com.devingo.app.PendingSecret
 import com.devingo.app.QueuedPrompt
 import com.devingo.app.RowKind
 import com.devingo.app.Subagent
@@ -84,12 +86,14 @@ import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.ArrowShrink
 import me.rerere.hugeicons.stroke.ArrowTurnForward
 import me.rerere.hugeicons.stroke.Brain
 import me.rerere.hugeicons.stroke.ChevronRight
 import me.rerere.hugeicons.stroke.Copy01
 import me.rerere.hugeicons.stroke.FloppyDisk
 import me.rerere.hugeicons.stroke.PencilEdit01
+import me.rerere.hugeicons.stroke.Terminal
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
 internal fun formatTokens(n: Long): String = when {
@@ -167,6 +171,8 @@ internal fun Transcript(
     ui: UiState,
     pendingPermission: PendingPermission?,
     pendingElicitation: PendingElicitation?,
+    /** A7.6: the secret card's ask — the status line's third wait state. */
+    pendingSecret: PendingSecret?,
     timings: Map<Long, TurnTiming>,
     expandedWork: Map<Long, Boolean>,
     queued: List<QueuedPrompt>,
@@ -263,7 +269,9 @@ internal fun Transcript(
             ) {
                 Box(Modifier.widthIn(max = 720.dp).fillMaxWidth()) {
                     when (row) {
-                        is RowKind.Status -> StatusLine(ui, pendingPermission, pendingElicitation)
+                        is RowKind.Status -> StatusLine(
+                            ui, pendingPermission, pendingElicitation, pendingSecret,
+                        )
                         is RowKind.User -> {
                             val m = itemById[row.itemId]
                                 ?.let { if (tail?.id == it.id) tail else it }
@@ -371,6 +379,7 @@ private fun StatusLine(
     ui: UiState,
     pendingPermission: PendingPermission?,
     pendingElicitation: PendingElicitation?,
+    pendingSecret: PendingSecret?,
 ) {
     val cs = MaterialTheme.colorScheme
     val (text, hexColor, pulsing) = when {
@@ -381,6 +390,11 @@ private fun StatusLine(
         )
         pendingElicitation != null -> Triple(
             "Devin 正在等你回答",
+            DevinGoColors.statusOrange,
+            false,
+        )
+        pendingSecret != null -> Triple(
+            "Devin 正在等你提供密钥",
             DevinGoColors.statusOrange,
             false,
         )
@@ -786,7 +800,9 @@ private fun BodyItem(
         Kind.Error -> ErrorLine(m.text, modifier)
         Kind.System -> SystemLine(m.text, modifier)
         Kind.Plan -> PlanCard(m, onSavePlan, modifier)
-        else -> Unit // Thought/Tool never render inline.
+        Kind.Compaction -> CompactionDivider(m, modifier)
+        Kind.ShellCommand -> ShellCommandLine(m, modifier)
+        else -> Unit // Thought/Tool/Answered never render inline.
     }
 }
 
@@ -1038,6 +1054,146 @@ private fun SystemLine(text: String, modifier: Modifier = Modifier) {
             .fillMaxWidth()
             .padding(vertical = 8.dp),
     )
+}
+
+/**
+ * A7.6's context-compaction divider (t3code ThreadContextDivider port):
+ * hairline — icon + label — hairline. While `in_progress` the label rides
+ * the stepped shimmer; a failed compaction turns icon+text error red. The
+ * store's `detail` carries the "128k → 40k" counts once the wire reports
+ * them (or the following usage_update fills them in).
+ */
+@Composable
+private fun CompactionDivider(m: ChatItem, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val active = m.status == "in_progress"
+    val failed = m.status == "failed"
+    val label = m.detail?.takeIf { it.isNotBlank() }?.let {
+        "${m.text} · $it"
+    } ?: m.text
+    Row(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            thickness = Hairline,
+            color = cs.outlineVariant,
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                if (failed) Icons.Filled.Warning else HugeIcons.ArrowShrink,
+                null,
+                modifier = Modifier.size(12.dp),
+                tint = if (failed) cs.error else cs.onSurfaceVariant,
+            )
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (failed) cs.error else cs.onSurfaceVariant,
+                maxLines = 1,
+                modifier = if (active) Modifier.steppedShimmer() else Modifier,
+            )
+        }
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            thickness = Hairline,
+            color = cs.outlineVariant,
+        )
+    }
+}
+
+/**
+ * The `!` shell command's transcript echo (A7.6): mono `$ cmd` beside a
+ * terminal glyph — shimmering while the wire reports pending/running, red
+ * `exit N` on failure, 已终止 when killed. With a captured output tail the
+ * row expands into the shared command-output box.
+ */
+@Composable
+private fun ShellCommandLine(m: ChatItem, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val running = m.status == "pending" || m.status == "running"
+    val failed = m.status == "failed" || (m.exitCode ?: 0) != 0
+    val hasOutput = !m.detail.isNullOrBlank()
+    var expanded by remember { mutableStateOf(false) }
+    val chevronRot by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        label = "shellChevron",
+    )
+    Column(modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .then(
+                    if (hasOutput) {
+                        Modifier.clickable { expanded = !expanded }
+                    } else {
+                        Modifier
+                    },
+                )
+                .padding(horizontal = 4.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .weight(1f)
+                    .then(if (running) Modifier.steppedShimmer() else Modifier),
+            ) {
+                Icon(
+                    HugeIcons.Terminal, null,
+                    modifier = Modifier.size(14.dp),
+                    tint = if (failed) cs.error else cs.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    m.text,
+                    style = monoText(MaterialTheme.typography.bodyMedium),
+                    color = cs.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            when {
+                m.status == "killed" -> Text(
+                    "已终止",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                )
+                failed -> Text(
+                    if (m.exitCode != null) "exit ${m.exitCode}" else "失败",
+                    style = monoText(MaterialTheme.typography.labelSmall),
+                    color = cs.error,
+                    maxLines = 1,
+                )
+            }
+            if (hasOutput) {
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    HugeIcons.ChevronRight, if (expanded) "收起输出" else "查看输出",
+                    modifier = Modifier
+                        .size(12.dp)
+                        .rotate(chevronRot),
+                    tint = cs.onSurfaceVariant,
+                )
+            }
+        }
+        AnimatedVisibility(
+            visible = expanded && hasOutput,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            CommandOutputBox(item = m, detail = m.detail.orEmpty())
+        }
+    }
 }
 
 /** The plan card's markdown export: a task checklist (done entries ticked). */

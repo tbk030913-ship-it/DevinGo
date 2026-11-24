@@ -110,6 +110,7 @@ import me.rerere.hugeicons.stroke.CommandLine
 import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.hugeicons.stroke.Quotes
 import me.rerere.hugeicons.stroke.Shield01
+import me.rerere.hugeicons.stroke.Terminal
 
 // ---- composer ------------------------------------------------------------------
 
@@ -164,6 +165,8 @@ internal fun Composer(
     onMentionResources: suspend (String) -> List<MentionResource>,
     /** A picked `@{kind}:{ref}` — registered verbatim for send-scan (A7.3). */
     onMentionInsert: (String) -> Unit,
+    /** `cognition.ai/userShellCommand` negotiated — the `!` affordance (A7.6). */
+    userShellCommands: Boolean,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -191,6 +194,12 @@ internal fun Composer(
     // blank 保存 is — it's the delete-item affordance.
     val canSend = queueEditing || input.isNotBlank() || attachments.isNotEmpty() ||
         citation?.quotedText?.isNotBlank() == true
+    // `!` at position 0 + the negotiated cap → a shell command, not a prompt
+    // (A7.6): a terminal glyph marks the field, and send bypasses the
+    // queue/steer menu — the shell runs it right away. Attachments can't
+    // ride the shell path, so with images pinned `!` stays literal text.
+    val shellCommand = userShellCommands && attachments.isEmpty() &&
+        input.startsWith("!")
 
     // The one native editor both layers share — text/selection/chips live on
     // the view; `input` and `selectionEnd` are its Compose mirrors.
@@ -290,7 +299,7 @@ internal fun Composer(
         when {
             !canSend -> Unit
             queueEditing -> onSend()
-            ui.running -> sendMenu = true
+            ui.running && !shellCommand -> sendMenu = true
             else -> onSend()
         }
     }
@@ -425,6 +434,18 @@ internal fun Composer(
                             onInsert = insertAtCaret,
                         )
                     }
+                    if (shellCommand) {
+                        // Top-anchored so the glyph sits on the first text
+                        // line in both layers (the row is bottom-aligned).
+                        Icon(
+                            HugeIcons.Terminal, "终端命令",
+                            modifier = Modifier
+                                .align(Alignment.Top)
+                                .padding(top = 18.dp, start = 10.dp)
+                                .size(16.dp),
+                            tint = cs.onSurfaceVariant,
+                        )
+                    }
                     ComposerField(
                         editor = editor,
                         input = input,
@@ -459,6 +480,7 @@ internal fun Composer(
                             sendState = sendState,
                             running = ui.running,
                             queueEditing = queueEditing,
+                            shellCommand = shellCommand,
                             steerable = attachments.isEmpty(),
                             sendMenu = sendMenu,
                             onSendMenuChange = { sendMenu = it },
@@ -547,6 +569,7 @@ internal fun Composer(
                                 sendState = sendState,
                                 running = ui.running,
                                 queueEditing = queueEditing,
+                                shellCommand = shellCommand,
                                 steerable = attachments.isEmpty(),
                                 sendMenu = sendMenu,
                                 onSendMenuChange = { sendMenu = it },
@@ -682,6 +705,8 @@ private fun ComposerSendArea(
     sendState: SendState,
     running: Boolean,
     queueEditing: Boolean,
+    /** `!` draft — a shell command never opens the queue/steer menu (A7.6). */
+    shellCommand: Boolean,
     steerable: Boolean,
     sendMenu: Boolean,
     onSendMenuChange: (Boolean) -> Unit,
@@ -704,7 +729,7 @@ private fun ComposerSendArea(
                     SendState.Stop -> onStop()
                     SendState.Send -> when {
                         queueEditing -> onSend()
-                        running -> onSendMenuChange(true)
+                        running && !shellCommand -> onSendMenuChange(true)
                         else -> onSend()
                     }
                 }

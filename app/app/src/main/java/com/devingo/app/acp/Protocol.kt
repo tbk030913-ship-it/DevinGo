@@ -411,6 +411,20 @@ object AcpMethods {
     const val SUBAGENT_BACKGROUND = "_cognition.ai/subagent/background"
     const val SUBAGENT_FOREGROUND = "_cognition.ai/subagent/foreground"
 
+    // Devin secret ask (A7.6): agent->client card request (envVarName/
+    // secretType/saveScope _meta), answered with {action:"save"|"decline"}.
+    const val SECRET_CREATE = "_cognition.ai/secret/create"
+
+    // Devin terminal lifecycle (A7.6) — negotiated via
+    // clientCapabilities._meta["cognition.ai/terminalLifecycle"]. Started/
+    // completed are agent->client notifications for shell-manager
+    // terminals (user `!` commands + background shells); kill is the
+    // client->agent stop call.
+    const val TERMINAL_COMMAND_STARTED = "_cognition.ai/terminal/commandStarted"
+    const val TERMINAL_COMMAND_COMPLETED = "_cognition.ai/terminal/commandCompleted"
+    const val TERMINAL_KILL_BACKGROUND_SHELL =
+        "_cognition.ai/terminal/killBackgroundShell"
+
     // Devin revert extension (negotiated via clientCapabilities._meta).
     const val REVERT_LIST_STEPS = "_cognition.ai/revert/listSteps"
     const val REVERT_FORK_FROM_STEP = "_cognition.ai/revert/forkFromStep"

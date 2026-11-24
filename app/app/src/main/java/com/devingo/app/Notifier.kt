@@ -158,5 +158,6 @@ class Notifier(context: Context) {
         private const val ID_PERMISSION = 1001
         private const val ID_TURN_DONE = 1002
         const val ID_ELICITATION = 1003
+        const val ID_SECRET = 1004
     }
 }

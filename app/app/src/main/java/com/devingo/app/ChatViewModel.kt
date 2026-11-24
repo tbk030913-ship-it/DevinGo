@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -117,6 +118,11 @@ class ChatViewModel(
     /** The elicitation card awaiting answers in the bound session (A7.2). */
     val pendingElicitation: StateFlow<PendingElicitation?> =
         bound({ pendingElicitation }, null)
+    /** The secret card awaiting a value in the bound session (A7.6). */
+    val pendingSecret: StateFlow<PendingSecret?> = bound({ pendingSecret }, null)
+    /** Shell-manager terminals for the 后台命令 sheet (A7.6). */
+    val backgroundShells: StateFlow<List<BackgroundShell>> =
+        bound({ backgroundShells }, emptyList())
     val queuedPrompts: StateFlow<List<QueuedPrompt>> = bound({ queuedPrompts }, emptyList())
     /** The queued prompt pulled into the composer for editing (U5.4). */
     val editingQueuedId: StateFlow<Long?> = bound({ editingQueuedId }, null)
@@ -142,6 +148,14 @@ class ChatViewModel(
     val badges: StateFlow<Map<String, SessionBadge>> = cm.badges
     /** The negotiated capability set — the @-picker's kind gating (A7.3). */
     val agentCaps: StateFlow<AgentCaps> = cm.agentCaps
+    /**
+     * `cognition.ai/userShellCommand` negotiated (A7.6) — the composer's
+     * `!` affordance and the store's shell-command send path both key on
+     * it; absent a meta echo, assume support like revertSupported.
+     */
+    val userShellCommands: StateFlow<Boolean> = cm.agentCaps
+        .map { !it.metaNegotiated || it.userShellCommand }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
     /** Pending approvals across all sessions — the notification's count. */
     val pendingApprovals: StateFlow<Int> = cm.pendingApprovals
     val openTarget: StateFlow<OpenTarget?> = cm.openTarget
@@ -311,6 +325,16 @@ class ChatViewModel(
     /** Question card submit/dismiss; null = declined without answers. */
     fun resolveElicitation(p: PendingElicitation, reply: ElicitationReply?) {
         store?.resolveElicitation(p, reply)
+    }
+
+    /** Secret card save/dismiss; null = declined (A7.6). */
+    fun resolveSecret(p: PendingSecret, reply: SecretReply?) {
+        store?.resolveSecret(p, reply)
+    }
+
+    /** 后台命令 sheet's 终止 — `_cognition.ai/terminal/killBackgroundShell` (A7.6). */
+    fun killBackgroundShell(terminalId: String) {
+        store?.killBackgroundShell(terminalId)
     }
 
     fun loadRevertSteps() {

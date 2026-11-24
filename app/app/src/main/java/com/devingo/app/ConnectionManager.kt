@@ -681,6 +681,12 @@ class ConnectionManager private constructor(private val app: Application) {
             workspaceSearcher = { query ->
                 getBridgeFsSearch(healthUrl(dialHost), lastToken, sessionId, query)
             },
+            // `!` shell prompts ride the negotiated surface (A7.6): absent
+            // a meta echo assume support, like revertSupported.
+            userShellCommandsEnabled = {
+                val caps = _agentCaps.value
+                !caps.metaNegotiated || caps.userShellCommand
+            },
         )
         // U7: show the last cached transcript right away — the attach replay
         // aligns it with the hub behind the staged commit.

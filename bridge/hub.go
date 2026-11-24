@@ -290,6 +290,11 @@ func gatewayInitParams() map[string]any {
 				"cognition.ai/subagentSupport":    true,
 				"cognition.ai/sessionRename":      true,
 				"cognition.ai/sessionShare":       true,
+				// A7.6: lifecycle notifications for shell-manager terminals,
+				// user `!` shell commands, and secret asks/sends.
+				"cognition.ai/terminalLifecycle":  true,
+				"cognition.ai/userShellCommand":   true,
+				"cognition.ai/secretSend":         true,
 			},
 		},
 		"clientInfo": map[string]any{"name": "devingo-bridge", "version": gatewayVersion},

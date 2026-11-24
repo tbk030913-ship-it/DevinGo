@@ -85,7 +85,21 @@ data class UiState(
     val subagentSupported: Boolean = false,
 )
 
-enum class Kind { User, Agent, Thought, Tool, Plan, System, Error, Answered }
+enum class Kind {
+    User, Agent, Thought, Tool, Plan, System, Error, Answered,
+    /**
+     * `_cognition.ai/compaction` divider (A7.6): `text` = label,
+     * `status` = in_progress/completed/failed, `detail` = the formatted
+     * "128k → 40k" counts when the wire reported them.
+     */
+    Compaction,
+    /**
+     * A shell-manager command echo (A7.6): `text` = `$ cmd`, `toolCallId`
+     * binds the terminalId once commandStarted names it; `exitCode`/`detail`
+     * carry the completion's code/output tail.
+     */
+    ShellCommand,
+}
 
 @Immutable
 data class ChatItem(
@@ -196,6 +210,54 @@ data class ElicitationReply(
     /** "question → answer" lines recorded into the turn's WorkLog. */
     val lines: List<String>,
 )
+
+/**
+ * A secret ask the user can still answer (A7.6 — `_cognition.ai/secret/create`
+ * request, or a notification/`request_secret` update surfaced the same way).
+ * [choice] completes with the typed value on save, null on decline/withdrawal.
+ */
+@Immutable
+data class PendingSecret(
+    /** Display name — `label`/`secretName`/`envVarName`/`title`. */
+    val label: String,
+    val envVarName: String? = null,
+    /** Why the agent needs it (`reason`/`secretInstructions`). */
+    val reason: String? = null,
+    /** `plain`/`totp` — echoed back with the answer. */
+    val secretType: String? = null,
+    /** `org`/`user` — echoed back with the answer. */
+    val saveScope: String? = null,
+    /** Masked input — wire `sensitive`, default true for a secret field. */
+    val sensitive: Boolean = true,
+    internal val choice: CompletableDeferred<SecretReply?>,
+    internal val requestId: Long = -1,
+)
+
+/** The card's save — decline completes with null instead. */
+data class SecretReply(val value: String)
+
+/**
+ * One shell-manager terminal (A7.6): user `!` commands and agent background
+ * shells, tracked via the terminalLifecycle notifications. [itemId] binds
+ * the transcript row when one exists (`!` echoes, started-shell rows).
+ */
+@Immutable
+data class BackgroundShell(
+    val terminalId: String,
+    val command: String,
+    /** running | completed | failed | killed */
+    val status: String = "running",
+    val exitCode: Int? = null,
+    /** Completion output tail (bounded). */
+    val output: String? = null,
+    val startedAt: Long = 0L,
+    /** The command came from this client's `!` composer. */
+    val userShell: Boolean = false,
+    /** Bound transcript item (Kind.ShellCommand), when one was written. */
+    val itemId: Long = -1L,
+) {
+    val running: Boolean get() = status == "running"
+}
 
 /**
  * A Devin subagent spawned via a task/subagent tool call (A7.4), tracked
