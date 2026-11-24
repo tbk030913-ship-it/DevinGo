@@ -224,8 +224,9 @@ fun DangerPillButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     leadingIcon: (@Composable () -> Unit)? = null,
+    loading: Boolean = false,
     enabled: Boolean = true,
-) = PillButton(PillKind.Danger, text, onClick, modifier, leadingIcon, false, enabled)
+) = PillButton(PillKind.Danger, text, onClick, modifier, leadingIcon, loading, enabled)
 
 @Composable
 private fun PillButton(

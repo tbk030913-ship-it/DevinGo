@@ -18,6 +18,8 @@ import com.devingo.app.acp.MentionResource
 import com.devingo.app.acp.PermissionOption
 import com.devingo.app.acp.PlanEntry
 import com.devingo.app.acp.RequestPermissionParams
+import com.devingo.app.acp.RevertExecuteResult
+import com.devingo.app.acp.RevertPreview
 import com.devingo.app.acp.RevertStep
 import com.devingo.app.acp.SessionMode
 import com.devingo.app.acp.SessionModel
@@ -44,6 +46,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
@@ -76,6 +79,11 @@ class SessionStore(
      * Connection-level capability; the owner hides the menu entry.
      */
     private val onRevertUnsupported: (() -> Unit)? = null,
+    /**
+     * Same probe-negative hook as [onRevertUnsupported] but for
+     * `_cognition.ai/subagent/…` — hides the action chips (A7.4).
+     */
+    private val onSubagentUnsupported: (() -> Unit)? = null,
     /**
      * Bridge `/fs/write` bound to this session — (relativePath, content).
      * Null when the bridge URL isn't known; 保存到工作区 reports a failure.
@@ -130,6 +138,8 @@ class SessionStore(
         const val MAX_DRAFT_CHARS = 64_000
         /** Per-tool detail cap; exec output keeps its tail within this. */
         const val TOOL_DETAIL_CAP = 4_000
+        /** Subagent statuses that must never regress to a live one (A7.4). */
+        private val SUBAGENT_TERMINAL = setOf("completed", "failed", "stopped")
         /** Default workspace path the plan card's 保存到工作区 writes. */
         const val PLAN_FILE_NAME = "plan.md"
         /**
@@ -348,10 +358,15 @@ class SessionStore(
                 _messages,
                 _ui.map { it.running }.distinctUntilChanged(),
                 _queuedPrompts,
-            ) { msgs, running, queued -> Triple(msgs, running, queued) }
-                .collect { (msgs, running, queued) ->
-                    rebuildModel(msgs, running, queued)
-                }
+                // A7.4: a subagent-only turn needs a WorkRow once settled —
+                // only the owning-turn set is structural for the model.
+                _subagents.map { l -> l.mapTo(HashSet()) { it.turnId } }
+                    .distinctUntilChanged(),
+            ) { msgs, running, queued, subTurns ->
+                ModelInput(msgs, running, queued, subTurns)
+            }.collect { (msgs, running, queued, subTurns) ->
+                rebuildModel(msgs, running, queued, subTurns)
+            }
         }
     }
 
@@ -363,10 +378,18 @@ class SessionStore(
      * leaves the model (and every other row) untouched; all other shapes
      * rebuild the full model.
      */
+    private data class ModelInput(
+        val msgs: List<ChatItem>,
+        val running: Boolean,
+        val queued: List<QueuedPrompt>,
+        val subagentTurnIds: Set<Long>,
+    )
+
     private fun rebuildModel(
         msgs: List<ChatItem>,
         running: Boolean,
         queued: List<QueuedPrompt>,
+        subagentTurnIds: Set<Long> = emptySet(),
     ) {
         val old = modelMsgs
         if (queued == modelQueued && running == modelRunning &&
@@ -392,7 +415,7 @@ class SessionStore(
         modelMsgs = msgs
         modelRunning = running
         modelQueued = queued
-        _transcript.value = buildTranscriptModel(msgs, running, queued)
+        _transcript.value = buildTranscriptModel(msgs, running, queued, subagentTurnIds)
         _streamingTail.value = msgs.lastOrNull()
     }
 
@@ -698,7 +721,11 @@ class SessionStore(
     fun liveGap(seq: Long): Boolean = attached && isLive(seq) && seq > lastSeq + 1
 
     private fun remoteTurnActivity() {
-        if (!remoteTurn && promptJob?.isActive != true) {
+        // Our own jobs speak for the turn — remote frames streaming during
+        // a prompt/steer mustn't latch remoteTurn, or it outlives the job.
+        if (!remoteTurn && promptJob?.isActive != true &&
+            steerJob?.isActive != true
+        ) {
             remoteTurn = true
             refreshRunning()
         }
@@ -788,6 +815,53 @@ class SessionStore(
                 upsertSubagent(ev.call)
             }
             is AcpEvent.SubagentCount -> _numLiveSubagents.value = ev.count
+            is AcpEvent.SubagentCtxFrame -> {
+                // A descendant agent's frame multiplexed onto our stream —
+                // append to the matching subagent's live output. Unknown
+                // ctx ids drop here rather than land as parent rows (t3
+                // routes them out of the parent's view entirely).
+                _subagents.update { list ->
+                    val idx = list.indexOfFirst {
+                        it.id == ev.agentId || it.toolCallId == ev.agentId ||
+                            it.childSessionId == ev.agentId
+                    }
+                    if (idx < 0) {
+                        list
+                    } else {
+                        val a = list[idx]
+                        val merged = (if (ev.newLine && a.detail != null) {
+                            a.detail + "\n" + ev.text
+                        } else {
+                            (a.detail ?: "") + ev.text
+                        }).takeLast(TOOL_DETAIL_CAP)
+                        list.toMutableList().apply { set(idx, a.copy(detail = merged)) }
+                    }
+                }
+            }
+            is AcpEvent.ToolContentChunk -> {
+                if (_subagents.value.any { it.toolCallId == ev.call.toolCallId }) {
+                    upsertSubagent(ev.call)
+                } else {
+                    val txt = toolDetailOf(ev.call)?.text
+                    if (txt != null) {
+                        mutateMessages { list ->
+                            val idx = list.indexOfLast {
+                                it.toolCallId == ev.call.toolCallId
+                            }
+                            if (idx < 0) {
+                                list
+                            } else {
+                                list.toMutableList().apply {
+                                    set(idx, this[idx].copy(
+                                        detail = ((this[idx].detail ?: "") + txt)
+                                            .takeLast(TOOL_DETAIL_CAP),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             is AcpEvent.PlanUpdate -> {
                 promptAcked = true
                 if (isLive(seq)) remoteTurnActivity()
@@ -880,41 +954,84 @@ class SessionStore(
      * kept; terminal updates freeze [Subagent.result] and [Subagent.endedAt].
      */
     private fun upsertSubagent(call: ToolCallInfo) {
-        val id = subagentMetaStr(call, "cognition.ai/sharedSubagentId")
-            ?: call.toolCallId
-        val status = normalizeSubagentStatus(
-            subagentMetaStr(call, "cognition.ai/agentStatus") ?: call.status,
-        )
-        val prompt = subagentPromptOf(call)
+        val meta = call._meta
+        // Documented Devin shape (t3 devinAcp.ts): spawn/completion ride as
+        // _meta OBJECTS on the call — `subagent_started`/`subagent_completed`
+        // — whose agentId IS the child session id. The flat keys below are
+        // fallbacks for builds that predate that shape.
+        val started = meta?.get("cognition.ai/subagent_started") as? JsonObject
+        val completed = meta?.get("cognition.ai/subagent_completed") as? JsonObject
+        val wire = completed ?: started
+        val agentId = wire?.get("agentId").strOrNull()
+        // A late frame may finally name the wire id — upgrade to it so
+        // control calls (cancel/background) address the agent, not the
+        // toolCallId.
+        val wireId = agentId
+            ?: subagentMetaStr(call, "cognition.ai/sharedSubagentId")
+        val status = when {
+            completed != null ->
+                if ((completed["success"] as? JsonPrimitive)?.booleanOrNull == false) {
+                    "failed"
+                } else {
+                    "completed"
+                }
+            started != null ->
+                if ((started["isBackground"] as? JsonPrimitive)?.booleanOrNull == true) {
+                    "background"
+                } else {
+                    "working"
+                }
+            else -> normalizeSubagentStatus(
+                subagentMetaStr(call, "cognition.ai/agentStatus") ?: call.status,
+            )
+        }
+        val prompt = started?.get("task").strOrNull()
+            ?.takeIf { it.isNotBlank() } ?: subagentPromptOf(call)
+        // "Tool"/"Ran …" placeholders mustn't overwrite a real title.
+        val title = (started?.get("title").strOrNull() ?: call.title)
+            ?.takeIf { it.isNotBlank() && it != "Tool" }
+            ?.subagentDisplayTitle()
+        val wireResult = completed?.get("summary").strOrNull()
+            ?.takeIf { it.isNotBlank() }
         // Progress rides _meta when the wire sends it, else the call's
         // content blocks carry the output text.
-        val detail = subagentMetaStr(call, "cognition.ai/progress")
+        val detail = wireResult ?: subagentMetaStr(call, "cognition.ai/progress")
             ?: toolDetailOf(call)?.text
-        val terminal = status == "completed" || status == "failed" ||
-            status == "stopped"
-        val now = System.currentTimeMillis()
         _subagents.update { list ->
-            // Frames disagree on whether they carry sharedSubagentId — match
-            // the stable toolCallId too or the entry would fork in two.
+            // Frames disagree on which id they carry — match the stable
+            // toolCallId too or the entry would fork in two.
             val idx = list.indexOfFirst {
-                it.id == id || it.toolCallId == call.toolCallId
+                it.toolCallId == call.toolCallId ||
+                    (wireId != null && it.id == wireId) ||
+                    it.id == call.toolCallId ||
+                    (agentId != null && it.childSessionId == agentId)
             }
             val old = list.getOrNull(idx)
+            // Terminal states never regress — a straggler in_progress frame
+            // after completion is wire noise, not a resurrected agent.
+            val effStatus = when {
+                old?.status in SUBAGENT_TERMINAL &&
+                    status !in SUBAGENT_TERMINAL -> old!!.status
+                else -> status ?: old?.status ?: "pending"
+            }
+            val terminal = effStatus in SUBAGENT_TERMINAL
+            val now = System.currentTimeMillis()
             val next = Subagent(
-                id = old?.id ?: id,
+                id = wireId ?: old?.id ?: call.toolCallId,
                 toolCallId = call.toolCallId,
-                title = call.title?.subagentDisplayTitle() ?: old?.title
+                title = title ?: old?.title
                     ?: prompt?.lineSequence()?.firstOrNull()?.take(80)
                     ?: "子代理",
-                status = status ?: old?.status ?: "pending",
+                status = effStatus,
                 prompt = prompt ?: old?.prompt,
                 detail = detail ?: old?.detail,
-                result = if (terminal) detail ?: old?.detail ?: old?.result
-                else old?.result,
+                result = wireResult
+                    ?: if (terminal) detail ?: old?.detail ?: old?.result
+                    else old?.result,
                 startedAt = old?.startedAt ?: now,
                 endedAt = if (terminal) old?.endedAt?.takeIf { it > 0 } ?: now
                 else 0L,
-                childSessionId = subagentChildSessionId(call)
+                childSessionId = agentId ?: subagentChildSessionId(call)
                     ?: old?.childSessionId,
                 childSessionUrl = subagentMetaStr(
                     call, "cognition.ai/childSessionUrl",
@@ -996,6 +1113,11 @@ class SessionStore(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // -32601 answers the capability probe — the surface isn't
+                // there on this build; hide the action chips like revert's.
+                if ((e as? AcpException)?.code == JSONRPC_METHOD_NOT_FOUND) {
+                    onSubagentUnsupported?.invoke()
+                }
                 append(Kind.Error, "子代理操作失败: ${e.display()}")
             }
         }
@@ -1202,12 +1324,17 @@ class SessionStore(
     /**
      * Refs the @-picker inserted — `@{kind}:` + a ref that may contain
      * spaces can't be re-derived from the draft text at send time.
+     * Insertion-ordered and bounded: a stale hint must never grow the set
+     * unbounded across a long session.
      */
-    private val mentionRefHints = HashSet<String>()
+    private val mentionRefHints = LinkedHashSet<String>()
 
     /** The picker inserted `@{kind}:{ref}` — remember the verbatim ref. */
     fun registerMentionRef(ref: String) {
-        mentionRefHints += ref
+        if (!mentionRefHints.add(ref) || mentionRefHints.size <= 200) return
+        // Over the cap: evict the oldest — a hint from hundreds of picks
+        // ago is likelier stale than recent ones.
+        mentionRefHints.remove(mentionRefHints.first())
     }
 
     /** Interrupt the running turn with a new instruction right now. */
@@ -1225,6 +1352,8 @@ class SessionStore(
         append(Kind.User, merged, steered = true)
         promptAcked = true // the turn is live; a steer failure isn't a lost echo
         steerJob = scope.launch {
+            remoteTurn = false // our own call now speaks for the turn
+            refreshRunning()
             try {
                 // Same block assembly as send — @-mentions steer as
                 // resource_links, not literal tokens.
@@ -1238,6 +1367,12 @@ class SessionStore(
                 throw e
             } catch (e: Exception) {
                 append(Kind.Error, "打断失败: ${e.display()}")
+            } finally {
+                // Our own prompt response never returns journaled — this
+                // job's end IS the turn's end. Drop any remoteTurn latch a
+                // post-job chunk set so running can't wedge on.
+                if (steerJob == coroutineContext[Job]) remoteTurn = false
+                refreshRunning()
             }
         }
     }
@@ -1521,14 +1656,22 @@ class SessionStore(
         }
         var cursor = 0
         for (match in SEND_MENTION_TOKEN.findAll(text)) {
+            // A hint-matched ref can swallow this token's start (a spaced
+            // path containing "@kind:") — it was consumed, not a mention.
+            if (match.range.first < cursor) continue
             // A mid-word `@` (emails, handles) is not a mention token.
             if (match.range.first > 0 && !text[match.range.first - 1].isWhitespace()) continue
             val kind = match.groupValues[1]
             val refStart = match.range.last + 1
             // A picker-inserted ref can hold spaces — a registered ref wins;
-            // a typed mention stays one whitespace-free word.
+            // a typed mention stays one whitespace-free word. The hint must
+            // end on a whitespace/EOL boundary or a stale hint would eat a
+            // longer typed token's tail (foo bar ← foo barista).
             val ref = mentionRefHints.asSequence()
-                .filter { text.startsWith(it, refStart) }
+                .filter {
+                    text.startsWith(it, refStart) &&
+                        text.getOrNull(refStart + it.length)?.isWhitespace() != false
+                }
                 .maxByOrNull { it.length }
                 ?: text.substring(refStart)
                     .takeWhile { !it.isWhitespace() }
@@ -1670,7 +1813,8 @@ class SessionStore(
 
     /** Populate the revert sheet's step list for this session. */
     fun loadRevertSteps() {
-        _revertSteps.value = null
+        // No eager null: while the sheet is open (list non-null) a
+        // stepsUpdated refresh swaps in place — nulling would unmount it.
         scope.launch {
             try {
                 _revertSteps.value = client.revertSteps(sessionId)
@@ -1703,6 +1847,32 @@ class SessionStore(
     } finally {
         _revertSteps.value = null
     }
+
+    /**
+     * `_cognition.ai/revert/preview` for the sheet's selected step (A7.5).
+     * [userMessageId] switches to the revertByUserMessageId target — the
+     * caller passes it only when the agent negotiated that capability.
+     * Throws: the sheet renders failure inline (non-fatal).
+     */
+    suspend fun revertPreview(stepId: String, userMessageId: String? = null): RevertPreview =
+        client.revertPreview(sessionId, stepId, userMessageId)
+
+    /**
+     * In-place revert (A7.5): `revert/execute` rewinds this session's
+     * history + workspace files. Null = failed (error row already
+     * appended); the caller reloads the transcript on success.
+     */
+    suspend fun revertExecute(stepId: String, userMessageId: String? = null): RevertExecuteResult? =
+        try {
+            client.revertExecute(sessionId, stepId, userMessageId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            append(Kind.Error, "回退失败: ${e.display()}")
+            null
+        } finally {
+            _revertSteps.value = null
+        }
 
     // ---- agent -> client requests -----------------------------------------------
 
@@ -1997,7 +2167,8 @@ class SessionStore(
     }
 
     private fun refreshRunning() {
-        val running = remoteTurn || promptJob?.isActive == true
+        val running = remoteTurn || promptJob?.isActive == true ||
+            steerJob?.isActive == true
         val was = _ui.value.running
         if (running == was) return
         if (!running) {

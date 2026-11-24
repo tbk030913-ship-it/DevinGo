@@ -137,7 +137,12 @@ fun ChatScreen(
     // the agent's detail sheet. Both keyed by session — a switch drops them.
     var subagentListOpen by remember(ui.sessionId) { mutableStateOf(false) }
     var detailSubagentId by remember(ui.sessionId) { mutableStateOf<String?>(null) }
-    val detailSubagent = subagents.firstOrNull { it.id == detailSubagentId }
+    // Match on the stable toolCallId too — the entry's `id` upgrades when a
+    // late frame names the wire agentId, and a sheet keyed on the old id
+    // mustn't detach mid-view.
+    val detailSubagent = subagents.firstOrNull {
+        it.id == detailSubagentId || it.toolCallId == detailSubagentId
+    }
 
     // Back returns to Home WITHOUT disconnecting — the session's store keeps
     // streaming and its row shows running/unread badges. An open sheet
@@ -277,6 +282,7 @@ fun ChatScreen(
                     onSavePlan = { vm.savePlanToWorkspace(planMarkdown(it.planEntries)) },
                     // A7.4: the turn-scoped cards; a row opens the detail sheet.
                     subagents = subagents,
+                    subagentActionsEnabled = ui.subagentSupported,
                     onSubagentOpen = { detailSubagentId = it.id },
                     onSubagentBackground = { vm.subagentBackground(it.id) },
                     onSubagentForeground = { vm.subagentForeground(it.id) },
@@ -311,8 +317,10 @@ fun ChatScreen(
                 onStop = vm::cancelTurn,
                 onOpenQueue = { queueSheet = true },
                 // A single agent skips the list — straight to its detail.
+                // The badge counts the wire's live figure, so branch only
+                // when both agree there's exactly one to open.
                 onOpenSubagents = {
-                    if (subagents.size == 1) {
+                    if (subagents.size == 1 && subagentCount == 1) {
                         detailSubagentId = subagents.first().id
                     } else {
                         subagentListOpen = true
@@ -419,7 +427,9 @@ fun ChatScreen(
         RevertSheet(
             steps = revertSteps.orEmpty(),
             onDismiss = vm::dismissRevertSteps,
-            onPick = vm::forkFromStep,
+            onFork = vm::forkFromStep,
+            onExecute = vm::revertExecute,
+            fetchPreview = vm::revertPreview,
         )
     }
     if (queueSheet) {
@@ -442,6 +452,7 @@ fun ChatScreen(
     if (subagentListOpen) {
         SubagentListSheet(
             subagents = subagents,
+            actionsEnabled = ui.subagentSupported,
             onOpen = { detailSubagentId = it.id },
             onBackground = { vm.subagentBackground(it.id) },
             onForeground = { vm.subagentForeground(it.id) },
@@ -450,13 +461,25 @@ fun ChatScreen(
         )
     }
     detailSubagent?.let { agent ->
+        // The live store flow wins while the child is attached; the
+        // session-list snapshot covers a child we've never opened (the
+        // flag can flip while this sheet is open either way).
+        val childPermFlow = remember(agent.childSessionId) {
+            agent.childSessionId?.let { vm.pendingPermissionFlowOf(it) }
+        }
+        val childPermLive = childPermFlow?.collectAsState()?.value
         SubagentDetailSheet(
             agent = agent,
             // Children surface as separate sessions — the hub routes their
             // `session/request_permission` to whoever subscribes them.
-            childPendingApproval = sessions.orEmpty()
-                .firstOrNull { it.sessionId == agent.childSessionId }
-                ?.pendingPermission == true,
+            childPendingApproval = if (childPermFlow != null) {
+                childPermLive != null
+            } else {
+                sessions.orEmpty()
+                    .firstOrNull { it.sessionId == agent.childSessionId }
+                    ?.pendingPermission == true
+            },
+            actionsEnabled = ui.subagentSupported,
             onBackground = { vm.subagentBackground(agent.id) },
             onForeground = { vm.subagentForeground(agent.id) },
             onCancel = { vm.subagentCancel(agent.id) },

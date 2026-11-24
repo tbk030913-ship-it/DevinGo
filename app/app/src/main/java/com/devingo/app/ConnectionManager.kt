@@ -100,6 +100,8 @@ class ConnectionManager private constructor(private val app: Application) {
          * session).
          */
         val revertSupported: Boolean = false,
+        /** Same contract as [revertSupported], for `_cognition.ai/subagent/…`. */
+        val subagentSupported: Boolean = false,
     )
 
     companion object {
@@ -239,6 +241,7 @@ class ConnectionManager private constructor(private val app: Application) {
     private val stores = java.util.concurrent.ConcurrentHashMap<String, SessionStore>()
     private val storeWatchJobs = mutableMapOf<String, Job>()
     private val reattachJobs = mutableMapOf<String, Job>()
+    private val reloadJobs = mutableMapOf<String, Job>()
     /** `_seq`s seen before their store existed (session/new result frames). */
     private val seqStash = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
@@ -428,6 +431,7 @@ class ConnectionManager private constructor(private val app: Application) {
                     // No cognition.ai echo at all → pre-negotiation
                     // counterpart: stay optimistic and let -32601 decide.
                     revertSupported = !caps.metaNegotiated || caps.revert,
+                    subagentSupported = !caps.metaNegotiated || caps.subagentSupport,
                 )
             }
             // Stores that outlived a dead socket (reconnect exhausted, or a
@@ -660,6 +664,10 @@ class ConnectionManager private constructor(private val app: Application) {
                 _conn.update { it.copy(revertSupported = false) }
                 _agentCaps.update { it.copy(revert = false) }
             },
+            onSubagentUnsupported = {
+                _conn.update { it.copy(subagentSupported = false) }
+                _agentCaps.update { it.copy(subagentSupport = false) }
+            },
             // Read at call time so a re-dialed host/token is picked up.
             workspaceFileWriter = { path, content ->
                 postBridgeFile(healthUrl(dialHost), lastToken, sessionId, path, content)
@@ -707,6 +715,7 @@ class ConnectionManager private constructor(private val app: Application) {
         val store = stores.remove(sessionId) ?: return
         storeWatchJobs.remove(sessionId)?.cancel()
         reattachJobs.remove(sessionId)?.cancel()
+        reloadJobs.remove(sessionId)?.cancel()
         if (gone) {
             scope.launch { cache.remove(sessionId) }
             scope.launch { runCatching { drafts.remove(sessionId) } }
@@ -754,6 +763,34 @@ class ConnectionManager private constructor(private val app: Application) {
                 throw e
             } catch (e: Exception) {
                 Log.w(TAG, "reattach ${store.sessionId}: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * A7.5: rebuild the transcript after a server-side history rewind
+     * (`revert/execute`, ours or a peer client's). The attach journal only
+     * appends, so a `session/load` replay is the only way to drop rows.
+     */
+    fun requestTranscriptReload(store: SessionStore) {
+        if (!socketLive) return
+        if (reloadJobs[store.sessionId]?.isActive == true) return
+        reloadJobs[store.sessionId] = scope.launch {
+            store.attachMutex.withLock {
+                store.beginReplay()
+                try {
+                    // session/load doesn't carry the turn state — keep the
+                    // one the store currently shows so a running turn
+                    // survives the rebuild.
+                    loadInto(store, store.ui.value.running)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "transcript reload ${store.sessionId}: ${e.message}")
+                } finally {
+                    store.endReplay()
+                    store.drainDeferred().forEach { route(it) }
+                }
             }
         }
     }
@@ -1102,6 +1139,8 @@ class ConnectionManager private constructor(private val app: Application) {
                             connected = true,
                             // Same stale-bridge fallback as ensureSocket.
                             revertSupported = !caps.metaNegotiated || caps.revert,
+                            subagentSupported = !caps.metaNegotiated ||
+                                caps.subagentSupport,
                         )
                     }
                     // Re-attach every store at its journal cursor — the
@@ -1314,6 +1353,8 @@ class ConnectionManager private constructor(private val app: Application) {
             // the replay itself just advanced the cursor — reacting to it
             // would loop attaches forever.
             is AcpEvent.SessionResync -> if (store.isLive(ev.seq)) reattach(store)
+            is AcpEvent.RevertHistoryRewound ->
+                if (store.isLive(ev.seq)) requestTranscriptReload(store)
             is AcpEvent.SessionDeleted -> dropStore(store.sessionId, gone = true)
             is AcpEvent.PermissionResolved -> store.resolvePeerRequest(e.requestId)
             else -> {

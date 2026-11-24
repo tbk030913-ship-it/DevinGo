@@ -6,8 +6,11 @@ import com.devingo.app.acp.AgentCaps
 import com.devingo.app.acp.FsSearchItem
 import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.MentionResource
+import com.devingo.app.acp.RevertPreview
+import com.devingo.app.acp.RevertStep
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -101,6 +104,7 @@ class ChatViewModel(
             running = sui.running,
             extraConfigOptions = sui.extraConfigOptions,
             revertSupported = conn.revertSupported,
+            subagentSupported = conn.subagentSupported,
         )
     }.stateIn(viewModelScope, SharingStarted.Eagerly, UiState())
 
@@ -116,7 +120,7 @@ class ChatViewModel(
     val queuedPrompts: StateFlow<List<QueuedPrompt>> = bound({ queuedPrompts }, emptyList())
     /** The queued prompt pulled into the composer for editing (U5.4). */
     val editingQueuedId: StateFlow<Long?> = bound({ editingQueuedId }, null)
-    val revertSteps: StateFlow<List<com.devingo.app.acp.RevertStep>?> = bound({ revertSteps }, null)
+    val revertSteps: StateFlow<List<RevertStep>?> = bound({ revertSteps }, null)
     val turnTimes: StateFlow<Map<Long, TurnTiming>> = bound({ turnTimes }, emptyMap())
     val draft: StateFlow<String> = bound({ draft }, "")
     val draftAttachments: StateFlow<List<ImageAttachment>> = bound({ draftAttachments }, emptyList())
@@ -292,6 +296,14 @@ class ChatViewModel(
     fun pendingPermissionOf(sessionId: String): PendingPermission? =
         cm.storeFor(sessionId)?.pendingPermission?.value
 
+    /**
+     * Live pending-permission flow of any attached session — the subagent
+     * detail sheet's child-approval notice must follow the child's own
+     * flag, not the (stale) session-list snapshot (A7.4).
+     */
+    fun pendingPermissionFlowOf(sessionId: String): StateFlow<PendingPermission?>? =
+        cm.storeFor(sessionId)?.pendingPermission
+
     fun resolvePermissionFor(sessionId: String, optionId: String?) {
         cm.storeFor(sessionId)?.resolvePermission(optionId)
     }
@@ -309,11 +321,44 @@ class ChatViewModel(
         store?.dismissRevertSteps()
     }
 
-    /** Fork off [stepId] on the bound session, then open the new session. */
-    fun forkFromStep(stepId: String) {
+    /** Fork off [step] on the bound session, then open the new session. */
+    fun forkFromStep(step: RevertStep) {
         val s = store ?: return
         cm.scope.launch {
-            s.forkFromStep(stepId)?.let { cm.openSession(it, s.cwd) }
+            s.forkFromStep(step.stepId)?.let { cm.openSession(it, s.cwd) }
+        }
+    }
+
+    /**
+     * A7.5: the revert target for "回退到这条消息" — devin's untagged
+     * RevertTarget prefers `userMessageId` once negotiated.
+     */
+    private fun revertMsgTarget(step: RevertStep): String? =
+        step.userMessageId?.takeIf { agentCaps.value.revertByUserMessageId }
+
+    /** Preview fetch for the sheet — null means failed (non-fatal there). */
+    suspend fun revertPreview(step: RevertStep): RevertPreview? {
+        val s = store ?: return null
+        return try {
+            s.revertPreview(step.stepId, revertMsgTarget(step))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * In-place revert on the bound session: rewinds history + files, then
+     * rebuilds the transcript via `session/load` (a forked answer opens it).
+     */
+    fun revertExecute(step: RevertStep) {
+        val s = store ?: return
+        cm.scope.launch {
+            s.revertExecute(step.stepId, revertMsgTarget(step))?.let { res ->
+                res.forkedSessionId?.let { cm.openSession(it, s.cwd) }
+                    ?: cm.requestTranscriptReload(s)
+            }
         }
     }
 

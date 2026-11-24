@@ -292,6 +292,36 @@ data class RevertStep(
     val summary: String? = null,
     val kind: String? = null,
     val userMessageId: String? = null,
+    val stepNumber: Int? = null,
+)
+
+/**
+ * `_cognition.ai/revert/preview` — one file the revert would roll back.
+ * Devin's payload nests the counters under `diffStats`; the action kind is
+ * `restore`/`delete`/`recreate` (internally-tagged FileRevertKindPayload).
+ */
+data class RevertPreviewFile(
+    val path: String,
+    val action: String? = null,
+    val additions: Int = 0,
+    val deletions: Int = 0,
+)
+
+/** `_cognition.ai/revert/preview` result (loose decode — keys vary). */
+data class RevertPreview(
+    val files: List<RevertPreviewFile> = emptyList(),
+    /** `irreversibleWarnings` — changes the engine can't undo (flattened). */
+    val warnings: List<String> = emptyList(),
+    /** `conflicts` — files whose content drifted from the recorded hash. */
+    val conflicts: List<String> = emptyList(),
+)
+
+/** `_cognition.ai/revert/execute` result (loose decode). */
+data class RevertExecuteResult(
+    /** `revertHistoryRewound` — history was truncated in place. */
+    val historyRewound: Boolean,
+    /** Present when the agent answered the revert by forking instead. */
+    val forkedSessionId: String? = null,
 )
 
 // Agent -> client
@@ -387,6 +417,8 @@ object AcpMethods {
     const val REVERT_PREVIEW = "_cognition.ai/revert/preview"
     const val REVERT_EXECUTE = "_cognition.ai/revert/execute"
     const val REVERT_STEPS_UPDATED = "_cognition.ai/revert/stepsUpdated"
+    /** Agent->client: history was rewound by a (peer or local) in-place revert. */
+    const val REVERT_HISTORY_REWOUND = "_cognition.ai/revert/historyRewound"
 }
 
 // JSON-RPC error code used by ACP when the agent requires authenticate first.

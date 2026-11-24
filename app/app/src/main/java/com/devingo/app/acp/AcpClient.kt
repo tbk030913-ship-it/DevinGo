@@ -79,6 +79,12 @@ interface AcpEvent {
     data class CompactionUpdate(val status: String) : AcpEvent
     /** `_cognition.ai/revert/stepsUpdated` — the revert step list changed. */
     data class RevertStepsUpdated(val params: JsonObject) : AcpEvent
+    /**
+     * `_cognition.ai/revert/historyRewound` — an in-place revert truncated
+     * the session's history (ours or a peer client's). The transcript must
+     * be rebuilt by `session/load`; the attach journal can't un-append.
+     */
+    data class RevertHistoryRewound(val firstRemovedUserMessageId: String? = null) : AcpEvent
     data class AgentLog(val channel: String, val message: String, val level: String) : AcpEvent
     data class Failure(val message: String) : AcpEvent
     /** Socket dropped; [reason] is the close/failure detail shown to the user. */
@@ -124,6 +130,24 @@ interface AcpEvent {
      * `_meta` (params- or update-level).
      */
     data class SubagentCount(val count: Int) : AcpEvent
+    /**
+     * A descendant-agent frame multiplexed onto this stream — `_meta`
+     * `subagent_context.parentAgentId` names the owning agent's session id
+     * (t3 devinAcp reroutes these to that agent). [text] folds into the
+     * matching subagent's live output: [newLine] separates line items
+     * (tool summaries) from streamed text (message/thought chunks).
+     */
+    data class SubagentCtxFrame(
+        val agentId: String,
+        val text: String,
+        val newLine: Boolean,
+    ) : AcpEvent
+    /**
+     * `tool_call_content_chunk` — Devin streams tool output in pieces
+     * (t3's registry fixtures). The store appends it to the row's detail,
+     * unlike [ToolCallUpdate] which replaces.
+     */
+    data class ToolContentChunk(val call: ToolCallInfo) : AcpEvent
 }
 
 /**
@@ -370,9 +394,6 @@ class AcpClient(
         return result.copy(sessionId = result.sessionId.ifEmpty { id })
     }
 
-    suspend fun prompt(sessionId: String, text: String): PromptResult =
-        promptBlocks(sessionId, listOf(ContentBlock(type = "text", text = text)))
-
     /**
      * Prompt with arbitrary content blocks — text, image/audio
      * (`data`+`mimeType`), resource links (`uri`+`name`), …
@@ -532,6 +553,7 @@ class AcpClient(
                 summary = o.strField("summary", "title", "description", "label"),
                 kind = o.strField("kind", "type"),
                 userMessageId = o.strField("userMessageId"),
+                stepNumber = o.intField("stepNumber"),
             )
         }
     }
@@ -546,6 +568,100 @@ class AcpClient(
     ).let {
         val r = (it["result"] as? JsonObject) ?: it
         r.strField("sessionId", "newSessionId", "forkedSessionId")
+    }
+
+    /**
+     * Revert-target params shared by preview/execute: the binary's
+     * untagged `RevertTarget` union deserializes `{stepId}` |
+     * `{userMessageId}` | `{targetNodeId}` flat next to `sessionId`.
+     * A non-null [userMessageId] picks the revertByUserMessageId surface.
+     */
+    private fun revertTargetParams(
+        sessionId: String,
+        stepId: String,
+        userMessageId: String?,
+    ) = buildJsonObject {
+        put("sessionId", sessionId)
+        if (userMessageId != null) put("userMessageId", userMessageId)
+        else put("stepId", stepId)
+    }
+
+    /**
+     * `_cognition.ai/revert/preview` — which file changes reverting to
+     * [stepId] would roll back (`fileActions`/`conflicts`/`irreversibleWarnings`
+     * on the wire). Decoded loosely like the other revert payloads.
+     */
+    suspend fun revertPreview(
+        sessionId: String,
+        stepId: String,
+        userMessageId: String? = null,
+    ): RevertPreview {
+        val result = request(
+            AcpMethods.REVERT_PREVIEW,
+            revertTargetParams(sessionId, stepId, userMessageId),
+        ).let { (it["result"] as? JsonObject) ?: it }
+        val files = listOf("fileActions", "files", "changes", "fileChanges")
+            .firstNotNullOfOrNull { result[it] as? JsonArray }
+            .orEmpty()
+            .mapNotNull { el ->
+                val o = el as? JsonObject ?: return@mapNotNull null
+                val path = o.strField("path", "filePath", "file", "relPath", "filename", "name")
+                    ?: return@mapNotNull null
+                val stats = o["diffStats"] as? JsonObject
+                RevertPreviewFile(
+                    path = path,
+                    action = o.strField("kind", "type", "action", "status"),
+                    additions = stats?.intField("insertions", "additions", "added", "addedLines")
+                        ?: o.intField("insertions", "additions", "added", "addedLines", "linesAdded")
+                        ?: 0,
+                    deletions = stats?.intField("deletions", "removed", "removedLines")
+                        ?: o.intField("deletions", "removed", "removedLines", "linesRemoved")
+                        ?: 0,
+                )
+            }
+        val warnings = (result["irreversibleWarnings"] as? JsonArray)
+            .orEmpty()
+            .mapNotNull { el ->
+                (el as? JsonPrimitive)?.takeIf { it.isString }?.content
+                    ?: (el as? JsonObject)?.let {
+                        it.strField("message", "warning", "text")
+                            ?: it.strField("path", "filePath", "file")
+                    }
+            }
+        val conflicts = (result["conflicts"] as? JsonArray)
+            .orEmpty()
+            .mapNotNull { el ->
+                (el as? JsonObject)?.strField("path", "filePath", "file", "relPath", "name")
+                    ?: (el as? JsonPrimitive)?.takeIf { it.isString }?.content
+            }
+        return RevertPreview(files, warnings, conflicts)
+    }
+
+    /**
+     * `_cognition.ai/revert/execute` — in-place revert: rewinds the
+     * conversation AND the workspace files. Slow (walks the undo records),
+     * so it gets the 2-minute budget. The agent may answer with a forked
+     * session instead (rare) — surfaced via [RevertExecuteResult].
+     */
+    suspend fun revertExecute(
+        sessionId: String,
+        stepId: String,
+        userMessageId: String? = null,
+    ): RevertExecuteResult {
+        val frame = request(
+            AcpMethods.REVERT_EXECUTE,
+            revertTargetParams(sessionId, stepId, userMessageId),
+            timeoutMs = 120_000,
+        )
+        val r = (frame["result"] as? JsonObject) ?: frame
+        val meta = r["_meta"] as? JsonObject
+        return RevertExecuteResult(
+            historyRewound = r.boolField("revertHistoryRewound") == true ||
+                r.boolField("historyRewound") == true ||
+                meta?.boolField("cognition.ai/revertHistoryRewound") == true,
+            forkedSessionId = r.strField("forkedSessionId", "newSessionId", "sessionId")
+                ?.takeIf { it.isNotBlank() && it != sessionId },
+        )
     }
 
     /** Probe of Devin's `_cognition.ai/session/rename`; failures surface as AcpException. */
@@ -843,8 +959,17 @@ class AcpClient(
                     emit(sessionId, seq, AcpEvent.CompactionUpdate(status))
                 }
             }
-            AcpMethods.REVERT_STEPS_UPDATED ->
+            AcpMethods.REVERT_STEPS_UPDATED, "cognition.ai/revert/stepsUpdated" ->
                 emit(sessionId, seq, AcpEvent.RevertStepsUpdated(p))
+            // Devin registers these under `cognition.ai/*`; both spellings
+            // reach the wire — the frontend listens on the underscored one.
+            AcpMethods.REVERT_HISTORY_REWOUND, "cognition.ai/revert/historyRewound" ->
+                emit(
+                    sessionId, seq,
+                    AcpEvent.RevertHistoryRewound(
+                        (p["firstRemovedUserMessageId"] as? JsonPrimitive)?.textOrNull,
+                    ),
+                )
             // _cognition.ai/mcp/serversChanged and other extensions: ignore.
         }
     }
@@ -858,7 +983,39 @@ class AcpClient(
         if (numLiveSubagents != null) {
             emit(sessionId, seq, AcpEvent.SubagentCount(numLiveSubagents))
         }
-        when (val kind = update["sessionUpdate"]?.jsonPrimitive?.textOrNull) {
+        val kind = update["sessionUpdate"]?.jsonPrimitive?.textOrNull
+        // Devin multiplexes descendant-agent frames onto the root stream,
+        // tagged `subagent_context.parentAgentId` = the owning agent's
+        // session id ("root" = this session itself). t3's devinAcp reroutes
+        // them to that agent — the store folds them into the matching
+        // subagent's output instead of rendering duplicate parent rows.
+        val ctxId = ((update["_meta"] as? JsonObject)
+            ?.get("cognition.ai/subagent_context") as? JsonObject)
+            ?.get("parentAgentId")?.jsonPrimitive?.textOrNull
+            ?.takeIf { it.isNotBlank() && it != "root" && it != sessionId }
+        if (ctxId != null) {
+            val ctxText = when (kind) {
+                "tool_call", "tool_call_update" ->
+                    runCatching {
+                        json.decodeFromJsonElement<ToolCallInfo>(update)
+                    }.getOrNull()?.let {
+                        val t = it.title ?: it.kind ?: "tool call"
+                        it.status?.let { s -> "$t · $s" } ?: t
+                    }
+                else -> update.textOfContent()
+            }
+            if (ctxText != null) {
+                emit(
+                    sessionId, seq,
+                    AcpEvent.SubagentCtxFrame(
+                        ctxId, ctxText,
+                        newLine = kind == "tool_call" || kind == "tool_call_update",
+                    ),
+                )
+            }
+            return
+        }
+        when (kind) {
             "agent_message_chunk" -> update.textOfContent()?.let {
                 emit(sessionId, seq, AcpEvent.AgentChunk(it))
             }
@@ -902,6 +1059,15 @@ class AcpClient(
                         if (kind == "tool_call") AcpEvent.ToolCall(info)
                         else AcpEvent.ToolCallUpdate(info),
                     )
+                }
+            }
+            "tool_call_content_chunk" -> {
+                // Devin streams tool output as chunks — the store appends
+                // them to the row's detail rather than replacing it.
+                runCatching {
+                    json.decodeFromJsonElement<ToolCallInfo>(update)
+                }.getOrNull()?.let {
+                    emit(sessionId, seq, AcpEvent.ToolContentChunk(it))
                 }
             }
             "plan" -> {
@@ -967,23 +1133,35 @@ class AcpClient(
             ?: (this["content"] as? JsonPrimitive)?.textOrNull
 
     /**
-     * A `tool_call` carrying a Devin subagent (A7.4): kind `subagent`/`task`,
-     * `cognition.ai/inferenceToolName` naming a task spawner (Devin's tool
-     * names ride _meta, like `exec`/`kill_shell` do), or `_meta` with
-     * `cognition.ai/childSessionUrl` / `sharedSubagentId` / `childSessionId`.
+     * A `tool_call` carrying a Devin subagent (A7.4). The documented wire
+     * shape (t3's `devinAcp.ts`) marks the spawn/completion as OBJECTS on
+     * `_meta` — `cognition.ai/subagent_started` / `subagent_completed`.
+     * Below that: kind `subagent`/`task`, `inferenceToolName` naming a task
+     * spawner, or a flat child-session key (unverified — kept as a
+     * fallback for other devin builds).
      */
     private fun isSubagentCall(call: ToolCallInfo): Boolean {
+        val meta = call._meta
+        if (meta?.get("cognition.ai/subagent_started") is JsonObject ||
+            meta?.get("cognition.ai/subagent_completed") is JsonObject
+        ) {
+            return true
+        }
         if (call.kind == "subagent" || call.kind == "task") return true
-        val meta = call._meta ?: return false
-        if (meta["cognition.ai/childSessionUrl"] != null ||
-            meta["cognition.ai/sharedSubagentId"] != null ||
-            meta["cognition.ai/childSessionId"] != null
+        if (meta == null) return false
+        if (meta.metaPresent("cognition.ai/childSessionUrl") ||
+            meta.metaPresent("cognition.ai/sharedSubagentId") ||
+            meta.metaPresent("cognition.ai/childSessionId")
         ) {
             return true
         }
         return (meta["cognition.ai/inferenceToolName"] as? JsonPrimitive)
             ?.textOrNull in SUBAGENT_TOOL_NAMES
     }
+
+    /** Present and not `JsonNull` — `"k": null` mustn't classify a call. */
+    private fun JsonObject.metaPresent(key: String): Boolean =
+        this[key].let { it != null && it !is JsonNull }
 
     /** Loose int read on a `_meta` object: number literal or numeric string. */
     private fun metaInt(meta: JsonElement?, key: String): Int? =
@@ -1042,6 +1220,13 @@ internal fun JsonObject.strField(vararg keys: String): String? =
 
 internal fun JsonObject.boolField(key: String): Boolean? =
     (this[key] as? JsonPrimitive)?.content?.toBooleanStrictOrNull()
+
+/** First matching key as an int — numeric literal or float (truncated). */
+internal fun JsonObject.intField(vararg keys: String): Int? =
+    keys.firstNotNullOfOrNull { k ->
+        (this[k] as? JsonPrimitive)
+            ?.let { it.longOrNull?.toInt() ?: it.doubleOrNull?.toInt() }
+    }
 
 internal fun JsonObject.longField(key: String): Long? =
     (this[key] as? JsonPrimitive)?.let { it.longOrNull ?: it.doubleOrNull?.toLong() }
