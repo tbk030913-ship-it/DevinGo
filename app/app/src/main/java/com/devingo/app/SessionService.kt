@@ -74,9 +74,11 @@ class SessionService : Service() {
                     pendingCount = intent.getIntExtra(EXTRA_PENDING_COUNT, 0),
                 )
                 lastActivity = readActivity(intent)
-                scheduleIdleRepost()
             }
         }
+        // Rearm on every redelivery — a sticky restart with a surviving
+        // terminal lastStatus still needs the timeout repost.
+        scheduleIdleRepost()
         // null intent = START_STICKY restart: repost whatever we last knew.
         startForegroundWithType(buildNotification())
         return START_STICKY
@@ -369,7 +371,14 @@ class SessionService : Service() {
 
         fun start(context: Context, title: String?) {
             fallbackTitle = title
-            context.startForegroundService(Intent(context, SessionService::class.java))
+            // Starting a service from the background throws — a stopped
+            // activity's collectors can still push. Skip silently; the next
+            // foreground pass re-pushes (FGS presence also exempts this).
+            runCatching {
+                context.startForegroundService(
+                    Intent(context, SessionService::class.java),
+                )
+            }
         }
 
         /**
@@ -382,7 +391,7 @@ class SessionService : Service() {
             val status = snapshot.hero
             lastStatus = status
             lastActivity = snapshot.extras.takeIf { it.isNotEmpty() }
-            context.startService(
+            runCatching { context.startService(
                 Intent(context, SessionService::class.java)
                     .setAction(ACTION_UPDATE)
                     .putExtra(EXTRA_STATE, status.state.name)
@@ -399,16 +408,18 @@ class SessionService : Service() {
                     .apply {
                         snapshot.extras.forEach { (k, v) -> putExtra(k, v) }
                     },
-            )
+            ) }
         }
 
         fun stop(context: Context) {
             lastStatus = null
             lastActivity = null
-            context.startService(
-                Intent(context, SessionService::class.java)
-                    .setAction(ACTION_STOP),
-            )
+            runCatching {
+                context.startService(
+                    Intent(context, SessionService::class.java)
+                        .setAction(ACTION_STOP),
+                )
+            }
         }
     }
 }
