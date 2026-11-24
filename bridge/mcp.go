@@ -591,6 +591,9 @@ func mcpAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		writeCliError(w, errCliArg)
 		return
 	}
+	// The manual flow reads one line — a multi-line paste must not smuggle
+	// extra input lines into the parked login's stdin.
+	pasted, _, _ = strings.Cut(pasted, "\n")
 	// Manual-token flow first: a pending login for this server owns stdin.
 	mcpLoginsMu.Lock()
 	l := mcpLogins[req.Name]
