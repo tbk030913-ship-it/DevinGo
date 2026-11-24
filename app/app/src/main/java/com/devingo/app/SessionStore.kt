@@ -389,6 +389,8 @@ class SessionStore(
     private var planItemId: Long? = null
     private var promptJob: Job? = null
     private var steerJob: Job? = null
+    private var cancelWatch: Job? = null
+    private var watchedJob: Job? = null
     /** A remote client's turn observed streaming (no local promptJob). */
     private var remoteTurn = false
     /**
@@ -2200,8 +2202,13 @@ class SessionStore(
         runCatching { client.cancel(sessionId) }
         // Watchdog: if the agent never answers session/cancel, the prompt
         // request would hang and `running` would stay true forever.
+        // Idempotent — composer, capsule and elicitation stops all land
+        // here; a second tap while one watchdog is armed must not arm a
+        // twin (both would append 本轮已强制结束).
         val job = promptJob ?: return
-        scope.launch {
+        if (cancelWatch?.isActive == true && watchedJob === job) return
+        watchedJob = job
+        cancelWatch = scope.launch {
             delay(CANCEL_WATCHDOG_MS)
             if (promptJob === job && job.isActive) {
                 job.cancel()

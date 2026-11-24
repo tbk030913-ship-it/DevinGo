@@ -163,7 +163,7 @@ private fun truncate(text: String, maxLength: Int): String {
  * The Devin transcript: reverseLayout LazyColumn fed bottom-to-top —
  * status line first, then each turn's WorkRow, body items (reversed) and
  * user bubble. Rows never displace each other (placementSpec = null); the
- * only entry motion is the 220ms fade/rise on <2s-fresh messages (U5.2).
+ * only entry motion is the 220ms fade/rise on fresh messages (U5.2).
  */
 @Composable
 internal fun Transcript(
@@ -265,7 +265,7 @@ internal fun Transcript(
                         // appear instantly. Placement stays off (B5).
                         fadeInSpec = null,
                         placementSpec = null,
-                        fadeOutSpec = tween(120),
+                        fadeOutSpec = tween(FADE_OUT_MS),
                     )
                     .fillMaxWidth(),
                 contentAlignment = Alignment.TopCenter,
@@ -515,16 +515,19 @@ private fun WorkRow(
         }
     }
     // t3code liveToolActivitySummary: the label IS the current activity —
-    // the in-progress tool's action verbatim; between tools the agent is
-    // never "idle", so fall through to thinking/replying instead of a
-    // blank line (a missing row reads as frozen).
+    // the in-progress tool's action verbatim. Between tools the row must
+    // never blank (t3 labels latestActivity regardless of status): a
+    // streaming reply reads 回复中, anything else 思考中 — a missing line
+    // reads as frozen. Note Agent items live in turn.body, not turn.work.
     val lastTool = items.lastOrNull {
         it.kind == Kind.Tool && it.status == "in_progress"
     }
-    val currentStep = lastTool?.text?.takeIf { it.isNotBlank() }
-        ?: if (live && (items.any { it.kind == Kind.Thought } ||
-                items.lastOrNull()?.kind == Kind.Agent || items.isEmpty())
-        ) "思考中" else null
+    val toolStep = lastTool?.text?.takeIf { it.isNotBlank() }
+    val isExec = toolStep != null && lastTool?.toolKind == "execute"
+    val currentStep = toolStep
+        ?: if (!live) null
+        else if (turn.body.lastOrNull()?.kind == Kind.Agent) "回复中"
+        else "思考中"
 
     // t3code's exposed thought: the newest non-empty reasoning, flattened
     // to one compacted line — while the turn is live, and afterwards while
@@ -641,7 +644,8 @@ private fun WorkRow(
                     Text(
                         // t3code "Worked for Xs · N steps" — both when known.
                         timing?.durationSec?.let {
-                            workDurationLabel(it) + " · ${items.size} 步"
+                            workDurationLabel(it) +
+                                if (items.isNotEmpty()) " · ${items.size} 步" else ""
                         } ?: "查看过程 · ${items.size} 步",
                         style = MaterialTheme.typography.labelLarge,
                         color = cs.onSurfaceVariant,
@@ -663,20 +667,26 @@ private fun WorkRow(
                 TurnDiffStatPill(diffAdd = diffAdd, diffDel = diffDel, onClick = onShowDiff)
             }
         }
-        if (live && currentStep != null) {
-            val isExec = lastTool?.toolKind == "execute"
+        // Settle edge fades the activity line out instead of popping the
+        // row's height (same token timing as every other swap here).
+        AnimatedVisibility(
+            visible = live && currentStep != null,
+            enter = fadeIn(tween(FADE_IN_MS)),
+            exit = fadeOut(tween(FADE_OUT_MS)),
+        ) {
+            val step = currentStep ?: return@AnimatedVisibility
             AnimatedContent(
-                targetState = currentStep,
+                targetState = step,
                 transitionSpec = {
                     fadeIn(tween(FADE_IN_MS)) togetherWith fadeOut(tween(FADE_OUT_MS))
                 },
                 label = "workStep",
-            ) { step ->
+            ) { s ->
                 Text(
                     // The activity line IS the live label (t3code's
                     // collapsed tool-group row): same weight as the header,
                     // the sweep makes liveness legible without a tap.
-                    step,
+                    s,
                     style = (if (isExec) monoText(MaterialTheme.typography.labelLarge)
                     else MaterialTheme.typography.labelLarge),
                     color = cs.onSurfaceVariant,
@@ -779,7 +789,7 @@ private val ENTRY_RISE = 25.dp
 
 /**
  * t3code's isFreshTimestamp + entering animation (ThreadFeed): items under
- * 2s old — and never replayed history — get a 220ms fade; the user bubble
+ * FRESH_ENTRY_WINDOW_MS old — and never replayed history — get a 220ms fade; the user bubble
  * also rises ENTRY_RISE like RN's FadeInDown. Replays, streaming growth
  * and remounts past the window compose already at rest: zero animation.
  */
@@ -797,7 +807,7 @@ private fun FreshEntry(
         if (animate) {
             progress.animateTo(1f, tween(ENTRY_ANIM_MS))
         } else {
-            // The 2s window can lapse mid-fade — never park partially faded.
+            // The freshness window can lapse mid-fade — never park partially faded.
             progress.snapTo(1f)
         }
     }
@@ -904,7 +914,7 @@ private fun AgentText(
         // already-settled renders it instantly (no replayed animation).
         AnimatedVisibility(
             visible = meta != null,
-            enter = fadeIn(tween(180)),
+            enter = fadeIn(tween(FADE_IN_MS)),
         ) {
             meta?.invoke()
         }

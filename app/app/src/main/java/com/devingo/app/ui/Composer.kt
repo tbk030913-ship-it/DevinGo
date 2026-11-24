@@ -261,6 +261,26 @@ internal fun Composer(
         else -> SendState.Disabled
     }
 
+    // t3code "Stopping" affordance: after the tap the stop button greys and
+    // goes inert until the turn actually drops (running → false) or a 10s
+    // cap returns it. Hoisted here (keyed by session) because the two
+    // ComposerSendArea layers swap on focus — a per-layer flag would
+    // re-arm Stop mid-cancel and leak into the next session.
+    var stopping by remember(ui.sessionId) { mutableStateOf(false) }
+    LaunchedEffect(ui.running) {
+        if (!ui.running) stopping = false
+    }
+    LaunchedEffect(stopping) {
+        if (stopping) {
+            kotlinx.coroutines.delay(10_000)
+            stopping = false
+        }
+    }
+    val onStopTap = {
+        stopping = true
+        onStop()
+    }
+
     // Expanded layer: focused (the user's own expansion), multi-line input,
     // an over-long single line, or attachments/citation needing the strip.
     var focused by remember(ui.sessionId) { mutableStateOf(false) }
@@ -485,7 +505,8 @@ internal fun Composer(
                             onSendMenuChange = { sendMenu = it },
                             onSend = onSend,
                             onSteer = onSteer,
-                            onStop = onStop,
+                            stopping = stopping,
+                            onStop = onStopTap,
                         )
                     }
                 }
@@ -574,7 +595,8 @@ internal fun Composer(
                                 onSendMenuChange = { sendMenu = it },
                                 onSend = onSend,
                                 onSteer = onSteer,
-                                onStop = onStop,
+                                stopping = stopping,
+                                onStop = onStopTap,
                             )
                         },
                     )
@@ -711,23 +733,11 @@ private fun ComposerSendArea(
     onSendMenuChange: (Boolean) -> Unit,
     onSend: () -> Unit,
     onSteer: () -> Unit,
+    /** Cancel tap latched parent-side — greys/inerts until the turn drops. */
+    stopping: Boolean,
     onStop: () -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
-    // t3code "Stopping" affordance: after the tap the stop button greys and
-    // goes inert until the turn actually drops (running → false) or a 10s
-    // cap returns it — cancel can't be double-fired and dead-stop reads as
-    // an action, not a broken button.
-    var stopping by remember { mutableStateOf(false) }
-    LaunchedEffect(running) {
-        if (!running) stopping = false
-    }
-    LaunchedEffect(stopping) {
-        if (stopping) {
-            kotlinx.coroutines.delay(10_000)
-            stopping = false
-        }
-    }
     // Trailing black circle: 48dp touch box around a 36dp visual.
     Box(
         Modifier
@@ -739,10 +749,7 @@ private fun ComposerSendArea(
             onClick = {
                 when (sendState) {
                     SendState.Disabled -> Unit
-                    SendState.Stop -> {
-                        stopping = true
-                        onStop()
-                    }
+                    SendState.Stop -> onStop()
                     SendState.Send -> when {
                         queueEditing -> onSend()
                         running && !shellCommand -> onSendMenuChange(true)
