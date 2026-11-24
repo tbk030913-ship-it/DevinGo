@@ -77,3 +77,4 @@
 2026-11-24 17:52（北京时间）| 断连根因+修复：电池白名单豁免的是doze网络限制而非CPU休眠——FGS保进程不保CPU，息屏后OkHttp ping定时器停摆、bridge 25s+10s看门狗判半开踢连，唤醒即EOFException；SessionService运行期持PARTIAL_WAKE_LOCK+WIFI_MODE_FULL_HIGH_PERF让心跳穿越doze（ACTION_STOP/onTimeout/onDestroy释放），manifest补WAKE_LOCK；滑出任务栏强杀属冷启动必然重连（attach+补齐兜底）
 2026-11-24 19:13 | transport 横幅（恢复/断连/进程退出）渲染到回合边缘：ChatItem.transport 标记 + buildTranscriptModel 双趟发射，过程组不再被横幅推离回复；缓存持久化 + 单测
 2026-11-24 20:01 | fix stuck-running (turnEnded+turnEpoch gate), reqMethod-tagged turn ends, peer-turn done push, capsule stop icon + step count, Done card elapsed
+2026-11-24 21:10 | 发版 v0.2.1：配置签名 Secrets + 修 platform 包名(android-37.0)，CI Release 工作流出包
