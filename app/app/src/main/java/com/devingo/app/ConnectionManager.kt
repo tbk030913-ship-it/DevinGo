@@ -424,7 +424,9 @@ class ConnectionManager private constructor(private val app: Application) {
                     statusText = "",
                     agentTitle = init.agentInfo?.title ?: init.agentInfo?.name,
                     connected = true,
-                    revertSupported = caps.revert,
+                    // No cognition.ai echo at all → pre-negotiation
+                    // counterpart: stay optimistic and let -32601 decide.
+                    revertSupported = !caps.metaNegotiated || caps.revert,
                 )
             }
             // Stores that outlived a dead socket (reconnect exhausted, or a
@@ -655,6 +657,7 @@ class ConnectionManager private constructor(private val app: Application) {
             onSessionReady = { sid, c -> onSessionReady?.invoke(sid, c) },
             onRevertUnsupported = {
                 _conn.update { it.copy(revertSupported = false) }
+                _agentCaps.update { it.copy(revert = false) }
             },
             // Read at call time so a re-dialed host/token is picked up.
             workspaceFileWriter = { path, content ->
@@ -960,6 +963,7 @@ class ConnectionManager private constructor(private val app: Application) {
         pendingOpen = null
         dropEpoch()
         _conn.value = ConnState()
+        _agentCaps.value = AgentCaps()
     }
 
     private fun onSocketDropped(reason: String) {
@@ -1047,9 +1051,6 @@ class ConnectionManager private constructor(private val app: Application) {
                     socketLive = true
                     val caps = AgentCaps.from(init)
                     _agentCaps.value = caps
-                    // Re-attach every store at its journal cursor — the
-                    // replayed gap lands as ordinary events.
-                    reattachStores()
                     _conn.update {
                         it.copy(
                             phase = if (_currentStore.value != null) Phase.Ready else it.phase,
@@ -1058,9 +1059,13 @@ class ConnectionManager private constructor(private val app: Application) {
                             reconnecting = false,
                             reconnectRetryAtMs = null,
                             connected = true,
-                            revertSupported = caps.revert,
+                            // Same stale-bridge fallback as ensureSocket.
+                            revertSupported = !caps.metaNegotiated || caps.revert,
                         )
                     }
+                    // Re-attach every store at its journal cursor — the
+                    // replayed gap lands as ordinary events.
+                    reattachStores()
                     refreshSessions()
                     return@launch
                 } catch (e: CancellationException) {

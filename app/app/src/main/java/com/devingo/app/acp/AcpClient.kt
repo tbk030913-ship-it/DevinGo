@@ -1,6 +1,7 @@
 package com.devingo.app.acp
 
 import android.util.Log
+import com.devingo.app.BuildConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -301,7 +302,7 @@ class AcpClient(
                     elicitation = JsonObject(emptyMap()),
                     _meta = CLIENT_CAPS_META,
                 ),
-                clientInfo = ClientInfo("DevinGo", "0.2.0"),
+                clientInfo = ClientInfo("DevinGo", BuildConfig.VERSION_NAME),
                 // Kept from the pre-negotiation declaration — devin still
                 // honors the top-level revert flag.
                 _meta = buildJsonObject { put("cognition.ai/revert", true) },
@@ -879,6 +880,12 @@ class AcpClient(
         /**
          * The `clientCapabilities._meta` declaration that unlocks devin's
          * full `agentCapabilities._meta` echo — parsed into [AgentCaps].
+         *
+         * Through the gateway this never reaches devin (the hub answers
+         * client `initialize` from its cached handshake), so the functional
+         * declaration lives in `gatewayInitParams` (bridge/hub.go) — keep
+         * both in sync; this stays for spec parity when no gateway sits
+         * in between.
          */
         private val CLIENT_CAPS_META = buildJsonObject {
             put("cognition.ai/revert", true)
@@ -900,9 +907,7 @@ internal fun JsonObject.strField(vararg keys: String): String? =
     }
 
 internal fun JsonObject.boolField(key: String): Boolean? =
-    (this[key] as? JsonPrimitive)?.let {
-        if (it.isString) it.content.toBooleanStrictOrNull() else it.content.toBooleanStrictOrNull()
-    }
+    (this[key] as? JsonPrimitive)?.content?.toBooleanStrictOrNull()
 
 internal fun JsonObject.longField(key: String): Long? =
     (this[key] as? JsonPrimitive)?.let { it.longOrNull ?: it.doubleOrNull?.toLong() }

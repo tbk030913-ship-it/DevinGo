@@ -42,6 +42,14 @@ data class AgentCaps(
     val sessionListOrderBy: List<String> = emptyList(),
     /** Path of the agent's MCP config file — from the result's own `_meta`. */
     val mcpConfigPath: String? = null,
+    /**
+     * True when `agentCapabilities._meta` carried at least one
+     * `cognition.ai/` key — i.e. the agent honored the negotiation
+     * protocol, so a missing flag is authoritative-false. When false the
+     * counterpart never saw the declaration (stale bridge/old devin) and
+     * callers should fall back to optimistic probing.
+     */
+    val metaNegotiated: Boolean = false,
     /** The raw `agentCapabilities` object — future flags read through here. */
     val raw: JsonObject? = null,
 ) {
@@ -84,6 +92,7 @@ data class AgentCaps(
                 userConfig = flag("userConfig"),
                 multiRootWorkspace = flag("multiRootWorkspace"),
                 sessionListOrderBy = orderBy,
+                metaNegotiated = meta?.keys?.any { it.startsWith("cognition.ai/") } == true,
                 mcpConfigPath = init._meta?.strField("mcpConfigPath"),
                 raw = caps,
             )
