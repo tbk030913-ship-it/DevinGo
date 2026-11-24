@@ -203,7 +203,8 @@ fun SettingsScreen(
             )
             SettingRow(
                 "策略拒答回退模型",
-                subtitle = prefs.refusalFallbackModel.ifBlank { "未设置 · 主模型被拒答时不降级" },
+                subtitle = prefs.refusalFallbackModel
+                    .ifBlank { "未设置 · 主模型被拒答时不降级" } + " · 新会话生效",
                 onClick = { editField = EditField.RefusalFallback },
             )
 
@@ -597,10 +598,10 @@ private fun EditFieldSheet(field: EditField, prefs: Prefs, onDismiss: () -> Unit
                     EditField.RefusalFallback -> {
                         val v = value.trim()
                         if (v.isEmpty() ||
-                            v.matches(Regex("^[A-Za-z0-9][A-Za-z0-9 ._:\\-+/]{0,63}$"))) {
+                            v.matches(Regex("^[A-Za-z0-9][A-Za-z0-9 ._:\\-+/]{0,63}(,[A-Za-z0-9][A-Za-z0-9 ._:\\-+/]{0,63})*$"))) {
                             prefs.refusalFallbackModel = v
                         } else {
-                            fieldError = "模型名只能含字母数字与 ._:-+/，≤64 字符"
+                            fieldError = "可逗号分隔多个模型，每项限字母数字与 ._:-+/，≤64 字符"
                             ok = false
                         }
                     }
