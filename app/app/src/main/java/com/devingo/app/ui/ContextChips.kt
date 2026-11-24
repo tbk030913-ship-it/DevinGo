@@ -72,6 +72,9 @@ internal val kindedTokenStart = Regex(
  */
 private val mentionTokenRegex = Regex("(^|\\s)(@\\S+)")
 
+/** `#L10` / `#L10-L25` anchor a source quote pins after a file ref. */
+private val lineAnchor = Regex("#L\\d+(?:-L\\d+)?")
+
 private fun nonWhitespaceEnd(text: String, from: Int): Int {
     var e = from
     while (e < text.length && !text[e].isWhitespace()) e++
@@ -115,6 +118,13 @@ internal fun scanContextTokens(
                 }
             }
             if (best > 0) end = refStart + best
+        }
+        // A source-viewer quote anchors the chip: @file:path#L10-L25 — the
+        // anchor isn't part of the matched path but must ride the token.
+        if (end > refStart) {
+            lineAnchor.find(text, end)
+                ?.takeIf { it.range.first == end }
+                ?.let { end = it.range.last + 1 }
         }
         if (end <= refStart) continue
         val ref = text.substring(refStart, end)

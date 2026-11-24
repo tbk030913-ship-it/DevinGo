@@ -32,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -57,10 +58,15 @@ import me.rerere.rikkahub.ui.theme.LocalDarkMode
 /** What the viewer opens on — [line] is the optional 1-based #L anchor. */
 internal data class SourceTarget(val path: String, val line: Int? = null)
 
+/** Per-line display cap — bounds the layout cost of minified sources. */
+private const val SOURCE_LINE_DISPLAY_CAP = 2_000
+
 /** file extension → the bettertext language name (subset it ships). */
 private fun languageForPath(path: String): String {
     val base = path.substringAfterLast('/')
-    if (base.equals("dockerfile", true) || base.startsWith("Dockerfile.")) {
+    if (base.equals("dockerfile", true) ||
+        base.startsWith("dockerfile.", ignoreCase = true)
+    ) {
         return "dockerfile"
     }
     if (base.equals("cmakelists.txt", true)) return "cmake"
@@ -132,7 +138,8 @@ internal fun SourceFileViewer(
             error = e.message ?: "读取失败"
         }
     }
-    val lines = remember(content) { content?.lines().orEmpty() }
+    // A trailing newline would mint a phantom empty last row.
+    val lines = remember(content) { content?.removeSuffix("\n")?.lines().orEmpty() }
     val language = remember(target.path) { languageForPath(target.path) }
     val listState = rememberLazyListState()
 
@@ -161,6 +168,28 @@ internal fun SourceFileViewer(
             ?.index?.plus(1)
     }
 
+    // Edge auto-scroll: a drag held near the viewport edge keeps the list
+    // moving and the selection following the finger (W8.1 review).
+    var dragging by remember(target.path) { mutableStateOf(false) }
+    var dragY by remember(target.path) { mutableStateOf(0f) }
+    val edgePx = with(LocalDensity.current) { 48.dp.toPx() }
+    LaunchedEffect(dragging) {
+        while (dragging) {
+            val vh = listState.layoutInfo.viewportSize.height.toFloat()
+            val delta = when {
+                dragY < edgePx -> -16f
+                dragY > vh - edgePx -> 16f
+                else -> 0f
+            }
+            if (delta != 0f) {
+                listState.scroll { scrollBy(delta) }
+                // The row under the finger changed — keep extending.
+                lineAt(dragY)?.let { selEnd = it }
+            }
+            kotlinx.coroutines.delay(16)
+        }
+    }
+
     DevinSheet(
         title = target.path,
         onDismiss = onDismiss,
@@ -179,17 +208,21 @@ internal fun SourceFileViewer(
                         .pointerInput(target.path) {
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { offset ->
+                                    dragY = offset.y
+                                    dragging = true
                                     lineAt(offset.y)?.let {
                                         selAnchor = it
                                         selEnd = it
                                     }
                                 },
                                 onDrag = { change, _ ->
+                                    dragY = change.position.y
                                     lineAt(change.position.y)?.let { selEnd = it }
                                     change.consume()
                                 },
-                                onDragEnd = {},
+                                onDragEnd = { dragging = false },
                                 onDragCancel = {
+                                    dragging = false
                                     selAnchor = 0
                                     selEnd = 0
                                 },
@@ -214,11 +247,9 @@ internal fun SourceFileViewer(
                             language = language,
                             palette = palette,
                             background = lineBg,
-                            onClick = {
-                                // While a selection is live a tap re-sets
-                                // its end (extend/shrink); else no-op.
-                                if (selecting) selEnd = ln
-                            },
+                            // Only interactive while a selection is live —
+                            // a tap then re-sets its end (extend/shrink).
+                            onClick = if (selecting) ({ selEnd = ln }) else null,
                         )
                     }
                 }
@@ -313,7 +344,7 @@ private fun SourceLine(
     language: String,
     palette: me.rerere.bettertext.highlight.HighlightTextColorPalette,
     background: androidx.compose.ui.graphics.Color?,
-    onClick: () -> Unit,
+    onClick: (() -> Unit)?,
 ) {
     val cs = MaterialTheme.colorScheme
     Row(
@@ -322,7 +353,9 @@ private fun SourceLine(
             .then(
                 if (background != null) Modifier.background(background) else Modifier,
             )
-            .clickable(onClick = onClick)
+            .then(
+                if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
+            )
             .padding(vertical = 1.dp),
     ) {
         Text(
@@ -333,11 +366,22 @@ private fun SourceLine(
             softWrap = false,
             modifier = Modifier.padding(end = 12.dp),
         )
+        // A single minified line can carry the file's whole 1 MiB — a
+        // MultiParagraph that size stalls Main for seconds (W8.1 review).
+        val shown = text.take(SOURCE_LINE_DISPLAY_CAP)
         Text(
-            rememberHighlightedCode(text.ifEmpty { " " }, language, palette),
+            rememberHighlightedCode(shown.ifEmpty { " " }, language, palette),
             style = monoText(MaterialTheme.typography.bodySmall).copy(fontSize = 12.sp),
             softWrap = true,
         )
+        if (shown.length < text.length) {
+            Text(
+                " ⋯",
+                style = monoText(MaterialTheme.typography.bodySmall).copy(fontSize = 12.sp),
+                color = cs.outline,
+                softWrap = false,
+            )
+        }
     }
 }
 

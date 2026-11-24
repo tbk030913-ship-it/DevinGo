@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -64,8 +65,9 @@ private data class TreeRow(
     /** The listed dir this status belongs to (entry rows: ""). */
     val dirPath: String = "",
 ) {
-    enum class Status { Entry, Loading, Error, Empty }
-    val key: String get() = entry?.relPath ?: "status:$dirPath"
+    enum class Status { Entry, Loading, Error, Empty, Truncated }
+    //  can't appear in a relPath — status keys can't collide with files.
+    val key: String get() = entry?.relPath ?: "$dirPath"
 }
 
 /**
@@ -92,6 +94,8 @@ internal fun WorkspaceFilesSheet(
     val expanded = remember { mutableStateSetOf<String>() }
     val loading = remember { mutableStateSetOf<String>() }
     val errors = remember { mutableStateMapOf<String, String>() }
+    val truncatedDirs = remember { mutableStateSetOf<String>() }
+    val treeState = rememberLazyListState()
 
     fun fetchDir(path: String) {
         if (!loading.add(path)) return
@@ -104,6 +108,7 @@ internal fun WorkspaceFilesSheet(
                     compareBy({ !it.isDir }, { it.name.lowercase() }),
                 )
                 errors.remove(path)
+                if (listing.truncated) truncatedDirs += path else truncatedDirs -= path
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -142,17 +147,6 @@ internal fun WorkspaceFilesSheet(
         if (children[path] == null && errors[path] == null) fetchDir(path)
     }
 
-    // A search-hit dir jump: expand every ancestor (fetching missing
-    // levels) so the path lands visible in the tree.
-    fun expandToDir(relPath: String) {
-        query = ""
-        var cur = ""
-        for (seg in relPath.split('/')) {
-            cur = if (cur.isEmpty()) seg else "$cur/$seg"
-            if (expanded.add(cur) && children[cur] == null) fetchDir(cur)
-        }
-    }
-
     val rows by remember {
         derivedStateOf {
             val out = mutableListOf<TreeRow>()
@@ -165,16 +159,45 @@ internal fun WorkspaceFilesSheet(
                         out += TreeRow(null, depth, TreeRow.Status.Error, dir)
                     kids != null && kids.isEmpty() ->
                         out += TreeRow(null, depth, TreeRow.Status.Empty, dir)
-                    kids != null -> kids.forEach { e ->
-                        out += TreeRow(e, depth, TreeRow.Status.Entry)
-                        if (e.isDir && e.relPath in expanded) {
-                            walk(e.relPath, depth + 1)
+                    kids != null -> {
+                        kids.forEach { e ->
+                            out += TreeRow(e, depth, TreeRow.Status.Entry)
+                            if (e.isDir && e.relPath in expanded) {
+                                walk(e.relPath, depth + 1)
+                            }
+                        }
+                        if (dir in truncatedDirs) {
+                            out += TreeRow(
+                                null, depth + 1, TreeRow.Status.Truncated, dir,
+                            )
                         }
                     }
                 }
             }
             walk("", 0)
             out
+        }
+    }
+
+    // A search-hit dir jump: expand every ancestor (fetching missing
+    // levels) so the path lands visible in the tree — then scroll to it.
+    fun expandToDir(relPath: String) {
+        query = ""
+        var cur = ""
+        for (seg in relPath.split('/')) {
+            cur = if (cur.isEmpty()) seg else "$cur/$seg"
+            if (expanded.add(cur) && children[cur] == null) fetchDir(cur)
+        }
+        scope.launch {
+            // The reveals land as the fetches return — poll briefly.
+            repeat(40) {
+                val idx = rows.indexOfFirst { it.key == relPath }
+                if (idx >= 0) {
+                    treeState.animateScrollToItem(idx)
+                    return@launch
+                }
+                delay(50)
+            }
         }
     }
 
@@ -212,7 +235,8 @@ internal fun WorkspaceFilesSheet(
             ),
         )
         LazyColumn(
-            Modifier
+            state = treeState,
+            modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
                 .padding(top = 8.dp, bottom = 8.dp),
@@ -272,6 +296,10 @@ internal fun WorkspaceFilesSheet(
                             onRetry = { fetchDir(row.dirPath) },
                         )
                         TreeRow.Status.Empty -> HintRow("空目录", depth = row.depth)
+                        TreeRow.Status.Truncated -> HintRow(
+                            "目录过大 · 仅显示前一部分",
+                            depth = row.depth,
+                        )
                     }
                 }
             }

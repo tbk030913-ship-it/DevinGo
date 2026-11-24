@@ -97,7 +97,14 @@ private fun SecretRequestCardContent(
     var value by remember(p.requestId) { mutableStateOf("") }
     var revealed by remember(p.requestId) { mutableStateOf(false) }
     val save = {
-        if (value.isNotBlank()) onResolve(SecretReply(value))
+        // Empty the field before the card closes — Android's autofill
+        // prompts to save a masked field that leaves the screen with
+        // text in it (t3code's send() does the same, A7.6 review).
+        val v = value
+        if (v.isNotBlank()) {
+            value = ""
+            onResolve(SecretReply(v))
+        }
     }
     Surface(
         modifier = Modifier.fillMaxWidth(),
