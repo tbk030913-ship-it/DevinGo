@@ -1267,7 +1267,13 @@ func (h *Hub) devingoMethod(c *Client, data []byte, head rpcHead) {
 		if c.listBusy {
 			// One call at a time per client; only the newest waiter is
 			// kept — the result is a fresh snapshot either way, so older
-			// queued calls are superseded, not queued behind it.
+			// queued calls are superseded, not queued behind it. The
+			// displaced waiter gets an explicit error: a silent overwrite
+			// would leave its request id pending until the app timeout.
+			if prev := c.listNext; prev != nil {
+				h.deliverLocked(c, errorFrame(prev.id, -32000,
+					"superseded by a newer sessions request"))
+			}
 			c.listNext = &sessionListQuery{
 				id:     append(json.RawMessage(nil), head.ID...),
 				cwd:    params.Cwd,
@@ -1375,6 +1381,19 @@ func (h *Hub) attach(c *Client, id json.RawMessage, sid string, afterSeq uint64,
 	// bridge restarted. Replaying nothing would diverge silently AND pin
 	// the client's live floor above the new epoch's seqs.
 	if s.earliestSeq() > afterSeq+1 || afterSeq >= s.nextSeq {
+		h.deliverLocked(c, resultFrameRaw(id, mustJSON(map[string]any{
+			"sessionId": sid, "needLoad": true, "lastSeq": s.nextSeq - 1,
+		})))
+		return
+	}
+	// A session the hub never hosted — its entry was lazily created by
+	// foreign traffic like a takeover's session/close — has no lastInfo
+	// and no authority to serve history. Answering needLoad:false would
+	// replay an empty journal and the client would never send
+	// session/load, surfacing as a frozen empty transcript. A client
+	// whose own session/load is still in flight is exempt: the response
+	// subscribes it anyway.
+	if len(s.lastInfo) == 0 && s.loaders[c] == 0 {
 		h.deliverLocked(c, resultFrameRaw(id, mustJSON(map[string]any{
 			"sessionId": sid, "needLoad": true, "lastSeq": s.nextSeq - 1,
 		})))

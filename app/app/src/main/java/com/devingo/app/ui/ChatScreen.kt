@@ -279,7 +279,16 @@ fun ChatScreen(
                         } else {
                             null
                         }
-                    shareSessionMarkdown(context, title, markdown, shareUrl)
+                    runCatching {
+                        shareSessionMarkdown(
+                            context, title, markdown, shareUrl,
+                            idTag = ui.sessionId.orEmpty(),
+                        )
+                    }.onFailure {
+                        Toast.makeText(
+                            context, "分享失败", Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 }
             },
             onRevert = vm::loadRevertSteps,
@@ -335,6 +344,7 @@ fun ChatScreen(
                         }
                     },
                     onResend = { vm.resend(it) },
+                    onRetryUsageLimit = { vm.retryUsageLimit(it) },
                     onEditQueued = { vm.beginQueuedEdit(it) },
                     // Message-level quote: the whole markdown pins to the
                     // draft and the sheet opens for trim/comment (U5.5).

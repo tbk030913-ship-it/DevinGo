@@ -175,7 +175,7 @@ internal fun MoreSessionsRow(
  * ID / delete. Swipe EndToStart queues the same deferred delete behind the
  * undo snackbar; the open session can't be deleted.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 internal fun SessionRow(
     s: AcpSession,
@@ -269,7 +269,12 @@ internal fun SessionRow(
                     // end pad clears the 48dp "…" button overlaid at CenterEnd.
                     .padding(start = 44.dp, end = 52.dp)
                     .heightIn(min = if (compact) 44.dp else 56.dp)
-                    .clickable(onClick = onClick)
+                    .combinedClickable(
+                        onClick = onClick,
+                        // Spec (M9.1): long-press opens the row's menu —
+                        // same surface the trailing "…" exposes.
+                        onLongClick = { menuOpen = true },
+                    )
                     .semantics {
                         customActions = listOf(
                             CustomAccessibilityAction("删除会话") {
@@ -377,7 +382,8 @@ private fun SessionMetaLine(s: AcpSession, lastSession: Boolean, badge: SessionB
     val items = mutableListOf<Pair<String, Boolean>>()
     relativeSessionTime(s.lastActivity).takeIf { it.isNotBlank() }
         ?.let { items += it to false }
-    if (s.isLocked) items += "占用中" to true
+    if (s.isLocked) items +=
+        "🔒 " + lockHolderLabel(s).ifBlank { "占用中" } to true
     if (s.pendingPermission || badge?.pendingPermission == true) items += "待授权" to true
     if (badge?.pendingInput == true) items += "待回答" to true
     if (s.running || badge?.running == true) items += "运行中" to false

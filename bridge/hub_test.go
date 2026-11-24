@@ -148,6 +148,11 @@ func main() {
 			}
 			respond(id, rpc{"stopReason": "end_turn"})
 		case "session/list":
+			if params["content_search"] == "HANG" {
+				// Never responds — keeps _devingo/sessions in-flight so
+				// the listNext supersede path can be exercised.
+				break
+			}
 			respond(id, rpc{"sessions": []any{
 				rpc{"sessionId": "S001", "cwd": "C:/proj", "title": "canned-one", "updatedAt": "2026-01-02T03:04:05Z"},
 			}})
@@ -501,6 +506,7 @@ func TestGatewayInitParamsDeclaresExtensions(t *testing.T) {
 		"cognition.ai/subagentSupport",
 		"cognition.ai/sessionRename",
 		"cognition.ai/sessionShare",
+		"cognition.ai/sessionListContentSearch",
 	} {
 		if meta[k] != true {
 			t.Fatalf("clientCapabilities._meta[%q] = %v, want true", k, meta[k])
@@ -1437,5 +1443,58 @@ func TestSpawnProfileRouting(t *testing.T) {
 	}
 	if nprocs != 0 {
 		t.Fatalf("idle profile proc was not reaped (procs=%d)", nprocs)
+	}
+}
+
+// M9.1: a takeover's force-close lazily creates the hub entry — the
+// follow-up attach must answer needLoad so the client falls back to
+// session/load instead of pinning to an empty journal.
+func TestAttachAfterForeignCloseNeedsLoad(t *testing.T) {
+	setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+	a := dialClient(t, srv)
+
+	a.request(t, 1, "session/close", rpcMsg{
+		"sessionId": "FOREIGN",
+		"_meta":     rpcMsg{"cognition.ai/force": true},
+	})
+	a.awaitID(t, 1, 20*time.Second)
+
+	a.request(t, 2, "_devingo/attach", rpcMsg{"sessionId": "FOREIGN"})
+	resp := a.awaitID(t, 2, 20*time.Second)
+	res, _ := resp["result"].(rpcMsg)
+	if res["needLoad"] != true {
+		t.Fatalf("attach after foreign close needLoad = %v, want true", res)
+	}
+}
+
+// M9.1: only the newest queued _devingo/sessions survives — the displaced
+// waiter gets an explicit error instead of hanging until the app timeout.
+// Also pins contentSearch → session/list content_search + excerpts param.
+func TestSessionsSupersedeAnswersDisplaced(t *testing.T) {
+	stats := setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+	a := dialClient(t, srv)
+
+	// The hanging query pins the per-client list slot.
+	a.request(t, 1, "_devingo/sessions", rpcMsg{"contentSearch": "HANG"})
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(readStats(t, stats), `"content_search":"HANG"`) &&
+		time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !strings.Contains(readStats(t, stats), `"content_search":"HANG"`) {
+		t.Fatalf("content_search never reached devin:\n%s", readStats(t, stats))
+	}
+	if !strings.Contains(readStats(t, stats), `"with_message_excerpts":true`) {
+		t.Fatalf("with_message_excerpts missing:\n%s", readStats(t, stats))
+	}
+
+	// req2 queues behind the hang; req3 supersedes it → explicit error.
+	a.request(t, 2, "_devingo/sessions", rpcMsg{"contentSearch": "x"})
+	a.request(t, 3, "_devingo/sessions", rpcMsg{"contentSearch": "y"})
+	resp := a.awaitID(t, 2, 20*time.Second)
+	if resp["error"] == nil {
+		t.Fatalf("superseded sessions request got no error: %v", resp)
 	}
 }

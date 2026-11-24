@@ -97,15 +97,19 @@ internal suspend fun shareSessionMarkdown(
     title: String,
     markdown: String,
     shareUrl: String?,
+    idTag: String,
 ) {
     val file = withContext(Dispatchers.IO) {
         val dir = File(context.cacheDir, "shared").apply { mkdirs() }
-        // Only one export is ever live — reuse the name so stale shares
-        // don't accumulate under cacheDir.
-        val name = title.ifBlank { "session" }
+        // The session tag keeps same-titled exports from overwriting each
+        // other while an earlier content:// grant is still live.
+        val name = (
+            title.ifBlank { "session" }.take(40) +
+                idTag.replace(Regex("""[^\p{L}\p{N}._\-]+"""), "")
+                    .takeLast(12).let { if (it.isBlank()) "" else "-$it" }
+            )
             .replace(Regex("""[^\p{L}\p{N}._\- ]+"""), "")
-            .trim().ifBlank { "session" }
-            .take(40) + ".md"
+            .trim().ifBlank { "session" } + ".md"
         File(dir, name).apply { writeText(markdown) }
     }
     val uri = FileProvider.getUriForFile(
