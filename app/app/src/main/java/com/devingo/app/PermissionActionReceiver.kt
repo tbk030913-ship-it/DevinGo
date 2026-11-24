@@ -24,6 +24,7 @@ class PermissionActionReceiver : BroadcastReceiver() {
         val app = context.applicationContext as Application
         val cm = ConnectionManager.get(app)
         val store = sessionId?.let { cm.storeFor(it) }
+        val countBefore = store?.pendingPermissionCount?.value ?: 0
         val answered = store?.resolvePermissionRequest(
             requestId = requestId,
             toolCallId = intent.getStringExtra(EXTRA_TOOL_CALL_ID),
@@ -43,16 +44,23 @@ class PermissionActionReceiver : BroadcastReceiver() {
             return
         }
         // The resolved card must come down even when no activity lives to
-        // push a fresh LiveStatus: rebuild once the request actually pops
-        // off the queue head (the reply coroutine does that async).
+        // push a fresh snapshot: rebuild the aggregate once the request
+        // actually pops off the queue (the reply coroutine does that async).
         val pending = goAsync()
         cm.scope.launch {
             try {
                 withTimeoutOrNull(REFRESH_TIMEOUT_MS) {
-                    store.pendingPermission.first { it == null || it.requestId != requestId }
+                    store.pendingPermissionCount.first { it < countBefore }
+                }
+                // The store's SessionStatus trails the pop by one emission —
+                // wait until the answered request is out of the aggregate.
+                withTimeoutOrNull(REFRESH_TIMEOUT_MS) {
+                    cm.sessionStatuses.first {
+                        it[store.sessionId]?.status?.permissionRequestId != requestId
+                    }
                 }
                 runCatching {
-                    SessionService.update(app, liveStatus(context, cm, store))
+                    SessionService.update(app, snapshot(context, cm))
                 }
             } finally {
                 pending.finish()
@@ -61,32 +69,20 @@ class PermissionActionReceiver : BroadcastReceiver() {
     }
 
     /**
-     * Rebuild the persistent card from the just-answered session's own
-     * state. MainActivity's collector overwrites it moments later when it
-     * is alive; when it isn't, this is the only refresh the card gets.
+     * Rebuild the persistent card from every live session. MainActivity's
+     * collector overwrites it moments later when it is alive; when it isn't,
+     * this is the only refresh the card gets.
      */
-    private fun liveStatus(
+    private fun snapshot(
         context: Context,
         cm: ConnectionManager,
-        store: SessionStore,
-    ): LiveStatus {
-        val sui = store.ui.value
-        return deriveLiveStatus(
-            ui = UiState(
-                sessionId = store.sessionId,
-                sessionTitle = sui.sessionTitle,
-                running = sui.running,
-                connected = cm.conn.value.connected,
-                reconnecting = cm.conn.value.reconnecting,
-            ),
-            runningDetail = null,
-            pendingPermission = store.pendingPermission.value,
-            turnStartedAtMillis = SessionService.lastStatus
-                ?.takeIf { it.sessionId == store.sessionId }
-                ?.startedAtMillis ?: 0L,
-            pendingCount = cm.pendingApprovalCount(),
-        ).copy(promoteOngoing = Prefs(context).liveUpdates)
-    }
+    ) = cm.activitySnapshot(
+        collapseFinishedFor = if (AppVisibility.isForeground && AppVisibility.chatVisible) {
+            AppVisibility.chatSessionId
+        } else {
+            null
+        },
+    ).withPromote(Prefs(context).liveUpdates)
 
     companion object {
         const val ACTION_ALLOW = "com.devingo.app.PERMISSION_ALLOW"

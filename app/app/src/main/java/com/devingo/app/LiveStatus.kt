@@ -3,9 +3,11 @@ package com.devingo.app
 import com.devingo.app.acp.PermissionOption
 
 /**
- * Snapshot of what the persistent session notification should say. Derived
- * in MainActivity from the VM flows; [SessionService] renders it. Pure data
- * + mapper so the mapping stays testable and off the UI thread.
+ * Snapshot of what the persistent session notification should say for ONE
+ * session. Derived per SessionStore in ConnectionManager's store watcher;
+ * [SessionService] renders it — alone as the single-session card, or as the
+ * hero/rows of the aggregate when several sessions are live. Pure data +
+ * mapper so the mapping stays testable and off the UI thread.
  */
 data class LiveStatus(
     val state: State,
@@ -86,6 +88,7 @@ fun deriveLiveStatus(
             title = title,
             detail = "正在重连…",
             startedAtMillis = turnStartedAtMillis,
+            sessionId = ui.sessionId,
         )
     }
 
@@ -97,6 +100,7 @@ fun deriveLiveStatus(
             title = title,
             detail = runningDetail ?: "处理中",
             startedAtMillis = turnStartedAtMillis,
+            sessionId = ui.sessionId,
         )
     }
 
@@ -106,6 +110,7 @@ fun deriveLiveStatus(
             title = title,
             detail = if (it == LiveStatus.State.Failed) "本轮失败" else "本轮已完成",
             startedAtMillis = turnStartedAtMillis,
+            sessionId = ui.sessionId,
         )
     }
 
@@ -114,6 +119,7 @@ fun deriveLiveStatus(
         title = title,
         detail = "等待指令",
         startedAtMillis = turnStartedAtMillis,
+        sessionId = ui.sessionId,
     )
 }
 

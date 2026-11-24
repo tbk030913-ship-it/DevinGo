@@ -51,3 +51,4 @@
 2026-11-24 07:05 | N6.1双审修复闭环：纯增/删与无内容diff崩溃、binary/mode-only文件消失、子目录越界/git stderr路径泄漏、untracked+unborn-HEAD覆盖、truncated透传、第二条评论追加草稿
 2026-11-24 07:32 | N6.2 内联@上下文chips+剪贴板图片粘贴（t3code移植）：ComposerEditText原生编辑器/原子删chip/chip点按sheet、@file选择器+bridge /fs/list端点与测试、展开/紧凑共用同一view
 2026-11-24 08:20 | N6.2 原生内联@上下文chip+剪贴板贴图（t3code移植）：ComposerEditText/ChipSpan/原子删除/chip点击sheet、/fs/list端点+文件picker、spec+质量修复（autofill/plaintext粘贴/numpad/folder）
+2026-11-24 08:03 | N6.3 多会话聚合通知（t3-agent-notifications移植）：SessionStore级LiveStatus派生+CM聚合快照、relay串extras重启重建、单会话卡片不变

@@ -20,7 +20,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -77,7 +76,6 @@ class MainActivity : ComponentActivity() {
                         prefs.lastSessionCwd = cwd
                     }
                     val ui by vm.ui.collectAsState()
-                    val pendingPermission by vm.pendingPermission.collectAsState()
 
                     val settingsVersion by prefs.settingsVersion.collectAsState()
 
@@ -96,67 +94,34 @@ class MainActivity : ComponentActivity() {
                             SessionService.stop(this@MainActivity)
                         }
                     }
-                    // Live Updates surface: derive the notification status from
-                    // the live flows. Map → dedupe → debounce so the service only
-                    // ever sees real state changes, never per-chunk flushes.
+                    // Live Updates surface: every SessionStore derives its
+                    // own LiveStatus app-side (N6.3); this collector only
+                    // folds them into the aggregate snapshot and pushes —
+                    // deduped + debounced so the service sees real changes.
                     LaunchedEffect(Unit) {
-                        var turnStart = 0L
-                        var wasRunning = false
-                        var finished: LiveStatus.State? = null
-                        var finishedAt = 0L
+                        val cm = ConnectionManager.get(application)
                         combine(
-                            vm.ui,
-                            vm.transcript,
-                            vm.pendingPermission,
-                            vm.pendingApprovals,
+                            cm.sessionStatuses,
+                            cm.conn,
+                            cm.pendingApprovals,
                             prefs.settingsVersion,
-                        ) { u, m, p, count, _ -> Triple(u, m, p) to count }
-                            .map { (t, count) ->
-                                val (u, m, p) = t
-                                if (u.running && !wasRunning) {
-                                    turnStart = System.currentTimeMillis()
-                                    finished = null
-                                }
-                                if (!u.running && wasRunning) {
-                                    finished = if (u.phase == Phase.Error ||
-                                        !u.error.isNullOrBlank()
-                                    ) {
-                                        LiveStatus.State.Failed
-                                    } else {
-                                        LiveStatus.State.Done
-                                    }
-                                    finishedAt = System.currentTimeMillis()
-                                }
-                                wasRunning = u.running
-                                // The card only lives for DONE_VISIBLE_MS; after
-                                // that the service reposts plain idle text.
-                                if (finished != null &&
-                                    System.currentTimeMillis() - finishedAt >= DONE_VISIBLE_MS
-                                ) {
-                                    finished = null
-                                }
-                                var status = deriveLiveStatus(
-                                    u, m.runningDetail, p, turnStart, finished,
-                                    pendingCount = count,
-                                )
-                                // The user is looking at the chat: the finished
-                                // card collapses back to plain idle text.
-                                if ((status.state == LiveStatus.State.Done ||
-                                        status.state == LiveStatus.State.Failed) &&
-                                    AppVisibility.isForeground &&
-                                    AppVisibility.chatVisible
-                                ) {
-                                    finished = null
-                                    status = status.copy(
-                                        state = LiveStatus.State.Idle,
-                                        detail = "等待指令",
-                                    )
-                                }
-                                val gated = status.copy(promoteOngoing = prefs.liveUpdates)
-                                if ((u.connected || u.reconnecting) &&
+                        ) { _, conn, pendingCount, _ -> conn to pendingCount }
+                            .map { (conn, pendingCount) ->
+                                if ((conn.connected || conn.reconnecting) &&
                                     prefs.keepAlive
                                 ) {
-                                    gated
+                                    // The user is looking at this chat: its
+                                    // finished card collapses back to idle.
+                                    val collapseFor =
+                                        if (AppVisibility.isForeground &&
+                                            AppVisibility.chatVisible
+                                        ) {
+                                            AppVisibility.chatSessionId
+                                        } else {
+                                            null
+                                        }
+                                    cm.activitySnapshot(collapseFor, pendingCount)
+                                        .withPromote(prefs.liveUpdates)
                                 } else {
                                     null
                                 }
@@ -165,8 +130,8 @@ class MainActivity : ComponentActivity() {
                             .filterNotNull()
                             .distinctUntilChanged()
                             .debounce(300)
-                            .collect { status ->
-                                SessionService.update(this@MainActivity, status)
+                            .collect { snapshot ->
+                                SessionService.update(this@MainActivity, snapshot)
                             }
                     }
                     // Live notification actions (允许/拒绝) resolve through the
@@ -263,9 +228,5 @@ class MainActivity : ComponentActivity() {
         // sessions on the last good snapshot.
         ConnectionManager.get(application).persistCaches()
         super.onStop()
-    }
-
-    private companion object {
-        const val DONE_VISIBLE_MS = 10 * 60 * 1000L
     }
 }

@@ -11,13 +11,23 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
+import com.devingo.app.notification.ACTIVITY_DATA_KEYS
+import com.devingo.app.notification.ACTIVITY_MAX_ROWS
+import com.devingo.app.notification.ActivityPresentation
+import com.devingo.app.notification.ActivityPhase
+import com.devingo.app.notification.ActivitySnapshot
+import com.devingo.app.notification.DONE_VISIBLE_MS
+import com.devingo.app.notification.KEY_ACTIVE
+import com.devingo.app.notification.activityLineKey
+import com.devingo.app.notification.activityRows
 
 /**
  * Keeps the process (and therefore the WebSocket to the bridge) alive while
  * a Devin session is open. The persistent notification doubles as the
  * Android Live Updates surface: [ACTION_UPDATE] rebuilds it from the latest
- * [LiveStatus] — working turns get a chronometer + indeterminate progress and
- * request promotion; idle/reconnecting states never promote.
+ * aggregate snapshot — a single live session gets the rich per-session card
+ * (chronometer + indeterminate progress + approval actions); ≥2 sessions get
+ * the multi-session aggregate. Idle/reconnecting states never promote.
  */
 class SessionService : Service() {
 
@@ -63,6 +73,7 @@ class SessionService : Service() {
                     permissionToolCallId = intent.getStringExtra(EXTRA_TOOL_CALL_ID),
                     pendingCount = intent.getIntExtra(EXTRA_PENDING_COUNT, 0),
                 )
+                lastActivity = readActivity(intent)
                 scheduleIdleRepost()
             }
         }
@@ -79,7 +90,11 @@ class SessionService : Service() {
         idleRepost?.let(mainHandler::removeCallbacks)
         idleRepost = null
         val s = lastStatus
-        if (s != null && (s.state == LiveStatus.State.Done || s.state == LiveStatus.State.Failed)) {
+        // Terminal card: the single-session Done/Failed card, or an
+        // aggregate whose rows all finished ("active" extra unset).
+        val terminal = lastActivity?.let { it[KEY_ACTIVE] == "false" }
+            ?: (s?.state == LiveStatus.State.Done || s?.state == LiveStatus.State.Failed)
+        if (s != null && terminal) {
             val r = Runnable {
                 idleRepost = null
                 lastStatus = LiveStatus(
@@ -88,10 +103,28 @@ class SessionService : Service() {
                     detail = "等待指令",
                     startedAtMillis = s.startedAtMillis,
                 )
+                lastActivity = null
                 startForegroundWithType(buildNotification())
             }
             idleRepost = r
             mainHandler.postDelayed(r, DONE_VISIBLE_MS)
+        }
+    }
+
+    /**
+     * Rebuild the aggregate extras map pushed on an ACTION_UPDATE — the
+     * string-only shape that lets a START_STICKY restart re-render the
+     * same card. Null when this update is a single-session card.
+     */
+    private fun readActivity(intent: Intent): Map<String, String>? {
+        if (intent.getStringExtra(activityLineKey(0)) == null) return null
+        return buildMap {
+            (0 until ACTIVITY_MAX_ROWS).forEach { i ->
+                intent.getStringExtra(activityLineKey(i))?.let { put(activityLineKey(i), it) }
+            }
+            ACTIVITY_DATA_KEYS.forEach { key ->
+                intent.getStringExtra(key)?.let { put(key, it) }
+            }
         }
     }
 
@@ -111,8 +144,6 @@ class SessionService : Service() {
             )
         val builder = NotificationCompat.Builder(this, Notifier.CHANNEL_SESSION)
             .setSmallIcon(R.drawable.ic_stat_devingo)
-            .setContentTitle(notificationTitle(status))
-            .setContentText(notificationText(status))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
@@ -121,9 +152,23 @@ class SessionService : Service() {
             .setContentIntent(openIntent(REQ_CONTENT))
             .addAction(0, "打开", openIntent(REQ_OPEN))
 
+        // ≥2 live session rows switch the card to the multi-session
+        // aggregate; a single session keeps the rich per-session card.
+        val activity = lastActivity
+        if (activity != null && activityRows(activity).size >= 2) {
+            applyAggregate(builder, activity, status)
+        } else {
+            builder
+                .setContentTitle(notificationTitle(status))
+                .setContentText(notificationText(status))
+            applyStatusStyle(builder, status)
+        }
+
         // Broadcast actions answer the exact request in the background —
         // but only when it is THE pending approval; with several waiting the
         // card shows the count and tapping opens the app to handle them.
+        // On an aggregated card [status] is the hero row — its identity
+        // keys these PendingIntents.
         if (status.state == LiveStatus.State.NeedsPermission && status.pendingCount <= 1) {
             builder
                 .addAction(
@@ -135,7 +180,11 @@ class SessionService : Service() {
                     broadcastIntent(requestKey(status) * 2 + 1, PermissionActionReceiver.ACTION_DENY, status),
                 )
         }
+        return builder.build()
+    }
 
+    /** The single-session card — the shape [LiveStatus] has always had. */
+    private fun applyStatusStyle(builder: NotificationCompat.Builder, status: LiveStatus) {
         when (status.state) {
             LiveStatus.State.Working -> {
                 builder
@@ -183,7 +232,41 @@ class SessionService : Service() {
                     .setRequestPromotedOngoing(false)
             }
         }
-        return builder.build()
+    }
+
+    /**
+     * The multi-session aggregate (N6.3, port of t3code's agent-activity
+     * card): tinted title + one colored status row per session. [hero] is
+     * the leading session's [LiveStatus] — its promote flag and approval
+     * identity apply to the whole card.
+     */
+    private fun applyAggregate(
+        builder: NotificationCompat.Builder,
+        data: Map<String, String>,
+        hero: LiveStatus,
+    ) {
+        val active = data[KEY_ACTIVE] != "false"
+        val presentation = ActivityPresentation(data, active)
+        presentation.applyTo(builder, this)
+        // The liveUpdates pref still gates promotion — but the aggregate
+        // only earns the Live Updates slot for a needs-user or running
+        // hero; a batch of finished cards isn't worth promoting.
+        val promote = hero.promoteOngoing &&
+            (presentation.phase?.needsUser == true ||
+                presentation.phase == ActivityPhase.RUNNING)
+        builder
+            .setCategory(
+                if (presentation.phase == ActivityPhase.RUNNING) {
+                    NotificationCompat.CATEGORY_PROGRESS
+                } else {
+                    NotificationCompat.CATEGORY_SERVICE
+                },
+            )
+            .setShortCriticalText(presentation.chip)
+            .setRequestPromotedOngoing(promote)
+        // All rows finished: the card self-expires like the single
+        // Done/Failed card, then the repost shows plain idle text.
+        if (!active) builder.setTimeoutAfter(DONE_VISIBLE_MS)
     }
 
     private fun notificationTitle(status: LiveStatus): String = when (status.state) {
@@ -262,7 +345,6 @@ class SessionService : Service() {
         private const val REQ_OPEN = 1
         private const val REQ_ALLOW = 2
         private const val REQ_DENY = 3
-        private const val DONE_VISIBLE_MS = 10 * 60 * 1000L
         private const val EXTRA_STATE = "live_state"
         private const val EXTRA_TITLE = "live_title"
         private const val EXTRA_DETAIL = "live_detail"
@@ -275,9 +357,12 @@ class SessionService : Service() {
         private const val EXTRA_TOOL_CALL_ID = "live_permission_tool_call_id"
         private const val EXTRA_PENDING_COUNT = "live_pending_count"
 
-        /** Survives START_STICKY restarts while the process lives. Read by
-         *  [PermissionActionReceiver] to keep the chronometer continuous. */
+        /** Survives START_STICKY restarts while the process lives — the
+         *  hero card's status (the aggregate's leading session). */
         @Volatile internal var lastStatus: LiveStatus? = null
+
+        /** The aggregate card's relay extras; null = single-session card. */
+        @Volatile private var lastActivity: Map<String, String>? = null
         @Volatile private var fallbackTitle: String? = null
 
         fun start(context: Context, title: String?) {
@@ -287,8 +372,16 @@ class SessionService : Service() {
             context.startForegroundService(intent)
         }
 
-        fun update(context: Context, status: LiveStatus) {
+        /**
+         * Push the aggregate snapshot: [ActivitySnapshot.hero] fills the
+         * long-lived extras (state/approval identity) and [ActivitySnapshot.extras]
+         * the relay-shaped `activity_*` lines — strings only, so an
+         * ACTION_UPDATE restart rebuilds the identical card.
+         */
+        internal fun update(context: Context, snapshot: ActivitySnapshot) {
+            val status = snapshot.hero
             lastStatus = status
+            lastActivity = snapshot.extras.takeIf { it.isNotEmpty() }
             context.startService(
                 Intent(context, SessionService::class.java)
                     .setAction(ACTION_UPDATE)
@@ -302,12 +395,16 @@ class SessionService : Service() {
                     .putExtra(Notifier.EXTRA_SESSION_ID, status.sessionId)
                     .putExtra(EXTRA_REQUEST_ID, status.permissionRequestId)
                     .putExtra(EXTRA_TOOL_CALL_ID, status.permissionToolCallId)
-                    .putExtra(EXTRA_PENDING_COUNT, status.pendingCount),
+                    .putExtra(EXTRA_PENDING_COUNT, status.pendingCount)
+                    .apply {
+                        snapshot.extras.forEach { (k, v) -> putExtra(k, v) }
+                    },
             )
         }
 
         fun stop(context: Context) {
             lastStatus = null
+            lastActivity = null
             context.startService(
                 Intent(context, SessionService::class.java)
                     .setAction(ACTION_STOP),

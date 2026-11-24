@@ -22,6 +22,10 @@ import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitDiff
 import com.devingo.app.acp.probeBridgeHealth
+import com.devingo.app.notification.ActivitySnapshot
+import com.devingo.app.notification.DONE_VISIBLE_MS
+import com.devingo.app.notification.SessionStatus
+import com.devingo.app.notification.aggregateActivity
 import com.devingo.app.tailnet.TailnetManager
 import com.devingo.app.tailnet.TailnetState
 import kotlinx.coroutines.CancellationException
@@ -41,6 +45,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -159,6 +164,32 @@ class ConnectionManager private constructor(private val app: Application) {
     /** The same total, synchronously — the broadcast answer path can't wait. */
     fun pendingApprovalCount(): Int =
         stores.values.sumOf { it.pendingPermissionCount.value }
+
+    /**
+     * Every live store's notification status — [watchStore] keeps one entry
+     * per session so the persistent card can aggregate ALL sessions, not
+     * just the one on screen (N6.3). Includes Idle entries: the aggregate's
+     * zero-row hero fallback needs a title for the idle card.
+     */
+    private val _sessionStatuses =
+        MutableStateFlow<Map<String, SessionStatus>>(emptyMap())
+    internal val sessionStatuses = _sessionStatuses.asStateFlow()
+
+    /**
+     * The persistent card's aggregate payload: ordered rows + the hero
+     * [LiveStatus] + relay-shaped extras. [collapseFinishedFor] names the
+     * on-screen session whose finished card stays collapsed — the
+     * foreground-only tweak MainActivity applies.
+     */
+    internal fun activitySnapshot(
+        collapseFinishedFor: String? = null,
+        pendingCount: Int = pendingApprovalCount(),
+    ): ActivitySnapshot = aggregateActivity(
+        statuses = _sessionStatuses.value,
+        currentSessionId = _currentStore.value?.sessionId,
+        pendingCount = pendingCount,
+        collapseFinishedFor = collapseFinishedFor,
+    )
 
     /** Heads-up events for sessions other than the one on screen. */
     private val _alerts = MutableSharedFlow<SessionAlert>(extraBufferCapacity = 8)
@@ -672,6 +703,7 @@ class ConnectionManager private constructor(private val app: Application) {
         }
         _badges.update { it - sessionId }
         _permissionCounts.update { it - sessionId }
+        _sessionStatuses.update { it - sessionId }
         if (gone) _sessions.update { list -> list?.filterNot { it.sessionId == sessionId } }
         if (_currentStore.value === store) {
             _currentStore.value = null
@@ -806,6 +838,70 @@ class ConnectionManager private constructor(private val app: Application) {
                 store.draft.debounce(DRAFT_SAVE_DEBOUNCE_MS).collect {
                     runCatching { drafts.save(store.sessionId, it) }
                 }
+            }
+            launch {
+                // N6.3: this store's own LiveStatus for the aggregated
+                // notification — the turnStart/finish edge tracking that
+                // used to run in MainActivity for the bound session alone,
+                // so a background session's card reflects ITS turn.
+                var turnStart = 0L
+                var wasRunning = false
+                var finished: LiveStatus.State? = null
+                var finishedAt = 0L
+                combine(
+                    store.ui,
+                    store.transcript,
+                    store.pendingPermission,
+                    _conn.map { Triple(it.reconnecting, it.phase, it.error) }
+                        .distinctUntilChanged(),
+                ) { u, m, p, (reconnecting, connPhase, connError) ->
+                    if (u.running && !wasRunning) {
+                        turnStart = System.currentTimeMillis()
+                        finished = null
+                    }
+                    if (!u.running && wasRunning) {
+                        finished = if (connPhase == Phase.Error ||
+                            !connError.isNullOrBlank()
+                        ) {
+                            LiveStatus.State.Failed
+                        } else {
+                            LiveStatus.State.Done
+                        }
+                        finishedAt = System.currentTimeMillis()
+                    }
+                    wasRunning = u.running
+                    // The card only lives for DONE_VISIBLE_MS; expiry is
+                    // evaluated lazily on emission, like before.
+                    if (finished != null &&
+                        System.currentTimeMillis() - finishedAt >= DONE_VISIBLE_MS
+                    ) {
+                        finished = null
+                    }
+                    val project = store.cwd
+                        .substringAfterLast('/')
+                        .substringAfterLast('\\')
+                    SessionStatus(
+                        status = deriveLiveStatus(
+                            ui = UiState(
+                                sessionId = store.sessionId,
+                                sessionTitle = u.sessionTitle?.takeIf { it.isNotBlank() }
+                                    ?: project,
+                                running = u.running,
+                                reconnecting = reconnecting,
+                            ),
+                            runningDetail = m.runningDetail,
+                            pendingPermission = p,
+                            turnStartedAtMillis = turnStart,
+                            finished = finished,
+                        ),
+                        project = project,
+                        finishedAtMillis = if (finished != null) finishedAt else 0L,
+                    )
+                }
+                    .distinctUntilChanged()
+                    .collect { status ->
+                        _sessionStatuses.update { it + (store.sessionId to status) }
+                    }
             }
         }
     }
