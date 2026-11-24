@@ -121,7 +121,11 @@ cd app
 
 ## 会话托管机制（hub）
 
-一个常驻 `devin acp` 进程承载所有客户端的所有会话。网关代办 `initialize`/`authenticate`
+默认一个常驻 `devin acp` 进程承载所有客户端的所有会话；`session/new`/`load` 的
+`_meta` 声明 `devingo/agentType`（review/codemap/summarizer）时，hub 按
+(agentType, refusalFallback) 配置键 spawn 独立 `devin acp --agent-type` 进程
+（备用模型经 `DEVIN_REFUSAL_FALLBACK` 环境变量传入），无会话无在途即回收——审批
+路由、`agent_died` 广播都按 proc 隔离。网关代办 `initialize`/`authenticate`
 （应答缓存直接回客户端，客户端握手零等待），其余请求 id 重写到网关内部序列再转发、响应
 映射回来——普通 ACP 客户端无感，可以直接连。每个会话的事件进 5000 条 / 8MiB 的序号化
 环形 journal（帧上带 `_seq`）：掉线、杀进程、换设备都不丢回合，重连后 `_devingo/attach`
@@ -136,7 +140,7 @@ cd app
 
 | 方法 / 通知 | 说明 |
 |---|---|
-| `_devingo/hello` | 客户端报到；回 clientId、版本、能力集 |
+| `_devingo/hello` | 客户端报到；回 clientId、版本、能力集（含 `agentTypes` 专项代理支持） |
 | `_devingo/sessions` | `session/list` 合并 hub 实时态（`running`、`pendingPermission`）；会话列表只走它，HTTP `/sessions` 已移除 |
 | `_devingo/attach` | 订阅会话 + `afterSeq` 之后 journal 回放；回 `lastSeq`/`running`/`pendingPermission`，截断或未托管返 `needLoad` |
 | `_devingo/detach` | 退订；hub 继续托管该会话 |
@@ -162,6 +166,13 @@ cd app
   仍为 false，App 无法应答），握手应答的 `agentCapabilities._meta` 解析为 `AgentCaps`
   （`ConnectionManager.agentCaps`）供 UI 按能力门控
 - 未知 agent→client 请求（如 `fs/*`、`terminal/*`）统一回 `method_not_found` —— Devin 会自行完成文件/终端操作
+- 专项 Agent：`session/new`/`load` 的 `_meta` 携带 `devingo/agentType`
+  （review/codemap/summarizer）+ `devingo/refusalFallback`（模型名）；无
+  `agentTypes` 能力的旧 bridge 上模式菜单置灰
+- 工作区 HTTP 面（token 门 + Origin 校验 + 会话 cwd 限定）：`/fs/list`（@选择器
+  平铺 + 目录懒树）、`/fs/read`（≤1MiB 源码查看）、`/fs/search`、`/fs/write`、
+  `/git/status|branches|diff|checkout|commit|push|pull`、`/pty`（终端）、
+  `/preview`（本地端口隧道）、`/models`
 
 ## 安全注意
 
@@ -178,13 +189,17 @@ cd app
 
 ## 已知限制 / TODO
 
-- 回退只接了「列表 + 分叉成新会话」：`revert/preview`、`revert/execute`（在本会话内回滚）
-  协议常量已留但未接线；agent 不支持 revert 时菜单项自动隐藏
-- 附件只支持图片（压缩后 ≤3MB/条）；`@` 引用有 `@file:`/`@folder:` 选择器
-  （`/fs/list` 列工作区文件），未列出的路径仍靠文本推断
+- 回退已接三模式：`revert/preview` 预览、`revert/execute` 本会话原地回滚（二次确认）、
+  `forkFromStep` 分叉成新会话；agent 不支持 revert 时菜单项自动隐藏
+- 附件只支持图片（压缩后 ≤3MB/条）；`@` 引用覆盖 9 种类型选择器（文件/目录/符号/
+  规则/skill/plan 等，`ComposerCommandPopover`）+ `/` 命令面板，`#Lx-Ly` 行锚
+  随引用发送，未列出的路径仍靠文本推断
 - `/models` 只留 id + name（无描述/参数）；模型列表主要靠会话内 `configOptions`，
   `/models` 是兜底
 - `-install` 的计划任务是 Windows schtasks（登录时启动，非系统服务）——未登录的
   Windows 会话里 bridge 不跑
-- `/fs/write`/`/fs/list`/`/git/diff` 都限定在会话 cwd 之内；`/fs/list` 只覆盖
-  git 跟踪 + 未忽略的未跟踪文件，被 .gitignore 排除的路径选择器里看不到
+- `/fs/*`、`/git/*` 都限定在会话 cwd 之内；`/fs/list` POST 平铺只覆盖 git 跟踪 +
+  未忽略的未跟踪文件，被 .gitignore 排除的路径选择器里看不到（文件树 GET 模式
+  仍列出但标灰）
+- 专项 Agent 的 profiled proc 上 `session/list`、`authenticate` 仍走 default proc
+  （凭据由网关在 spawn 时注入）；profiled 会话的空闲回收粒度是「无会话无在途」
