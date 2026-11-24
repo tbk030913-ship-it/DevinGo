@@ -78,3 +78,6 @@
 2026-11-24 19:13 | transport 横幅（恢复/断连/进程退出）渲染到回合边缘：ChatItem.transport 标记 + buildTranscriptModel 双趟发射，过程组不再被横幅推离回复；缓存持久化 + 单测
 2026-11-24 20:01 | fix stuck-running (turnEnded+turnEpoch gate), reqMethod-tagged turn ends, peer-turn done push, capsule stop icon + step count, Done card elapsed
 2026-11-24 21:10 | 发版 v0.2.1：配置签名 Secrets + 修 platform 包名(android-37.0)，CI Release 工作流出包
+2026-11-24 21:25 | 修复冷隧道误报：Running 后首个 tailnet 探测超 1.5s 预算报 bridge 不可达，补一轮 6s 重试
+2026-11-24 22:28 | turn-state authority: bridge broadcasts _devingo/turn_running on prompt-count transitions; client remoteTurn driven by it (frame inference retired) — post-end stragglers can't wedge running + cold-tunnel probe retry
+2026-11-24 22:50 | review 修复：turn_running 改纯 live 推送(不入journal, 修 load 窗口丢失+旧客户端 reattach 风暴)；'!' shell prompt 不计 running；RemoteTurnEnd 清理让位 signal；finishLoad seeding 门控

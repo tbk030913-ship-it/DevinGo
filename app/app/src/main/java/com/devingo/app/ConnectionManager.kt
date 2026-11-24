@@ -140,6 +140,10 @@ class ConnectionManager private constructor(private val app: Application) {
         private const val RECONNECT_MAX_DELAY_MS = 30_000L
         /** `session/close` gets this long to answer before teardown proceeds. */
         private const val CLOSE_TIMEOUT_MS = 2_000L
+        /** Cold-tunnel retry budget: a just-Running tsnet node's first peer
+         *  dial pays the WireGuard handshake inside /healthz — well past the
+         *  shared 1.5s probe budget. */
+        private const val TAILNET_RETRY_PROBE_MS = 6_000L
         /** Transcript cache writes ride a debounce — one save per quiet stretch. */
         private const val CACHE_SAVE_DEBOUNCE_MS = 5_000L
         /** Draft persistence is per keystroke-burst, not per keystroke. */
@@ -1707,6 +1711,7 @@ class ConnectionManager private constructor(private val app: Application) {
         val (cand, dial) = reachable
             .firstOrNull { !TailnetManager.hostNeedsTailnet(it.first) }
             ?: reachable.firstOrNull()
+            ?: retryTailnetProbe(prefs, candidates)
             ?: return null
         // The configured host changed while probing (re-pair, settings
         // edit): this result belongs to the stale config — drop it rather
@@ -1733,6 +1738,37 @@ class ConnectionManager private constructor(private val app: Application) {
                 runCatching { TailnetManager.resolveHost(cand) }.getOrNull()
             }
         }
+
+    /**
+     * Last-ditch pass over tailnet candidates when nothing answered. Two
+     * cold windows outlive the shared 1.5s budget: a node still Starting
+     * (fresh app launch races the poll) and a Running node whose first
+     * forward dial pays the WireGuard handshake inside the probe. Both
+     * report "bridge 不可达"/"Tailscale 未连接" one tap too early — wait the
+     * node's own startup window plus a handshake-sized probe instead.
+     */
+    private suspend fun retryTailnetProbe(
+        prefs: Prefs,
+        candidates: List<String>,
+    ): Pair<String, String>? {
+        if (!prefs.tailnetEnabled) return null
+        val tails = candidates.filter { TailnetManager.hostNeedsTailnet(it) }
+        if (tails.isEmpty()) return null
+        return coroutineScope {
+            tails.map { cand ->
+                async {
+                    // resolveHost's waitForRunning (10s) absorbs a Starting
+                    // node; the probe then covers the cold handshake.
+                    runCatching { TailnetManager.resolveHost(cand) }
+                        .getOrNull()
+                        ?.takeIf {
+                            probeBridgeHealth(healthUrl(it), TAILNET_RETRY_PROBE_MS)
+                        }
+                        ?.let { cand to it }
+                }
+            }.awaitAll().filterNotNull().firstOrNull()
+        }
+    }
 
     /** Failure text when no candidate answered — names a missing tailnet. */
     private fun probeErrorText(): String {

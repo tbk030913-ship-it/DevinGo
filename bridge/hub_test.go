@@ -671,6 +671,85 @@ func TestAttachReplaysJournal(t *testing.T) {
 	}
 }
 
+// (c2) subscribers see the authoritative turn state on each prompt-flight
+// edge: _devingo/turn_running true at forward, false at the response. The
+// marker is live-only (no _seq) — attach already carries the same state in
+// its result, and a journaled seq pre-signal clients never ack would read
+// as a gap and force a re-attach per edge. `!` user-shell prompts aren't
+// turns: they emit no marker at all.
+func TestTurnRunningBroadcast(t *testing.T) {
+	setupHub(t, fakeDevin(t))
+	srv := newTestServer(t)
+
+	a := dialClient(t, srv)
+	sid := initAndNew(t, a)
+	b := dialClient(t, srv)
+	b.request(t, 1, "_devingo/attach", rpcMsg{"sessionId": sid})
+	b.awaitID(t, 1, 20*time.Second)
+
+	a.request(t, 9, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "hi"}},
+	})
+	a.awaitID(t, 9, 20*time.Second) // turn finished
+
+	start := b.awaitMethod(t, "_devingo/turn_running", 20*time.Second)
+	if p, _ := start["params"].(rpcMsg); p["running"] != true {
+		t.Fatalf("first turn_running params = %v, want running=true", p)
+	}
+	end := b.awaitMethod(t, "_devingo/turn_running", 20*time.Second)
+	if p, _ := end["params"].(rpcMsg); p["running"] != false {
+		t.Fatalf("second turn_running params = %v, want running=false", p)
+	}
+	// Live-only: a journaled _seq would force pre-signal clients into a
+	// re-attach at every turn edge.
+	if start["_seq"] != nil || end["_seq"] != nil {
+		t.Fatal("turn_running frames must not carry _seq (live-only)")
+	}
+
+	// Sequential turns repeat the edge pair.
+	a.request(t, 10, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "again"}},
+	})
+	a.awaitID(t, 10, 20*time.Second)
+	for _, want := range []bool{true, false} {
+		m := b.awaitMethod(t, "_devingo/turn_running", 20*time.Second)
+		if p, _ := m["params"].(rpcMsg); p["running"] != want {
+			t.Fatalf("turn_running params = %v, want running=%v", p, want)
+		}
+	}
+
+	// `!` shell prompts keep no running count — after its flight the only
+	// markers on the wire are the real prompt's true+false pair.
+	a.request(t, 11, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt": []any{rpcMsg{"type": "text", "text": "!ls",
+			"_meta": rpcMsg{"cognition.ai/userShellCommand": true}}},
+	})
+	a.awaitID(t, 11, 20*time.Second)
+	a.request(t, 12, "session/prompt", rpcMsg{
+		"sessionId": sid,
+		"prompt":    []any{rpcMsg{"type": "text", "text": "real"}},
+	})
+	a.awaitID(t, 12, 20*time.Second)
+	var runs []any
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m, ok := b.nextWithin(time.Until(deadline))
+		if !ok {
+			break
+		}
+		if m["method"] == "_devingo/turn_running" {
+			p, _ := m["params"].(rpcMsg)
+			runs = append(runs, p["running"])
+		}
+	}
+	if len(runs) != 2 || runs[0] != true || runs[1] != false {
+		t.Fatalf("markers after shell+real prompts = %v, want [true false] (real prompt only)", runs)
+	}
+}
+
 // (d) a permission request reaches every subscriber; the first reply wins,
 // late replies are dropped, and other clients see permission_resolved.
 func TestPermissionFirstReplyWins(t *testing.T) {

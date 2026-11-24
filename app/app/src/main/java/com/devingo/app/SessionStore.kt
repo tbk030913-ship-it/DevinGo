@@ -408,6 +408,16 @@ class SessionStore(
      */
     private var turnEpoch = 0
 
+    /**
+     * `_devingo/turn_running` broadcasts are the hub's authoritative
+     * in-flight-prompt state — once seen, frame inference retires for
+     * remoteTurn: a post-end straggler can no longer relight it. Old bridges
+     * never send the signal, so inference stays live until the first one.
+     */
+    @Volatile private var turnSignalSeen = false
+    /** The hub-side prompt count's last broadcast/attach value — backs remoteTurn. */
+    @Volatile private var hubTurnRunning = false
+
     private fun openTurnGate() {
         turnEnded = false
         turnEpoch++
@@ -648,6 +658,7 @@ class SessionStore(
         // as well would wedge running on past the job's end.
         remoteTurn = result.running &&
             promptJob?.isActive != true && steerJob?.isActive != true
+        hubTurnRunning = result.running
         if (remoteTurn) openTurnGate() else turnEnded = true
         refreshRunning()
         // The hub answers attach BEFORE streaming the backlog: keep the
@@ -783,8 +794,11 @@ class SessionStore(
         replaying = false
         attached = true
         // Same own-job exclusion as markAttached — the count is hub-side
-        // and includes our in-flight prompts.
-        remoteTurn = running &&
+        // and includes our in-flight prompts. Under the hub signal a marker
+        // that landed mid-load already holds the live value — reseeding from
+        // the attach-time snapshot would regress it.
+        if (!turnSignalSeen) hubTurnRunning = running
+        remoteTurn = hubTurnRunning &&
             promptJob?.isActive != true && steerJob?.isActive != true
         if (remoteTurn) openTurnGate() else turnEnded = true
         refreshRunning()
@@ -842,7 +856,41 @@ class SessionStore(
      */
     fun liveGap(seq: Long): Boolean = attached && isLive(seq) && seq > lastSeq + 1
 
+    /**
+     * The hub's authoritative turn state: true = an in-flight prompt exists
+     * (ours or a peer's); false = none. A true edge opens the gate so the
+     * turn's frames stream as live; a false edge is a hard end — from then
+     * on only another true (or our own job start) may relight running.
+     */
+    private fun onTurnRunningSignal(running: Boolean) {
+        turnSignalSeen = true
+        hubTurnRunning = running
+        if (running) {
+            openTurnGate()
+            if (promptJob?.isActive != true && steerJob?.isActive != true) {
+                remoteTurn = true
+            }
+        } else {
+            // The signal IS the authoritative end — it reaches us before the
+            // prompt's response frame, so RemoteTurnEnd would read remoteTurn
+            // already cleared. A peer turn we watched gets its heads-up here.
+            if (remoteTurn) {
+                notifier.notifyTurnDone(
+                    _ui.value.sessionTitle?.takeIf { it.isNotBlank() }
+                        ?: "DevinGo",
+                    sessionId,
+                )
+            }
+            remoteTurn = false
+            turnEnded = true
+        }
+        refreshRunning()
+    }
+
     private fun remoteTurnActivity() {
+        // Once the hub's authoritative turn signal exists, frame inference
+        // must never set remoteTurn — stragglers stay dark by definition.
+        if (turnSignalSeen) return
         if (turnEnded) return
         // Our own jobs speak for the turn — remote frames streaming during
         // a prompt/steer mustn't latch remoteTurn, or it outlives the job.
@@ -881,20 +929,30 @@ class SessionStore(
                     appendStreaming(Kind.User, ev.text, isLive(seq))
                 }
             }
+            is AcpEvent.TurnRunning -> {
+                if (!isLive(seq)) return
+                onTurnRunningSignal(ev.running)
+            }
             is AcpEvent.RemoteTurnEnd -> {
                 if (!isLive(seq)) return
-                if (remoteTurn) {
-                    // A peer turn we watched run just finished — same
-                    // heads-up a local prompt's end posts.
-                    notifier.notifyTurnDone(
-                        _ui.value.sessionTitle?.takeIf { it.isNotBlank() }
-                            ?: "DevinGo",
-                        sessionId,
-                    )
+                // Under the hub signal the count owns remoteTurn: a non-final
+                // peer end (overlapping prompts) must not darken a turn that
+                // is still running, and the final end's clear+notify already
+                // ran at the turn_running(false) edge.
+                if (!turnSignalSeen) {
+                    if (remoteTurn) {
+                        // A peer turn we watched run just finished — same
+                        // heads-up a local prompt's end posts.
+                        notifier.notifyTurnDone(
+                            _ui.value.sessionTitle?.takeIf { it.isNotBlank() }
+                                ?: "DevinGo",
+                            sessionId,
+                        )
+                    }
+                    remoteTurn = false
+                    turnEnded = true
+                    refreshRunning()
                 }
-                remoteTurn = false
-                turnEnded = true
-                refreshRunning()
                 reportStopReason(ev.stopReason)
             }
             is AcpEvent.AgentDead -> {
@@ -1103,6 +1161,7 @@ class SessionStore(
         clearElicitations()
         clearSecrets()
         remoteTurn = false
+        hubTurnRunning = false
         // A shimmering divider must not hang through the outage — mark it
         // failed; a replayed completion on re-attach heals the same item.
         compactionAfterPending = false
@@ -1676,6 +1735,11 @@ class SessionStore(
                     if (steerJob == coroutineContext[Job]) remoteTurn = false
                     turnEnded = true
                 }
+                // Under the hub's turn signal a peer prompt may outlive our
+                // job — carry its state forward instead of going dark.
+                if (turnSignalSeen) {
+                    remoteTurn = hubTurnRunning && promptJob?.isActive != true
+                }
                 refreshRunning()
             }
         }
@@ -1906,6 +1970,11 @@ class SessionStore(
                 // post-job straggler can't latch remoteTurn back on, unless
                 // a newer turn already opened it (peer prompt mid-job).
                 if (turnEpoch == epoch) turnEnded = true
+                // Under the hub's turn signal a peer prompt may outlive our
+                // job — carry its state forward instead of going dark.
+                if (turnSignalSeen) {
+                    remoteTurn = hubTurnRunning && steerJob?.isActive != true
+                }
                 // refreshRunning's falling edge releases the next queued
                 // prompt — no explicit drain here or it would send two.
                 refreshRunning()

@@ -144,6 +144,16 @@ interface AcpEvent {
         val stopReason: String?,
     ) : AcpEvent
     /**
+     * Gateway marker `_devingo/turn_running`: the hub's authoritative
+     * in-flight-prompt state for this session (emitted on every 0↔nonzero
+     * transition of its prompt counter). Once seen, the store treats it as
+     * the source of truth for [remoteTurn] instead of inferring turn state
+     * from update frames — a post-end straggler can no longer relight it.
+     */
+    data class TurnRunning(
+        val running: Boolean,
+    ) : AcpEvent
+    /**
      * `elicitation/complete` as a notification — the agent closed the
      * pending question card on its own; drop it without answering.
      */
@@ -1103,6 +1113,12 @@ class AcpClient(
                 AcpEvent.AgentDead(
                     (p["reason"] as? JsonPrimitive)?.textOrNull
                         ?: "devin 进程已退出",
+                ),
+            )
+            "_devingo/turn_running" -> emit(
+                sessionId, seq,
+                AcpEvent.TurnRunning(
+                    (p["running"] as? JsonPrimitive)?.textOrNull == "true",
                 ),
             )
             AcpMethods.ELICITATION_COMPLETE, AcpMethods.SESSION_ELICITATION_COMPLETE -> {

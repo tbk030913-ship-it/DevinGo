@@ -107,6 +107,10 @@ type clientReq struct {
 	session *Session        // session marked in-flight at forward time (nil when unscoped)
 	waiter  chan callResult // non-nil for the gateway's own calls
 	fan     bool            // authenticate fan-out copy: response marks authed, never delivered (W8.3)
+	// session/prompt incremented s.running at forward time — the response
+	// side decrements only when this paired flag is set (`!` user-shell
+	// prompts don't count: they run in the shell, not as a turn).
+	promptCounted bool
 }
 
 type callResult struct {
@@ -569,9 +573,12 @@ func (h *Hub) procDied(p *devinProc, cause error) {
 		if s.procKey != p.key {
 			continue // hosted on a sibling process — unaffected
 		}
-		s.running = 0
 		s.inflight = 0
 		s.loaders = map[*Client]int{}
+		if s.running > 0 {
+			s.running = 0
+			h.broadcastTurnStateLocked(s)
+		}
 		h.broadcastJournalLocked(s, markerFrame("_devingo/agent_dead",
 			map[string]any{"sessionId": s.id, "reason": cause.Error()}), nil)
 		s.maybeArmIdleLocked(h)
@@ -767,8 +774,18 @@ func (h *Hub) forwardToDevin(c *Client, p *devinProc, head rpcHead, data []byte)
 		s.cancelIdleLocked()
 		switch head.Method {
 		case "session/prompt":
-			s.running++
-			s.lastPrompter = c
+			// `!` user-shell commands ride session/prompt but run in the
+			// shell, not as a turn: they keep no running count and emit no
+			// turn broadcast — a long `!` flight would otherwise wedge
+			// every client's prompt queue behind it.
+			if !userShellPrompt(head) {
+				cr.promptCounted = true
+				s.running++
+				s.lastPrompter = c
+				if s.running == 1 {
+					h.broadcastTurnStateLocked(s)
+				}
+			}
 		case "session/load":
 			s.loaders[c]++
 		}
@@ -783,9 +800,14 @@ func (h *Hub) forwardToDevin(c *Client, p *devinProc, head rpcHead, data []byte)
 			s.inflight--
 			switch head.Method {
 			case "session/prompt":
-				s.running--
-				if s.lastPrompter == c {
-					s.lastPrompter = nil
+				if cr.promptCounted {
+					s.running--
+					if s.lastPrompter == c {
+						s.lastPrompter = nil
+					}
+					if s.running == 0 {
+						h.broadcastTurnStateLocked(s)
+					}
 				}
 			case "session/load":
 				s.loaders[c]--
@@ -970,10 +992,13 @@ func (h *Hub) devinResponse(p *devinProc, line []byte, head rpcHead) {
 	// gone) session after a delete+lazy-recreate edge.
 	if cr.session != nil {
 		cr.session.inflight--
-		if cr.method == "session/prompt" {
+		if cr.promptCounted {
 			cr.session.running--
 			if cr.session.lastPrompter == cr.client {
 				cr.session.lastPrompter = nil
+			}
+			if cr.session.running == 0 {
+				h.broadcastTurnStateLocked(cr.session)
 			}
 			// Offline push: a turn that just ended with no live audience
 			// still reaches the user. s == cr.session confines this to the
@@ -2115,6 +2140,45 @@ func markerFrame(method string, params map[string]any) json.RawMessage {
 		"params":  params,
 	})
 	return b
+}
+
+// userShellPrompt reports whether a session/prompt carries devin's
+// user-shell marker (`!` commands execute in the shell, not as a turn).
+func userShellPrompt(head rpcHead) bool {
+	for _, b := range head.Params.Prompt {
+		if b.Meta.UserShellCommand {
+			return true
+		}
+	}
+	return false
+}
+
+// broadcastTurnStateLocked pushes the authoritative in-flight-prompt state to
+// subscribers on each 0↔nonzero transition of s.running. Clients render turn
+// state from this signal instead of inferring it from update frames — a
+// post-end straggler can no longer masquerade as a live turn.
+//
+// Live-only, NOT journaled: attach/load already reports the same state
+// atomically in its result, and a journaled copy would consume a _seq that
+// old clients never ack — every turn edge would read as a withheld-frame gap
+// and force a re-attach. Unsequenced also keeps it "live" on the client even
+// inside a session/load replay window.
+// Caller holds h.mu.
+func (h *Hub) broadcastTurnStateLocked(s *Session) {
+	wire := markerFrame("_devingo/turn_running", map[string]any{
+		"sessionId": s.id,
+		"running":   s.running > 0,
+	})
+	for c := range s.subs {
+		h.deliverLocked(c, wire)
+	}
+	// Loaders too: during a load window they own the delivery pool, and a
+	// turn edge inside it must not be missed.
+	for c := range s.loaders {
+		if !s.subs[c] {
+			h.deliverLocked(c, wire)
+		}
+	}
 }
 
 func resultFrame(id json.RawMessage, result json.RawMessage) []byte {
@@ -3571,6 +3635,13 @@ type rpcHead struct {
 		// _meta carries the _devingo spawn profile (agentType /
 		// refusalFallback) on session/new|load — read by frameProcKeyLocked.
 		Meta json.RawMessage `json:"_meta"`
+		// session/prompt content blocks — scanned only for the
+		// userShellCommand marker, which doesn't count toward running.
+		Prompt []struct {
+			Meta struct {
+				UserShellCommand bool `json:"cognition.ai/userShellCommand"`
+			} `json:"_meta"`
+		} `json:"prompt"`
 	} `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  json.RawMessage `json:"error"`
