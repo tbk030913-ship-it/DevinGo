@@ -4,6 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.devingo.app.acp.AgentCaps
 import com.devingo.app.acp.AgentType
+import com.devingo.app.acp.EcoItem
+import com.devingo.app.acp.EcoList
+import com.devingo.app.acp.McpAuthResult
+import com.devingo.app.acp.McpLoginState
 import com.devingo.app.acp.FsDirListing
 import com.devingo.app.acp.FsReadResult
 import com.devingo.app.acp.FsSearchItem
@@ -325,6 +329,14 @@ class ChatViewModel(
         store?.resend(item)
     }
 
+    /**
+     * The UsageLimit card's 重试 (M9.2): applies prefs' 回退模型 to the
+     * bound session, then resends the tripped prompt.
+     */
+    fun retryUsageLimit(card: ChatItem) {
+        store?.retryUsageLimit(card, Prefs(getApplication<Application>()).refusalFallbackModel)
+    }
+
     fun cancelTurn() {
         store?.cancelTurn()
     }
@@ -553,4 +565,35 @@ class ChatViewModel(
     } catch (e: Exception) {
         emptyList()
     }
+
+    // ---- ecosystem (M9.2): MCP servers, skills/rules/plugins, doctor --------
+
+    /** `devin mcp list` rows — live-refreshed on `…/mcp/serversChanged`. */
+    val mcpServers: StateFlow<List<EcoItem>?> = cm.mcpServers
+
+    /** Agent-initiated MCP OAuth ask — the sign-in sheet collects it. */
+    val mcpAuthRequest: StateFlow<ConnectionManager.McpAuthRequest?> =
+        cm.mcpAuthRequest
+
+    fun refreshMcpServers() = cm.refreshMcpServers()
+
+    /** Per-server switch — error text on failure, null on success. */
+    suspend fun setMcpServerEnabled(name: String, enabled: Boolean): String? =
+        cm.setMcpServerEnabled(name, enabled)
+
+    suspend fun startMcpLogin(name: String): McpLoginState = cm.startMcpLogin(name)
+
+    suspend fun mcpLoginStatus(name: String): McpLoginState? = cm.mcpLoginStatus(name)
+
+    suspend fun submitMcpAuthCallback(name: String, url: String): McpAuthResult =
+        cm.submitMcpAuthCallback(name, url)
+
+    fun dismissMcpAuthRequest() = cm.dismissMcpAuthRequest()
+
+    suspend fun fetchEcoList(kind: String): EcoList = cm.fetchEcoList(kind)
+
+    suspend fun fetchEcoShow(kind: String, name: String): String =
+        cm.fetchEcoShow(kind, name)
+
+    suspend fun fetchDoctor(): String = cm.fetchDoctor()
 }

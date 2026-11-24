@@ -100,6 +100,7 @@ fun SettingsScreen(
     val context = LocalContext.current
     val cs = MaterialTheme.colorScheme
     var editField by remember { mutableStateOf<EditField?>(null) }
+    var ecoSheet by remember { mutableStateOf<EcoSheet?>(null) }
     var logoutConfirm by remember { mutableStateOf(false) }
 
     // System states re-read on every resume.
@@ -479,6 +480,26 @@ fun SettingsScreen(
                 },
             )
 
+            // ---- 生态（M9.2）---------------------------------------------------------
+            SectionHeader("生态", Modifier.padding(start = 20.dp))
+            val mcpServers by vm.mcpServers.collectAsState()
+            SettingRow(
+                "MCP 服务",
+                subtitle = mcpServers?.let { list ->
+                    val on = list.count { it.enabled != false }
+                    "${list.size} 个服务器 · $on 个已启用"
+                },
+                onClick = { ecoSheet = EcoSheet.Mcp },
+            )
+            SettingRow(
+                "Rules · Skills · Plugins",
+                onClick = { ecoSheet = EcoSheet.Lists },
+            )
+            SettingRow(
+                "环境诊断",
+                onClick = { ecoSheet = EcoSheet.Doctor },
+            )
+
             // ---- 关于 ---------------------------------------------------------------
             SectionHeader("关于", Modifier.padding(start = 20.dp))
             val versionName = remember {
@@ -498,6 +519,12 @@ fun SettingsScreen(
             prefs = prefs,
             onDismiss = { editField = null },
         )
+    }
+    when (ecoSheet) {
+        EcoSheet.Mcp -> McpServersSheet(vm, onDismiss = { ecoSheet = null })
+        EcoSheet.Lists -> EcoListSheet(vm, onDismiss = { ecoSheet = null })
+        EcoSheet.Doctor -> DoctorSheet(vm, onDismiss = { ecoSheet = null })
+        null -> Unit
     }
     if (logoutConfirm) {
         AlertDialog(
@@ -521,6 +548,9 @@ private fun masked(value: String): String =
     if (value.isBlank()) "未设置" else "••••••••"
 
 private enum class EditField { Host, Token, Cwd, ApiKey, RefusalFallback }
+
+/** Which M9.2 ecosystem sheet is open over settings. */
+private enum class EcoSheet { Mcp, Lists, Doctor }
 
 /** Single-field editor sheet; secrets get a visibility toggle. */
 @Composable

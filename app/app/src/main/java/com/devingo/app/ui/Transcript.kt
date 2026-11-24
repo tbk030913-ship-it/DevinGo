@@ -93,6 +93,7 @@ import me.rerere.hugeicons.stroke.ChevronRight
 import me.rerere.hugeicons.stroke.Copy01
 import me.rerere.hugeicons.stroke.FloppyDisk
 import me.rerere.hugeicons.stroke.PencilEdit01
+import me.rerere.hugeicons.stroke.RefreshCw
 import me.rerere.hugeicons.stroke.Terminal
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 
@@ -181,6 +182,8 @@ internal fun Transcript(
     onReviewDiff: (Long, String?) -> Unit,
     onUserLongPress: (ChatItem) -> Unit,
     onResend: (ChatItem) -> Unit,
+    /** M9.2: the UsageLimit card's 重试 — fallback model + resend. */
+    onRetryUsageLimit: (ChatItem) -> Unit,
     onEditQueued: (Long) -> Unit,
     /** Long-press 引用 on an agent message — pins it as a draft citation. */
     onQuote: (ChatItem) -> Unit,
@@ -330,6 +333,7 @@ internal fun Transcript(
                                     m,
                                     onQuote = { onQuote(m) },
                                     onSavePlan = { onSavePlan(m) },
+                                    onRetryUsageLimit = { onRetryUsageLimit(m) },
                                 )
                             }
                         }
@@ -792,6 +796,7 @@ private fun BodyItem(
     streaming: Boolean = false,
     onQuote: () -> Unit = {},
     onSavePlan: () -> Unit = {},
+    onRetryUsageLimit: () -> Unit = {},
     meta: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
@@ -802,6 +807,7 @@ private fun BodyItem(
         Kind.Plan -> PlanCard(m, onSavePlan, modifier)
         Kind.Compaction -> CompactionDivider(m, modifier)
         Kind.ShellCommand -> ShellCommandLine(m, modifier)
+        Kind.UsageLimit -> UsageLimitCard(m, onRetryUsageLimit, modifier)
         else -> Unit // Thought/Tool/Answered never render inline.
     }
 }
@@ -1038,6 +1044,87 @@ private fun ErrorLine(text: String, modifier: Modifier = Modifier) {
             maxLines = 4,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+/**
+ * M9.2's quota/rate-limit recovery card (t3code UsageLimitRecoveryCard
+ * port): headline + optional reset instant + one-tap 重试 that applies
+ * the configured fallback model and resends the tripped prompt. After
+ * firing, `status="retried"` freezes the card as a plain notice.
+ */
+@Composable
+private fun UsageLimitCard(
+    m: ChatItem,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    val resetText = remember(m.resetAtMs) {
+        m.resetAtMs?.let {
+            "将于 ${SimpleDateFormat("M月d日 HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it))} 重置"
+        }
+    }
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = cs.errorContainer.copy(alpha = 0.35f),
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Warning, null,
+                    modifier = Modifier.size(16.dp),
+                    tint = cs.error,
+                )
+                Text(
+                    listOfNotNull(m.text, resetText).joinToString(" · "),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurface,
+                )
+            }
+            m.detail?.takeIf { it.isNotBlank() && it != m.text }?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 4.dp, start = 24.dp),
+                )
+            }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp, start = 24.dp),
+            ) {
+                if (m.status == "retried") {
+                    Text(
+                        "已重试",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = cs.onSurfaceVariant,
+                    )
+                } else {
+                    OutlinePillButton(
+                        "重试",
+                        onClick = onRetry,
+                        leadingIcon = {
+                            Icon(
+                                HugeIcons.RefreshCw, null,
+                                modifier = Modifier.size(16.dp),
+                                tint = cs.onSurface,
+                            )
+                        },
+                        modifier = Modifier.widthIn(min = 96.dp),
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -138,9 +138,13 @@ interface AcpEvent {
     /**
      * `_devingo/event` carrying a journaled response owned by another client.
      * Only turn-ending frames are surfaced: a `session/prompt` result means a
-     * remote client's turn finished.
+     * remote client's turn finished. [resetAtMs] is the quota-reset instant
+     * decoded off `result._meta` on a `quota_exhausted` end (M9.2).
      */
-    data class RemoteTurnEnd(val stopReason: String?) : AcpEvent
+    data class RemoteTurnEnd(
+        val stopReason: String?,
+        val resetAtMs: Long? = null,
+    ) : AcpEvent
     /**
      * `elicitation/complete` as a notification — the agent closed the
      * pending question card on its own; drop it without answering.
@@ -177,6 +181,26 @@ interface AcpEvent {
      * unlike [ToolCallUpdate] which replaces.
      */
     data class ToolContentChunk(val call: ToolCallInfo) : AcpEvent
+    /**
+     * `_cognition.ai/mcp/serversChanged` — the configured MCP server set or
+     * a server's runtime status changed (M9.2). The payload layout varies
+     * across builds, so consumers re-read `devin mcp list` instead of
+     * parsing [params].
+     */
+    data class McpServersChanged(val params: JsonObject) : AcpEvent
+    /**
+     * `_cognition.ai/mcp/authorizationRequired` — the agent needs the user
+     * to complete OAuth for [serverName] at [authorizationUrl].
+     */
+    data class McpAuthorizationRequired(
+        val serverName: String,
+        val authorizationUrl: String,
+    ) : AcpEvent
+    /**
+     * `_cognition.ai/mcp/authorizationFinished` — a pending OAuth flow
+     * completed; server list state should be re-read.
+     */
+    data class McpAuthorizationFinished(val serverName: String?) : AcpEvent
 }
 
 /**
@@ -546,7 +570,13 @@ class AcpClient(
                 running = o.boolField("running") ?: false,
                 pendingPermission = o.boolField("pendingPermission") ?: false,
                 excerpts = decodeExcerpts(o["excerpts"])
-                    .ifEmpty { decodeExcerpts(meta?.get("excerpts")) },
+                    .ifEmpty { decodeExcerpts(meta?.get("excerpts")) }
+                    // Evidenced wire key — same SessionMeta family as
+                    // cognition.ai/isLocked (devin-strings.txt).
+                    .ifEmpty {
+                        decodeExcerpts(meta?.get("cognition.ai/messageExcerpts"))
+                    }
+                    .ifEmpty { decodeExcerpts(o["messageExcerpts"]) },
             )
         }
     }
@@ -797,8 +827,13 @@ class AcpClient(
         AcpMethods.SESSION_SHARE,
         buildJsonObject { put("sessionId", sessionId) },
     ).let {
-        val r = (it["result"] as? JsonObject) ?: it
-        r.strField("url", "shareUrl", "share_url", "link", "sessionUrl")
+        when (val r = it["result"]) {
+            is JsonObject -> r.strField(
+                "url", "shareUrl", "share_url", "link", "sessionUrl",
+            )
+            is JsonPrimitive -> r.takeIf { p -> p.isString }?.content
+            else -> null
+        } ?: it.strField("url", "shareUrl", "share_url", "link", "sessionUrl")
     }
 
     // ---- @-mention resource lists (A7.3) -------------------------------------
@@ -1101,11 +1136,17 @@ class AcpClient(
                 // error on another request kind would just end the marker a
                 // beat early; the next chunk re-marks it.)
                 val frame = p["event"] as? JsonObject
-                val stopReason = ((frame?.get("result") as? JsonObject)
-                    ?.get("stopReason") as? JsonPrimitive)?.textOrNull
+                val result = frame?.get("result") as? JsonObject
+                val stopReason = (result?.get("stopReason") as? JsonPrimitive)
+                    ?.textOrNull
                 when {
-                    stopReason != null ->
-                        emit(sessionId, seq, AcpEvent.RemoteTurnEnd(stopReason))
+                    stopReason != null -> emit(
+                        sessionId, seq,
+                        AcpEvent.RemoteTurnEnd(
+                            stopReason,
+                            quotaResetMs(result, result?.get("_meta") as? JsonObject),
+                        ),
+                    )
                     frame?.get("error") != null -> emit(
                         sessionId, seq,
                         AcpEvent.RemoteTurnEnd(
@@ -1191,7 +1232,26 @@ class AcpClient(
                         (p["firstRemovedUserMessageId"] as? JsonPrimitive)?.textOrNull,
                     ),
                 )
-            // _cognition.ai/mcp/serversChanged and other extensions: ignore.
+            // M9.2: MCP lifecycle — both the `_cognition.ai/…` (extension)
+            // and `cognition.ai/…` spellings reach the wire.
+            "cognition.ai/mcp/serversChanged", "_cognition.ai/mcp/serversChanged" ->
+                emit(sessionId, seq, AcpEvent.McpServersChanged(p))
+            "cognition.ai/mcp/authorizationRequired",
+            "_cognition.ai/mcp/authorizationRequired" -> {
+                val serverName = p.strField("serverName", "server_name", "name")
+                    .orEmpty()
+                val authUrl = p.strField("authorizationUrl", "authorization_url",
+                    "authUrl", "url").orEmpty()
+                if (authUrl.isNotEmpty()) {
+                    emit(sessionId, seq,
+                        AcpEvent.McpAuthorizationRequired(serverName, authUrl))
+                }
+            }
+            "cognition.ai/mcp/authorizationFinished",
+            "_cognition.ai/mcp/authorizationFinished" ->
+                emit(sessionId, seq, AcpEvent.McpAuthorizationFinished(
+                    p.strField("serverName", "server_name", "name")))
+            // _cognition.ai/plugins/changed and other extensions: ignore.
         }
     }
 
@@ -1352,6 +1412,18 @@ class AcpClient(
             else -> Log.w(TAG, "Unknown sessionUpdate kind: $kind")
         }
     }
+
+    /**
+     * Quota-reset keys on a turn-end frame (M9.2): `*_quota_reset_at_unix`
+     * ride `result` or `result._meta`. Returns the earliest future instant
+     * in epoch ms — unix seconds are promoted, an already-ms value passes.
+     */
+    private fun quotaResetMs(a: JsonObject?, b: JsonObject?): Long? =
+        firstLong(
+            a, b,
+            "daily_quota_reset_at_unix", "weekly_quota_reset_at_unix",
+            "quota_reset_at_unix", "reset_at_unix", "resetAt",
+        )?.let { if (it < 10_000_000_000_000L) it * 1000 else it }
 
     /** First [keys] hit across [a] then [b] as a lenient long. */
     private fun firstLong(
@@ -1850,22 +1922,23 @@ data class GitOpResult(
 )
 
 /**
- * Shared plumbing for the /git/ endpoints (W8.2): bearer auth, query or
- * JSON-body request, and non-2xx → [AcpException] carrying the server's
- * `error` field (sanitized git text — safe to show verbatim).
+ * Shared plumbing for the bridge's JSON endpoints (git W8.2, ecosystem
+ * M9.2): bearer auth, query or JSON-body request, and non-2xx →
+ * [AcpException] carrying the server's `error` field (sanitized server
+ * text — safe to show verbatim).
  */
-private suspend fun bridgeGitJson(
+private suspend fun bridgeJson(
     baseHttpUrl: String,
     token: String?,
     method: String, // "GET" | "POST"
     path: String,
     query: List<Pair<String, String>> = emptyList(),
     body: JsonObject? = null,
+    readTimeoutSec: Long = 35, // the bridge's 30s op budget plus slack
 ): JsonObject = withContext(Dispatchers.IO) {
     val client = bridgeHttpClient.newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
-        // Mutations get the bridge's own 30s budget plus slack.
-        .readTimeout(35, TimeUnit.SECONDS)
+        .readTimeout(readTimeoutSec, TimeUnit.SECONDS)
         .build()
     val url = "$baseHttpUrl$path".toHttpUrl().newBuilder().apply {
         query.forEach { (k, v) -> addQueryParameter(k, v) }
@@ -1898,7 +1971,7 @@ suspend fun getBridgeGitStatus(
     sessionId: String,
     cwd: String,
 ): GitStatus {
-    val obj = bridgeGitJson(baseHttpUrl, token, "GET", "/git/status",
+    val obj = bridgeJson(baseHttpUrl, token, "GET", "/git/status",
         listOf("sessionId" to sessionId, "cwd" to cwd))
     return GitStatus(
         isRepo = obj.boolField("isRepo") == true,
@@ -1925,7 +1998,7 @@ suspend fun getBridgeGitBranches(
     sessionId: String,
     cwd: String,
 ): GitBranches {
-    val obj = bridgeGitJson(baseHttpUrl, token, "GET", "/git/branches",
+    val obj = bridgeJson(baseHttpUrl, token, "GET", "/git/branches",
         listOf("sessionId" to sessionId, "cwd" to cwd))
     return GitBranches(
         current = obj.strField("current").orEmpty(),
@@ -1953,7 +2026,7 @@ suspend fun postBridgeGitCheckout(
     cwd: String,
     branch: String?,
     createBranch: String?,
-): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/checkout",
+): GitOpResult = bridgeJson(baseHttpUrl, token, "POST", "/git/checkout",
     body = buildJsonObject {
         put("sessionId", sessionId)
         put("cwd", cwd)
@@ -1974,7 +2047,7 @@ suspend fun postBridgeGitCommit(
     files: List<String>,
     message: String,
     createBranch: String?,
-): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/commit",
+): GitOpResult = bridgeJson(baseHttpUrl, token, "POST", "/git/commit",
     body = buildJsonObject {
         put("sessionId", sessionId)
         put("cwd", cwd)
@@ -1989,7 +2062,7 @@ suspend fun postBridgeGitPush(
     token: String?,
     sessionId: String,
     cwd: String,
-): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/push",
+): GitOpResult = bridgeJson(baseHttpUrl, token, "POST", "/git/push",
     body = buildJsonObject {
         put("sessionId", sessionId)
         put("cwd", cwd)
@@ -2001,7 +2074,7 @@ suspend fun postBridgeGitPull(
     token: String?,
     sessionId: String,
     cwd: String,
-): GitOpResult = bridgeGitJson(baseHttpUrl, token, "POST", "/git/pull",
+): GitOpResult = bridgeJson(baseHttpUrl, token, "POST", "/git/pull",
     body = buildJsonObject {
         put("sessionId", sessionId)
         put("cwd", cwd)
@@ -2061,3 +2134,184 @@ suspend fun fetchBridgeHealth(baseHttpUrl: String, token: String?): BridgeHealth
             healthJson.decodeFromString(BridgeHealth.serializer(), resp.body?.string() ?: "")
         }
     }
+
+// ---- ecosystem (M9.2): mcp / skills / rules / plugins / doctor ------------------
+
+/** One normalized row from `devin <x> list --format json` (bridge-side lift). */
+data class EcoItem(
+    val name: String,
+    val detail: String = "",
+    val path: String = "",
+    val enabled: Boolean? = null,
+    val status: String = "",
+)
+
+/** A `/…/list` payload — parsed rows when JSON mode yielded, raw text always. */
+data class EcoList(val items: List<EcoItem>, val output: String)
+
+private fun JsonObject.toEcoList(): EcoList = EcoList(
+    items = (this["items"] as? JsonArray)?.mapNotNull { el ->
+        val o = el as? JsonObject ?: return@mapNotNull null
+        EcoItem(
+            name = o.strField("name") ?: return@mapNotNull null,
+            detail = o.strField("detail").orEmpty(),
+            path = o.strField("path").orEmpty(),
+            enabled = o.boolField("enabled"),
+            status = o.strField("status").orEmpty(),
+        )
+    }.orEmpty(),
+    output = strField("output").orEmpty(),
+)
+
+private fun workspaceQuery(sessionId: String?, cwd: String?): List<Pair<String, String>> =
+    buildList {
+        sessionId?.takeIf { it.isNotBlank() }?.let { add("sessionId" to it) }
+        cwd?.takeIf { it.isNotBlank() }?.let { add("cwd" to it) }
+    }
+
+/**
+ * `devin mcp list` via `GET /mcp/list` — rows carry enabled/status when the
+ * server's JSON decoded. Throws [AcpException] on non-2xx.
+ */
+suspend fun getBridgeMcpList(
+    baseHttpUrl: String,
+    token: String?,
+    sessionId: String? = null,
+    cwd: String? = null,
+): EcoList = bridgeJson(baseHttpUrl, token, "GET", "/mcp/list",
+    workspaceQuery(sessionId, cwd)).toEcoList()
+
+/**
+ * `devin <kind> list` via `GET /<kind>/list` — kind ∈ skills|rules|plugins.
+ * Throws [AcpException] on non-2xx.
+ */
+suspend fun getBridgeEcoList(
+    baseHttpUrl: String,
+    token: String?,
+    kind: String,
+    sessionId: String? = null,
+    cwd: String? = null,
+): EcoList = bridgeJson(baseHttpUrl, token, "GET", "/$kind/list",
+    workspaceQuery(sessionId, cwd)).toEcoList()
+
+/** `devin <kind> show <name>` — the entry's detail text. */
+suspend fun getBridgeEcoShow(
+    baseHttpUrl: String,
+    token: String?,
+    kind: String,
+    name: String,
+    sessionId: String? = null,
+    cwd: String? = null,
+): String = bridgeJson(baseHttpUrl, token, "GET", "/$kind/show",
+    workspaceQuery(sessionId, cwd) + ("name" to name)).strField("output").orEmpty()
+
+/**
+ * `devin mcp enable|disable <name>` — only ever fired by an explicit tap on
+ * a server row's switch. Returns the CLI output on success; throws
+ * [AcpException] with the CLI error text otherwise.
+ */
+suspend fun postBridgeMcpToggle(
+    baseHttpUrl: String,
+    token: String?,
+    name: String,
+    enabled: Boolean,
+    cwd: String? = null,
+): String = bridgeJson(baseHttpUrl, token, "POST", "/mcp/toggle",
+    body = buildJsonObject {
+        put("name", name)
+        put("enabled", enabled)
+        cwd?.takeIf { it.isNotBlank() }?.let { put("cwd", it) }
+    }).strField("output").orEmpty()
+
+/** A pending `devin mcp login` flow's state (bridge `/mcp/login`). */
+data class McpLoginState(
+    val name: String = "",
+    val authUrl: String? = null,
+    val output: String = "",
+    val done: Boolean = false,
+    /** Process exit error — only meaningful once [done]. */
+    val error: String? = null,
+)
+
+private fun JsonObject.toMcpLoginState(): McpLoginState = McpLoginState(
+    name = strField("name").orEmpty(),
+    authUrl = strField("authUrl")?.takeIf { it.isNotBlank() },
+    output = strField("output").orEmpty(),
+    done = boolField("done") == true,
+    error = strField("error")?.takeIf { it.isNotBlank() },
+)
+
+/**
+ * `POST /mcp/login` — spawns (or reuses) a `devin mcp login` parked on
+ * stdin and waits ≤15s for the authorization URL to appear in its output.
+ * [McpLoginState.authUrl] may still be null (slow provider) — poll
+ * [getBridgeMcpLoginStatus].
+ */
+suspend fun postBridgeMcpLogin(
+    baseHttpUrl: String,
+    token: String?,
+    name: String,
+    cwd: String? = null,
+): McpLoginState = bridgeJson(baseHttpUrl, token, "POST", "/mcp/login",
+    body = buildJsonObject {
+        put("name", name)
+        cwd?.takeIf { it.isNotBlank() }?.let { put("cwd", it) }
+    }).toMcpLoginState()
+
+/** `GET /mcp/login?name=` — null when no login is pending for [name]. */
+suspend fun getBridgeMcpLoginStatus(
+    baseHttpUrl: String,
+    token: String?,
+    name: String,
+): McpLoginState? = try {
+    bridgeJson(baseHttpUrl, token, "GET", "/mcp/login",
+        listOf("name" to name)).toMcpLoginState()
+} catch (e: AcpException) {
+    null // 404 — nothing pending
+}
+
+/** Result of relaying the pasted OAuth callback URL (`/mcp/authCallback`). */
+data class McpAuthResult(
+    val ok: Boolean,
+    val via: String = "",
+    val status: Int = 0,
+    val body: String = "",
+)
+
+/**
+ * `POST /mcp/authCallback` — the pasted OAuth redirect is delivered to a
+ * live login's stdin (manual-token flow) or fetched on the bridge's
+ * loopback (agent-side listener). The URL never leaves the PC the user
+ * can't reach from the phone.
+ */
+suspend fun postBridgeMcpAuthCallback(
+    baseHttpUrl: String,
+    token: String?,
+    name: String,
+    url: String,
+): McpAuthResult {
+    val obj = bridgeJson(baseHttpUrl, token, "POST", "/mcp/authCallback",
+        body = buildJsonObject {
+            put("name", name)
+            put("url", url)
+        })
+    return McpAuthResult(
+        ok = obj.boolField("ok") == true,
+        via = obj.strField("via").orEmpty(),
+        status = obj.intField("status") ?: 0,
+        body = obj.strField("body").orEmpty(),
+    )
+}
+
+/**
+ * `GET /doctor` — `devin doctor` diagnostics output (up to ~90s of checks;
+ * the read budget matches). A failing check still returns 200 with the
+ * output plus an `error` key.
+ */
+suspend fun getBridgeDoctor(baseHttpUrl: String, token: String?): String {
+    val obj = bridgeJson(baseHttpUrl, token, "GET", "/doctor",
+        readTimeoutSec = 100)
+    val out = obj.strField("output").orEmpty()
+    val err = obj.strField("error")
+    return if (err.isNullOrBlank()) out else "$out\n$err"
+}

@@ -849,7 +849,7 @@ class SessionStore(
                 if (!isLive(seq)) return
                 remoteTurn = false
                 refreshRunning()
-                reportStopReason(ev.stopReason)
+                reportStopReason(ev.stopReason, ev.resetAtMs)
             }
             is AcpEvent.AgentDead -> {
                 remoteTurn = false
@@ -1575,12 +1575,10 @@ class SessionStore(
             try {
                 // Same block assembly as send — @-mentions steer as
                 // resource_links, not literal tokens.
-                reportStopReason(
-                    client.promptBlocks(
-                        sessionId,
-                        buildBlocks(merged, emptyList()),
-                    ).stopReason,
-                )
+                client.promptBlocks(
+                    sessionId,
+                    buildBlocks(merged, emptyList()),
+                ).let { reportStopReason(it.stopReason, quotaResetMs(it._meta)) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1790,7 +1788,7 @@ class SessionStore(
             try {
                 val result = client.promptBlocks(sessionId, blocks)
                 onSessionReady?.invoke(sessionId, cwd)
-                reportStopReason(result.stopReason)
+                reportStopReason(result.stopReason, quotaResetMs(result._meta))
                 if (currentMessages.isNotEmpty()) {
                     notifier.notifyTurnDone(
                         _ui.value.sessionTitle?.takeIf { it.isNotBlank() } ?: "DevinGo",
@@ -1800,13 +1798,18 @@ class SessionStore(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (!promptAcked) {
+                val msg = e.display()
+                if (isQuotaText(msg)) {
+                    // A quota-class JSON-RPC error gets the recovery card
+                    // too (stopReason isn't the only carrier — M9.2).
+                    appendUsageLimit(null, msg)
+                } else if (!promptAcked) {
                     // No turn activity ever arrived — the agent likely never
                     // received the prompt, so flag the local echo accordingly.
                     markFailed(userItem.id)
-                    append(Kind.Error, "${e.display()}（消息可能未送达）")
+                    append(Kind.Error, "$msg（消息可能未送达）")
                 } else {
-                    append(Kind.Error, e.display())
+                    append(Kind.Error, msg)
                 }
             } finally {
                 // refreshRunning's falling edge releases the next queued
@@ -1970,13 +1973,73 @@ class SessionStore(
         trimEnd(*",;:!?)]}'\"".toCharArray())
 
     /** Non-`end_turn` stop reasons get a visible system line. */
-    private fun reportStopReason(stopReason: String?) {
+    private fun reportStopReason(stopReason: String?, resetAtMs: Long? = null) {
         when (stopReason) {
             null, "end_turn" -> {}
             "cancelled" -> append(Kind.System, "本轮已取消")
             "max_tokens" -> append(Kind.System, "达到输出上限")
             "refusal" -> append(Kind.System, "被拒绝")
+            "quota_exhausted" -> appendUsageLimit(resetAtMs, stopReason)
             else -> append(Kind.System, stopReason)
+        }
+    }
+
+    /**
+     * Quota-class text on a prompt error (M9.2): matches the agent's
+     * "Quota exhausted"/"usage limit"/"rate limit" family plus the
+     * `quota_exhausted` enum spelling — the recovery card's trigger when
+     * the failure arrives as an exception rather than a stopReason.
+     */
+    private fun isQuotaText(msg: String): Boolean =
+        msg.contains("quota", ignoreCase = true) ||
+            msg.contains("usage limit", ignoreCase = true) ||
+            msg.contains("rate limit", ignoreCase = true) ||
+            msg.contains("额度") || msg.contains("配额")
+
+    /** `*_quota_reset_at_unix` keys on a frame's `_meta` → epoch ms. */
+    private fun quotaResetMs(meta: JsonObject?): Long? {
+        if (meta == null) return null
+        return listOf(
+            "daily_quota_reset_at_unix", "weekly_quota_reset_at_unix",
+            "quota_reset_at_unix", "reset_at_unix",
+        ).firstNotNullOfOrNull { (meta[it] as? JsonPrimitive)?.longOrNull }
+            ?.let { if (it < 10_000_000_000_000L) it * 1000 else it }
+    }
+
+    /**
+     * The M9.2 quota/rate-limit recovery card: headline + the wire's raw
+     * reason in [detail], reset instant in [ChatItem.resetAtMs].
+     */
+    private fun appendUsageLimit(resetAtMs: Long?, raw: String) {
+        append(Kind.UsageLimit, "额度已用尽", detail = raw, resetAtMs = resetAtMs)
+    }
+
+    /**
+     * The UsageLimit card's 重试: [fallbackModel] (设置里的回退模型，逗号
+     * 列表取第一个) is applied through session/set_config_option first,
+     * then the user message that tripped the quota resends verbatim. The
+     * card flips to 已重试 so the button can't fire twice.
+     */
+    fun retryUsageLimit(card: ChatItem, fallbackModel: String?) {
+        if (card.kind != Kind.UsageLimit || card.status == "retried") return
+        val idx = currentMessages.indexOfLast { it.id == card.id }
+        if (idx < 0) return
+        val user = currentMessages.take(idx)
+            .lastOrNull { it.kind == Kind.User } ?: return
+        if (user.attachmentCount > 0 && user.attachments.isEmpty()) {
+            // Same guard as resend: cache-restored echoes keep the image
+            // COUNT but not the bytes — text-only resend would drop them.
+            append(Kind.Error, "图片未被缓存，无法随消息重发")
+            return
+        }
+        val model = fallbackModel?.split(',')
+            ?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+        if (model != null) setModel(model)
+        if (!send(user.text, user.attachments, mergeCitation = false)) return
+        mutateMessages { list ->
+            list.map {
+                if (it.id == card.id) it.copy(status = "retried") else it
+            }
         }
     }
 
@@ -2142,6 +2205,11 @@ class SessionStore(
                     appendLine("---")
                     appendLine("*${m.text}*")
                     appendLine("---")
+                }
+                Kind.UsageLimit -> {
+                    appendLine("> ⚠ ${m.text}" +
+                        (m.detail?.takeIf { it.isNotBlank() }
+                            ?.let { " — $it" } ?: ""))
                 }
             }
             appendLine()
@@ -3189,6 +3257,7 @@ class SessionStore(
         exitCode: Int? = null,
         attachments: List<ImageAttachment> = emptyList(),
         steered: Boolean = false,
+        resetAtMs: Long? = null,
     ): ChatItem {
         flushStreaming()
         val item = ChatItem(
@@ -3197,6 +3266,7 @@ class SessionStore(
             detail = detail, detailTruncated = detailTruncated,
             exitCode = exitCode, attachments = attachments,
             attachmentCount = attachments.size, steered = steered,
+            resetAtMs = resetAtMs,
         )
         streamingId = null
         // A Kind.User here is always a live local echo (replayed user text

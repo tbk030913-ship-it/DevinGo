@@ -23,8 +23,17 @@ import com.devingo.app.acp.fetchBridgeModels
 import com.devingo.app.acp.getBridgeFsRead
 import com.devingo.app.acp.getBridgeFsSearch
 import com.devingo.app.acp.getBridgeFsTree
+import com.devingo.app.acp.EcoItem
+import com.devingo.app.acp.EcoList
+import com.devingo.app.acp.McpAuthResult
+import com.devingo.app.acp.McpLoginState
+import com.devingo.app.acp.getBridgeDoctor
+import com.devingo.app.acp.getBridgeEcoList
+import com.devingo.app.acp.getBridgeEcoShow
 import com.devingo.app.acp.getBridgeGitBranches
 import com.devingo.app.acp.getBridgeGitStatus
+import com.devingo.app.acp.getBridgeMcpList
+import com.devingo.app.acp.getBridgeMcpLoginStatus
 import com.devingo.app.acp.postBridgeFile
 import com.devingo.app.acp.postBridgeFsList
 import com.devingo.app.acp.postBridgeGitCheckout
@@ -32,6 +41,9 @@ import com.devingo.app.acp.postBridgeGitCommit
 import com.devingo.app.acp.postBridgeGitDiff
 import com.devingo.app.acp.postBridgeGitPull
 import com.devingo.app.acp.postBridgeGitPush
+import com.devingo.app.acp.postBridgeMcpAuthCallback
+import com.devingo.app.acp.postBridgeMcpLogin
+import com.devingo.app.acp.postBridgeMcpToggle
 import com.devingo.app.acp.probeBridgeHealth
 import com.devingo.app.notification.ActivitySnapshot
 import com.devingo.app.notification.DONE_VISIBLE_MS
@@ -374,6 +386,8 @@ class ConnectionManager private constructor(private val app: Application) {
         listJob?.cancel()
         searchJob?.cancel()
         _searchResults.value = null
+        _mcpServers.value = null
+        _mcpAuthRequest.value = null
         stores.keys.toList().forEach { dropStore(it) }
     }
 
@@ -1159,6 +1173,9 @@ class ConnectionManager private constructor(private val app: Application) {
         _sessions.update { list ->
             list?.map { if (it.sessionId == sessionId) it.copy(title = title) else it }
         }
+        _searchResults.update { list ->
+            list?.map { if (it.sessionId == sessionId) it.copy(title = title) else it }
+        }
         stores[sessionId]?.setTitleLocal(title)
         null
     } catch (e: CancellationException) {
@@ -1175,6 +1192,26 @@ class ConnectionManager private constructor(private val app: Application) {
      */
     suspend fun forceCloseSession(sessionId: String): String? = try {
         client.closeSession(sessionId, force = true)
+        // Clear the lock on the cached row too — otherwise it keeps
+        // showing 占用中 until the next refresh and re-prompts takeover.
+        _sessions.update { list ->
+            list?.map {
+                if (it.sessionId == sessionId) it.copy(
+                    isLocked = false,
+                    lockHolderClient = null,
+                    lockHolderPid = null,
+                ) else it
+            }
+        }
+        _searchResults.update { list ->
+            list?.map {
+                if (it.sessionId == sessionId) it.copy(
+                    isLocked = false,
+                    lockHolderClient = null,
+                    lockHolderPid = null,
+                ) else it
+            }
+        }
         null
     } catch (e: CancellationException) {
         throw e
@@ -1191,8 +1228,10 @@ class ConnectionManager private constructor(private val app: Application) {
      */
     fun searchSessions(query: String) {
         searchJob?.cancel()
+        // Drop the previous query's answer up front — stale excerpts
+        // rendering under a newer query reads as a match.
+        _searchResults.value = null
         if (query.isBlank() || !socketLive) {
-            _searchResults.value = null
             return
         }
         searchJob = scope.launch {
@@ -1517,6 +1556,25 @@ class ConnectionManager private constructor(private val app: Application) {
             onSocketDropped(ev.event.reason)
             return
         }
+        // Connection-level ecosystem frames (M9.2): never session-scoped —
+        // consume them here before the store demux below would route an
+        // unscoped frame into whatever session happens to be on screen.
+        when (val e = ev.event) {
+            is AcpEvent.McpServersChanged -> {
+                refreshMcpServers()
+                return
+            }
+            is AcpEvent.McpAuthorizationRequired -> {
+                _mcpAuthRequest.value = McpAuthRequest(e.serverName, e.authorizationUrl)
+                return
+            }
+            is AcpEvent.McpAuthorizationFinished -> {
+                _mcpAuthRequest.value = null
+                refreshMcpServers()
+                return
+            }
+            else -> Unit
+        }
         // Unscoped frames (parse failures, unjournaled logs) go to whatever
         // is on screen; session-scoped frames only to their own store —
         // a scoped frame for a session we don't host is dropped, never
@@ -1666,6 +1724,98 @@ class ConnectionManager private constructor(private val app: Application) {
             TailnetManager.state.value !is TailnetState.Running &&
             prefs.hostCandidates.any { TailnetManager.hostNeedsTailnet(it) }
         return if (tailPending) "局域网不通，Tailscale 未连接" else "bridge 不可达"
+    }
+
+    // ---- ecosystem (M9.2): MCP servers, skills/rules/plugins, doctor -----------
+
+    /** An agent-initiated MCP OAuth ask — the sign-in sheet reads it. */
+    data class McpAuthRequest(val serverName: String, val authorizationUrl: String)
+
+    /**
+     * `devin mcp list` rows for the MCP sheet — null until the first
+     * refresh lands (distinguishes "loading" from "empty").
+     */
+    private val _mcpServers = MutableStateFlow<List<EcoItem>?>(null)
+    val mcpServers: StateFlow<List<EcoItem>?> = _mcpServers.asStateFlow()
+
+    /** A pending agent-side OAuth request; cleared on finish or dismiss. */
+    private val _mcpAuthRequest = MutableStateFlow<McpAuthRequest?>(null)
+    val mcpAuthRequest: StateFlow<McpAuthRequest?> = _mcpAuthRequest.asStateFlow()
+
+    /** The cwd `devin <x>` runs inside — the bound session's workspace. */
+    private fun ecoCwd(): String? =
+        currentStore.value?.cwd?.takeIf { it.isNotBlank() }
+
+    /** `devin mcp list` — silent no-op without a dialed bridge. */
+    fun refreshMcpServers(cwd: String? = ecoCwd()) {
+        val (http, token) = bridgeEndpoint() ?: return
+        scope.launch {
+            runCatching { getBridgeMcpList(http, token, cwd = cwd) }
+                .onSuccess { _mcpServers.value = it.items }
+        }
+    }
+
+    /**
+     * The sheet's per-server switch → `devin mcp enable|disable`; refreshes
+     * the list on success. Returns error text or null.
+     */
+    suspend fun setMcpServerEnabled(name: String, enabled: Boolean): String? {
+        val (http, token) = bridgeEndpoint() ?: return "bridge 未连接"
+        return try {
+            postBridgeMcpToggle(http, token, name, enabled, ecoCwd())
+            refreshMcpServers()
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            e.display()
+        }
+    }
+
+    /** `devin mcp login` — spawns the OAuth flow and waits for its URL. */
+    suspend fun startMcpLogin(name: String): McpLoginState {
+        val (http, token) = bridgeEndpoint()
+            ?: throw AcpException("bridge 未连接")
+        return postBridgeMcpLogin(http, token, name, ecoCwd())
+    }
+
+    /** Poll a pending login — null when nothing is pending for [name]. */
+    suspend fun mcpLoginStatus(name: String): McpLoginState? {
+        val (http, token) = bridgeEndpoint() ?: return null
+        return getBridgeMcpLoginStatus(http, token, name)
+    }
+
+    /** Relay the pasted OAuth callback URL to the pending login. */
+    suspend fun submitMcpAuthCallback(name: String, url: String): McpAuthResult {
+        val (http, token) = bridgeEndpoint()
+            ?: throw AcpException("bridge 未连接")
+        return postBridgeMcpAuthCallback(http, token, name, url)
+    }
+
+    /** The sign-in sheet dismissed without completing — drop the banner. */
+    fun dismissMcpAuthRequest() {
+        _mcpAuthRequest.value = null
+    }
+
+    /** `devin <kind> list` — kind ∈ skills|rules|plugins. */
+    suspend fun fetchEcoList(kind: String): EcoList {
+        val (http, token) = bridgeEndpoint()
+            ?: throw AcpException("bridge 未连接")
+        return getBridgeEcoList(http, token, kind, cwd = ecoCwd())
+    }
+
+    /** `devin <kind> show <name>` — the entry's detail text. */
+    suspend fun fetchEcoShow(kind: String, name: String): String {
+        val (http, token) = bridgeEndpoint()
+            ?: throw AcpException("bridge 未连接")
+        return getBridgeEcoShow(http, token, kind, name, cwd = ecoCwd())
+    }
+
+    /** `devin doctor` diagnostics — up to ~90s of environment checks. */
+    suspend fun fetchDoctor(): String {
+        val (http, token) = bridgeEndpoint()
+            ?: throw AcpException("bridge 未连接")
+        return getBridgeDoctor(http, token)
     }
 
     /** The last-dialed bridge as (http base, token) — /pty + /preview share
