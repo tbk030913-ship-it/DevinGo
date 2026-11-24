@@ -50,9 +50,11 @@ import com.devingo.app.ui.monoText
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ArrowTurnForward
 
-private val PORT_RE = Regex("""(?:localhost|127\.0\.0\.1):(\d{2,5})""")
+private val PORT_RE = Regex("""(?:localhost|\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})""")
 
-/** Newest localhost/127.0.0.1 port mentioned in the transcript, or null.
+/** Newest dev-server port mentioned in the transcript, or null. Exec output
+ *  ("Local: http://localhost:5173/") lands on Kind.Tool detail, so scan it
+ *  too; any IPv4 host works — the proxy only uses the port on localhost.
  *  rows[0] renders at the visual bottom — scanning forward hits the latest
  *  messages first; within a text the last match wins. */
 internal fun detectPreviewPort(model: TranscriptModel, tail: ChatItem?): Int? {
@@ -61,17 +63,16 @@ internal fun detectPreviewPort(model: TranscriptModel, tail: ChatItem?): Int? {
             ?.groupValues?.get(1)?.toIntOrNull()
             ?.takeIf { it in 1..65535 }
 
-    tail?.text?.let { t ->
-        scan(t)?.let { return it }
-    }
+    tail?.let { t -> scan(t.text)?.let { return it } }
     for (row in model.rows) {
         val item = when (row) {
             is RowKind.Body -> model.itemById[row.itemId]
             is RowKind.User -> model.itemById[row.itemId]
             else -> null
         } ?: continue
-        if (item.kind != Kind.User && item.kind != Kind.Agent) continue
+        if (item.kind != Kind.User && item.kind != Kind.Agent && item.kind != Kind.Tool) continue
         scan(item.text)?.let { return it }
+        scan(item.detail.orEmpty())?.let { return it }
     }
     return null
 }
