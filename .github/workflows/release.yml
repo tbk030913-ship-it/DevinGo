@@ -93,7 +93,7 @@ jobs:
           cache-dependency-path: bridge/go.sum
 
       - name: Android SDK platform
-        run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-37"
+        run: $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-37.0"
 
       - name: 还原 release 签名材料
         env:
