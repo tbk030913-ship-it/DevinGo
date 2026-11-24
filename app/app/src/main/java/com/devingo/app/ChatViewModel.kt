@@ -571,6 +571,10 @@ class ChatViewModel(
     /** `devin mcp list` rows — live-refreshed on `…/mcp/serversChanged`. */
     val mcpServers: StateFlow<List<EcoItem>?> = cm.mcpServers
 
+    /** List fetch failure / raw table fallback for the MCP sheet. */
+    val mcpServersError: StateFlow<String?> = cm.mcpServersError
+    val mcpServersOutput: StateFlow<String?> = cm.mcpServersOutput
+
     /** Agent-initiated MCP OAuth ask — the sign-in sheet collects it. */
     val mcpAuthRequest: StateFlow<ConnectionManager.McpAuthRequest?> =
         cm.mcpAuthRequest

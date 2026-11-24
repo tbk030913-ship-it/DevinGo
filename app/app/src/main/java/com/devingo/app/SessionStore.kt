@@ -849,7 +849,7 @@ class SessionStore(
                 if (!isLive(seq)) return
                 remoteTurn = false
                 refreshRunning()
-                reportStopReason(ev.stopReason, ev.resetAtMs)
+                reportStopReason(ev.stopReason)
             }
             is AcpEvent.AgentDead -> {
                 remoteTurn = false
@@ -1578,7 +1578,7 @@ class SessionStore(
                 client.promptBlocks(
                     sessionId,
                     buildBlocks(merged, emptyList()),
-                ).let { reportStopReason(it.stopReason, quotaResetMs(it._meta)) }
+                ).let { reportStopReason(it.stopReason) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1788,7 +1788,7 @@ class SessionStore(
             try {
                 val result = client.promptBlocks(sessionId, blocks)
                 onSessionReady?.invoke(sessionId, cwd)
-                reportStopReason(result.stopReason, quotaResetMs(result._meta))
+                reportStopReason(result.stopReason)
                 if (currentMessages.isNotEmpty()) {
                     notifier.notifyTurnDone(
                         _ui.value.sessionTitle?.takeIf { it.isNotBlank() } ?: "DevinGo",
@@ -1802,7 +1802,7 @@ class SessionStore(
                 if (isQuotaText(msg)) {
                     // A quota-class JSON-RPC error gets the recovery card
                     // too (stopReason isn't the only carrier — M9.2).
-                    appendUsageLimit(null, msg)
+                    appendUsageLimit(msg)
                 } else if (!promptAcked) {
                     // No turn activity ever arrived — the agent likely never
                     // received the prompt, so flag the local echo accordingly.
@@ -1973,13 +1973,13 @@ class SessionStore(
         trimEnd(*",;:!?)]}'\"".toCharArray())
 
     /** Non-`end_turn` stop reasons get a visible system line. */
-    private fun reportStopReason(stopReason: String?, resetAtMs: Long? = null) {
+    private fun reportStopReason(stopReason: String?) {
         when (stopReason) {
             null, "end_turn" -> {}
             "cancelled" -> append(Kind.System, "本轮已取消")
             "max_tokens" -> append(Kind.System, "达到输出上限")
             "refusal" -> append(Kind.System, "被拒绝")
-            "quota_exhausted" -> appendUsageLimit(resetAtMs, stopReason)
+            "quota_exhausted" -> appendUsageLimit(stopReason)
             else -> append(Kind.System, stopReason)
         }
     }
@@ -1996,22 +1996,12 @@ class SessionStore(
             msg.contains("rate limit", ignoreCase = true) ||
             msg.contains("额度") || msg.contains("配额")
 
-    /** `*_quota_reset_at_unix` keys on a frame's `_meta` → epoch ms. */
-    private fun quotaResetMs(meta: JsonObject?): Long? {
-        if (meta == null) return null
-        return listOf(
-            "daily_quota_reset_at_unix", "weekly_quota_reset_at_unix",
-            "quota_reset_at_unix", "reset_at_unix",
-        ).firstNotNullOfOrNull { (meta[it] as? JsonPrimitive)?.longOrNull }
-            ?.let { if (it < 10_000_000_000_000L) it * 1000 else it }
-    }
-
     /**
      * The M9.2 quota/rate-limit recovery card: headline + the wire's raw
-     * reason in [detail], reset instant in [ChatItem.resetAtMs].
+     * reason in [detail].
      */
-    private fun appendUsageLimit(resetAtMs: Long?, raw: String) {
-        append(Kind.UsageLimit, "额度已用尽", detail = raw, resetAtMs = resetAtMs)
+    private fun appendUsageLimit(raw: String) {
+        append(Kind.UsageLimit, "额度已用尽", detail = raw)
     }
 
     /**
@@ -3257,7 +3247,6 @@ class SessionStore(
         exitCode: Int? = null,
         attachments: List<ImageAttachment> = emptyList(),
         steered: Boolean = false,
-        resetAtMs: Long? = null,
     ): ChatItem {
         flushStreaming()
         val item = ChatItem(
@@ -3266,7 +3255,6 @@ class SessionStore(
             detail = detail, detailTruncated = detailTruncated,
             exitCode = exitCode, attachments = attachments,
             attachmentCount = attachments.size, steered = steered,
-            resetAtMs = resetAtMs,
         )
         streamingId = null
         // A Kind.User here is always a live local echo (replayed user text

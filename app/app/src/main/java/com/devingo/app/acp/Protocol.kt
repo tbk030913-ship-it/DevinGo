@@ -228,7 +228,6 @@ data class ContentBlock(
 @Serializable
 data class PromptResult(
     val stopReason: String? = null,
-    /** Quota-failure frames carry `*_quota_reset_at_unix` keys here (M9.2). */
     val _meta: JsonObject? = null,
 )
 

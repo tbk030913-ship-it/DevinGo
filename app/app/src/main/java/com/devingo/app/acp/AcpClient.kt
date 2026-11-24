@@ -138,12 +138,10 @@ interface AcpEvent {
     /**
      * `_devingo/event` carrying a journaled response owned by another client.
      * Only turn-ending frames are surfaced: a `session/prompt` result means a
-     * remote client's turn finished. [resetAtMs] is the quota-reset instant
-     * decoded off `result._meta` on a `quota_exhausted` end (M9.2).
+     * remote client's turn finished.
      */
     data class RemoteTurnEnd(
         val stopReason: String?,
-        val resetAtMs: Long? = null,
     ) : AcpEvent
     /**
      * `elicitation/complete` as a notification — the agent closed the
@@ -1142,10 +1140,7 @@ class AcpClient(
                 when {
                     stopReason != null -> emit(
                         sessionId, seq,
-                        AcpEvent.RemoteTurnEnd(
-                            stopReason,
-                            quotaResetMs(result, result?.get("_meta") as? JsonObject),
-                        ),
+                        AcpEvent.RemoteTurnEnd(stopReason),
                     )
                     frame?.get("error") != null -> emit(
                         sessionId, seq,
@@ -1412,18 +1407,6 @@ class AcpClient(
             else -> Log.w(TAG, "Unknown sessionUpdate kind: $kind")
         }
     }
-
-    /**
-     * Quota-reset keys on a turn-end frame (M9.2): `*_quota_reset_at_unix`
-     * ride `result` or `result._meta`. Returns the earliest future instant
-     * in epoch ms — unix seconds are promoted, an already-ms value passes.
-     */
-    private fun quotaResetMs(a: JsonObject?, b: JsonObject?): Long? =
-        firstLong(
-            a, b,
-            "daily_quota_reset_at_unix", "weekly_quota_reset_at_unix",
-            "quota_reset_at_unix", "reset_at_unix", "resetAt",
-        )?.let { if (it < 10_000_000_000_000L) it * 1000 else it }
 
     /** First [keys] hit across [a] then [b] as a lenient long. */
     private fun firstLong(

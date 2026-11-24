@@ -387,6 +387,8 @@ class ConnectionManager private constructor(private val app: Application) {
         searchJob?.cancel()
         _searchResults.value = null
         _mcpServers.value = null
+        _mcpServersError.value = null
+        _mcpServersOutput.value = null
         _mcpAuthRequest.value = null
         stores.keys.toList().forEach { dropStore(it) }
     }
@@ -1738,6 +1740,14 @@ class ConnectionManager private constructor(private val app: Application) {
     private val _mcpServers = MutableStateFlow<List<EcoItem>?>(null)
     val mcpServers: StateFlow<List<EcoItem>?> = _mcpServers.asStateFlow()
 
+    /** Fetch failure for [mcpServers] — the sheet surfaces it, not a spinner. */
+    private val _mcpServersError = MutableStateFlow<String?>(null)
+    val mcpServersError: StateFlow<String?> = _mcpServersError.asStateFlow()
+
+    /** Raw `devin mcp list` table — rendered when JSON rows decode empty. */
+    private val _mcpServersOutput = MutableStateFlow<String?>(null)
+    val mcpServersOutput: StateFlow<String?> = _mcpServersOutput.asStateFlow()
+
     /** A pending agent-side OAuth request; cleared on finish or dismiss. */
     private val _mcpAuthRequest = MutableStateFlow<McpAuthRequest?>(null)
     val mcpAuthRequest: StateFlow<McpAuthRequest?> = _mcpAuthRequest.asStateFlow()
@@ -1751,7 +1761,16 @@ class ConnectionManager private constructor(private val app: Application) {
         val (http, token) = bridgeEndpoint() ?: return
         scope.launch {
             runCatching { getBridgeMcpList(http, token, cwd = cwd) }
-                .onSuccess { _mcpServers.value = it.items }
+                .onSuccess {
+                    _mcpServers.value = it.items
+                    _mcpServersOutput.value = it.output
+                    _mcpServersError.value = null
+                }
+                .onFailure { e ->
+                    // Exit the spinner — the raw table may still render.
+                    _mcpServers.value = emptyList()
+                    _mcpServersError.value = e.display()
+                }
         }
     }
 

@@ -108,8 +108,7 @@ enum class Kind {
     /**
      * Quota/rate-limit turn failure (M9.2): `stopReason=quota_exhausted` or a
      * quota-class prompt error. `text` = headline, `detail` = the wire's raw
-     * reason, `resetAtMs` = the reported reset instant when one rode the
-     * frame; `status` = "retried" once the card's 重试 fired.
+     * reason; `status` = "retried" once the card's 重试 fired.
      */
     UsageLimit,
 }
@@ -150,11 +149,6 @@ data class ChatItem(
      * bubble gets a "↪ 已转向" corner badge (U5.4).
      */
     val steered: Boolean = false,
-    /**
-     * Usage-limit reset instant (epoch ms) reported on the quota frame —
-     * the [Kind.UsageLimit] card's "将于 X 重置" line; not cache-persisted.
-     */
-    val resetAtMs: Long? = null,
 )
 
 /** One `diff` content item of a tool call: unified old/new file text. */

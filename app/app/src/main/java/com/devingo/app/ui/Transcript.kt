@@ -1049,7 +1049,7 @@ private fun ErrorLine(text: String, modifier: Modifier = Modifier) {
 
 /**
  * M9.2's quota/rate-limit recovery card (t3code UsageLimitRecoveryCard
- * port): headline + optional reset instant + one-tap 重试 that applies
+ * port): headline + one-tap 重试 that applies
  * the configured fallback model and resends the tripped prompt. After
  * firing, `status="retried"` freezes the card as a plain notice.
  */
@@ -1060,11 +1060,6 @@ private fun UsageLimitCard(
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
-    val resetText = remember(m.resetAtMs) {
-        m.resetAtMs?.let {
-            "将于 ${SimpleDateFormat("M月d日 HH:mm", java.util.Locale.getDefault()).format(java.util.Date(it))} 重置"
-        }
-    }
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -1083,7 +1078,7 @@ private fun UsageLimitCard(
                     tint = cs.error,
                 )
                 Text(
-                    listOfNotNull(m.text, resetText).joinToString(" · "),
+                    m.text,
                     style = MaterialTheme.typography.bodyMedium,
                     color = cs.onSurface,
                 )

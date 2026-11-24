@@ -1004,7 +1004,7 @@ private fun FeedbackLines(notice: String?, opError: String?) {
 
 /** Status fetch failed — message + retry. */
 @Composable
-private fun InlineRetry(text: String, onRetry: () -> Unit) {
+internal fun InlineRetry(text: String, onRetry: () -> Unit) {
     val cs = MaterialTheme.colorScheme
     Row(
         Modifier

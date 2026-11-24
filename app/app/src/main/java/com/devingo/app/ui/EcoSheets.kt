@@ -68,6 +68,8 @@ fun McpServersSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
     val cs = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
     val servers by vm.mcpServers.collectAsState()
+    val serversErr by vm.mcpServersError.collectAsState()
+    val serversRaw by vm.mcpServersOutput.collectAsState()
     val authReq by vm.mcpAuthRequest.collectAsState()
     var error by remember { mutableStateOf<String?>(null) }
     var busyName by remember { mutableStateOf<String?>(null) }
@@ -88,8 +90,13 @@ fun McpServersSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
                 trailing = { SettingValue("去登录") },
             )
         }
-        when (val list = servers) {
-            null -> Row(
+        val list = servers
+        when {
+            serversErr != null -> InlineRetry(
+                "加载失败：$serversErr",
+                onRetry = { vm.refreshMcpServers() },
+            )
+            list == null -> Row(
                 Modifier.fillMaxWidth().padding(vertical = 24.dp),
                 horizontalArrangement = Arrangement.Center,
             ) {
@@ -100,12 +107,24 @@ fun McpServersSheet(vm: ChatViewModel, onDismiss: () -> Unit) {
             }
             else -> {
                 if (list.isEmpty()) {
-                    Text(
-                        "暂无 MCP 服务器",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = cs.onSurfaceVariant,
-                        modifier = Modifier.padding(vertical = 20.dp),
-                    )
+                    if (!serversRaw.isNullOrBlank()) {
+                        // JSON lift found no named rows — the raw `devin
+                        // mcp list` table still carries the real state.
+                        Text(
+                            serversRaw.orEmpty(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = cs.onSurfaceVariant,
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            modifier = Modifier.padding(vertical = 12.dp),
+                        )
+                    } else {
+                        Text(
+                            "暂无 MCP 服务器",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = cs.onSurfaceVariant,
+                            modifier = Modifier.padding(vertical = 20.dp),
+                        )
+                    }
                 }
                 list.forEach { srv ->
                     val enabled = srv.enabled != false

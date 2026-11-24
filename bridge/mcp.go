@@ -150,12 +150,12 @@ type cliItem struct {
 	Status  string `json:"status,omitempty"`
 }
 
-// devinList runs `devin <sub> list` in dir: `--format json` is attempted
-// first (every `devin <x>` usage block advertises "Output as JSON"), with
-// a bare-text fallback when the flag or its shape isn't understood — the
-// binary's table output is the documented raw form either way.
+// devinList runs `devin <sub> list` in dir: `--json` is attempted first
+// (verified on the shipped binary: `mcp list`/`skills list`/`doctor`
+// take it; `rules`/`plugins` don't — the flag error just falls through
+// to the bare-text run, whose table is the documented raw form anyway).
 func devinList(ctx context.Context, dir string, sub ...string) (string, []cliItem, error) {
-	args := append(append([]string{}, sub...), "--format", "json")
+	args := append(append([]string{}, sub...), "--json")
 	out, err := runDevinCapped(ctx, dir, args...)
 	if err == nil {
 		if items := cliItemsFromJSON(out); items != nil {
@@ -358,9 +358,10 @@ func tail(s string, max int) string {
 // spawnMcpLogin starts `devin mcp login <name>` parked on stdin, output to
 // temp files (runDevinOutput's grandchild lesson — a pipe would leak wait
 // blocks and a blocking stdin is required anyway). --force-manual-token-
-// flow is tried first: the binary's help text describes it for exactly
-// this "localhost redirect won't work" case. An unknown flag kills the
-// process within the first few hundred ms — detect that and respawn plain.
+// flow is tried first — borrowed from `auth login`'s help text ("skip
+// browser-based auth and paste a token manually"); `mcp login --help`
+// doesn't list it, so an unknown flag may kill the process within the
+// first few hundred ms — detect that and respawn plain.
 func spawnMcpLogin(name, dir string) (*mcpLogin, error) {
 	l, err := spawnMcpLoginArgs(name, dir, true)
 	if err != nil {
