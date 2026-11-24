@@ -107,6 +107,9 @@ class ChatViewModel(
     val transcript: StateFlow<TranscriptModel> = bound({ transcript }, TranscriptModel.EMPTY)
     val streamingTail: StateFlow<ChatItem?> = bound({ streamingTail }, null)
     val pendingPermission: StateFlow<PendingPermission?> = bound({ pendingPermission }, null)
+    /** The elicitation card awaiting answers in the bound session (A7.2). */
+    val pendingElicitation: StateFlow<PendingElicitation?> =
+        bound({ pendingElicitation }, null)
     val queuedPrompts: StateFlow<List<QueuedPrompt>> = bound({ queuedPrompts }, emptyList())
     /** The queued prompt pulled into the composer for editing (U5.4). */
     val editingQueuedId: StateFlow<Long?> = bound({ editingQueuedId }, null)
@@ -279,6 +282,11 @@ class ChatViewModel(
 
     fun resolvePermissionFor(sessionId: String, optionId: String?) {
         cm.storeFor(sessionId)?.resolvePermission(optionId)
+    }
+
+    /** Question card submit/dismiss; null = declined without answers. */
+    fun resolveElicitation(reply: ElicitationReply?) {
+        store?.resolveElicitation(reply)
     }
 
     fun loadRevertSteps() {

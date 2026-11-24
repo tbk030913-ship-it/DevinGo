@@ -349,6 +349,12 @@ object AcpMethods {
     const val SESSION_REQUEST_PERMISSION = "session/request_permission"
     const val SESSION_CLOSE = "session/close"
 
+    // Agent->client elicitation (A7.2): `session/elicitation` is the draft
+    // name some agents still send for the same create request.
+    const val ELICITATION_CREATE = "elicitation/create"
+    const val SESSION_ELICITATION = "session/elicitation"
+    const val ELICITATION_COMPLETE = "elicitation/complete"
+
     // Devin revert extension (negotiated via clientCapabilities._meta).
     const val REVERT_LIST_STEPS = "_cognition.ai/revert/listSteps"
     const val REVERT_FORK_FROM_STEP = "_cognition.ai/revert/forkFromStep"

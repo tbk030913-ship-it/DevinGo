@@ -814,7 +814,13 @@ class ConnectionManager private constructor(private val app: Application) {
             cur.filterKeys { it in keep }.toMutableMap().apply {
                 list.forEach { s ->
                     if (stores[s.sessionId] == null) {
-                        put(s.sessionId, SessionBadge(s.pendingPermission, s.running, false))
+                        put(
+                            s.sessionId,
+                            SessionBadge(
+                                pendingPermission = s.pendingPermission,
+                                running = s.running,
+                            ),
+                        )
                     }
                 }
             }
@@ -829,11 +835,13 @@ class ConnectionManager private constructor(private val app: Application) {
             launch {
                 combine(
                     store.pendingPermission,
+                    store.pendingElicitation,
                     store.ui,
                     store.unread,
-                ) { p, u, unread ->
+                ) { p, e, u, unread ->
                     SessionBadge(
                         pendingPermission = p != null,
+                        pendingInput = e != null,
                         running = u.running,
                         unread = unread,
                     )
@@ -871,9 +879,10 @@ class ConnectionManager private constructor(private val app: Application) {
                     store.ui,
                     store.transcript,
                     store.pendingPermission,
+                    store.pendingElicitation,
                     _conn.map { Triple(it.reconnecting, it.phase, it.error) }
                         .distinctUntilChanged(),
-                ) { u, m, p, (reconnecting, connPhase, connError) ->
+                ) { u, m, p, e, (reconnecting, connPhase, connError) ->
                     if (u.running && !wasRunning) {
                         turnStart = System.currentTimeMillis()
                         finished = null
@@ -910,6 +919,7 @@ class ConnectionManager private constructor(private val app: Application) {
                             ),
                             runningDetail = m.runningDetail,
                             pendingPermission = p,
+                            pendingElicitation = e,
                             turnStartedAtMillis = turnStart,
                             finished = finished,
                         ),
@@ -1274,7 +1284,7 @@ class ConnectionManager private constructor(private val app: Application) {
             // would loop attaches forever.
             is AcpEvent.SessionResync -> if (store.isLive(ev.seq)) reattach(store)
             is AcpEvent.SessionDeleted -> dropStore(store.sessionId, gone = true)
-            is AcpEvent.PermissionResolved -> store.resolvePeerPermission(e.requestId)
+            is AcpEvent.PermissionResolved -> store.resolvePeerRequest(e.requestId)
             else -> {
                 store.onEvent(e, ev.seq)
                 // Replay backlog is history — only live frames light unread.
@@ -1303,13 +1313,19 @@ class ConnectionManager private constructor(private val app: Application) {
             req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
             return
         }
-        if (req.method == AcpMethods.SESSION_REQUEST_PERMISSION &&
-            store !== _currentStore.value
-        ) {
+        // A needs-user request for a session that isn't on screen gets a
+        // heads-up — the same heads-up for permissions and elicitations.
+        val needsUser = when (req.method) {
+            AcpMethods.SESSION_REQUEST_PERMISSION -> "需要你的授权"
+            AcpMethods.ELICITATION_CREATE, AcpMethods.SESSION_ELICITATION ->
+                "有问题需要你回答"
+            else -> null
+        }
+        if (needsUser != null && store !== _currentStore.value) {
             val title = store.ui.value.sessionTitle?.takeIf { it.isNotBlank() }
                 ?: stores[sid]?.cwd?.substringAfterLast('/')?.substringAfterLast('\\')
                 ?: sid.orEmpty()
-            _alerts.tryEmit(SessionAlert(store.sessionId, "「$title」需要你的授权"))
+            _alerts.tryEmit(SessionAlert(store.sessionId, "「$title」$needsUser"))
         }
         store.handleAgentRequest(req)
     }

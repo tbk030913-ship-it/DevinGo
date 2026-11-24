@@ -8,6 +8,7 @@ import com.devingo.app.acp.AcpMethods
 import com.devingo.app.acp.AttachResult
 import com.devingo.app.acp.ConfigOption
 import com.devingo.app.acp.ContentBlock
+import com.devingo.app.acp.ElicitationParser
 import com.devingo.app.acp.GitDiffResult
 import com.devingo.app.acp.InboundEvent
 import com.devingo.app.acp.IncomingRequest
@@ -180,6 +181,13 @@ class SessionStore(
     private val _pendingPermissionCount = MutableStateFlow(0)
     val pendingPermissionCount = _pendingPermissionCount.asStateFlow()
 
+    /** The elicitation card on screen (queue head, like [pendingPermission]). */
+    private val _pendingElicitation = MutableStateFlow<PendingElicitation?>(null)
+    val pendingElicitation = _pendingElicitation.asStateFlow()
+
+    private val _pendingElicitationCount = MutableStateFlow(0)
+    val pendingElicitationCount = _pendingElicitationCount.asStateFlow()
+
     private val _queuedPrompts = MutableStateFlow<List<QueuedPrompt>>(emptyList())
     val queuedPrompts = _queuedPrompts.asStateFlow()
 
@@ -261,11 +269,15 @@ class SessionStore(
     /** True once any turn activity (chunk/tool/plan) arrived for the in-flight prompt. */
     @Volatile private var promptAcked = false
 
-    // Permission requests queue internally; the UI only ever sees the head.
-    private val permissionLock = Any()
+    // Pending agent→client requests queue internally; the UI only ever
+    // sees the head of each queue. [requestLock] guards both maps + queues —
+    // the peer-resolution path must not interleave with pop/remove.
+    private val requestLock = Any()
     private val permissionQueue = ArrayDeque<PendingPermission>()
     /** Wire request id -> open request; attach re-deliveries dedupe on it. */
     private val openRequests = mutableMapOf<Long, PermEntry>()
+    private val elicitationQueue = ArrayDeque<PendingElicitation>()
+    private val openElicitations = mutableMapOf<Long, ElicEntry>()
     /**
      * Unique negative keys for requests whose wire id isn't an integer —
      * a shared -1 would collapse every keyless request onto one entry and
@@ -277,6 +289,13 @@ class SessionStore(
         var req: IncomingRequest,
         val pending: PendingPermission,
         /** Another client already answered — respond nothing ourselves. */
+        var resolvedByPeer: Boolean = false,
+    )
+
+    private class ElicEntry(
+        var req: IncomingRequest,
+        val pending: PendingElicitation,
+        /** Peer answer or `elicitation/complete` — respond nothing. */
         var resolvedByPeer: Boolean = false,
     )
 
@@ -614,6 +633,7 @@ class SessionStore(
         promptJob?.cancel()
         steerJob?.cancel()
         clearPermissions()
+        clearElicitations()
         deferredLive.clear()
         scope.coroutineContext[Job]?.cancel()
     }
@@ -739,6 +759,7 @@ class SessionStore(
                     append(Kind.System, "[${ev.channel}] ${ev.message}")
                 }
             }
+            is AcpEvent.ElicitationComplete -> dismissElicitation()
             is AcpEvent.Failure -> append(Kind.Error, ev.message)
             else -> Unit // forward-compat with updates added alongside acp/ changes
         }
@@ -758,6 +779,7 @@ class SessionStore(
         attachDefer = false
         deferredLive.clear()
         clearPermissions()
+        clearElicitations()
         remoteTurn = false
         // A mid-replay drop — or a drop while a committed attach's backlog
         // is still staged — leaves the cursor past frames that only ever
@@ -1388,6 +1410,14 @@ class SessionStore(
         commitIfCaughtUp(req.seq)
         when (req.method) {
             AcpMethods.SESSION_REQUEST_PERMISSION -> handlePermission(req)
+            AcpMethods.ELICITATION_CREATE,
+            AcpMethods.SESSION_ELICITATION -> handleElicitation(req)
+            // The agent closed a pending elicitation itself — drop the card,
+            // don't answer the still-open create request.
+            AcpMethods.ELICITATION_COMPLETE -> {
+                dismissElicitation()
+                req.respond(buildJsonObject {})
+            }
             else -> req.respondError(JSONRPC_METHOD_NOT_FOUND, "DevinGo 不支持 ${req.method}")
         }
     }
@@ -1402,7 +1432,7 @@ class SessionStore(
         }
         // Attach re-delivers still-open requests without _seq; the same wire
         // id means the same pending card — keep the newest (livest) responder.
-        synchronized(permissionLock) {
+        synchronized(requestLock) {
             openRequests.entries.firstOrNull { it.value.req.rpcId == req.rpcId }
                 ?.let { it.value.req = req; return }
         }
@@ -1410,7 +1440,7 @@ class SessionStore(
         val choice = CompletableDeferred<String?>()
         val pending = PendingPermission(params.toolCall, params.options, choice, requestId)
         val entry = PermEntry(req, pending)
-        synchronized(permissionLock) { openRequests[requestId] = entry }
+        synchronized(requestLock) { openRequests[requestId] = entry }
         pushPermission(pending)
         notifier.notifyPermissionPending(
             params.toolCall.title ?: params.toolCall.kind ?: "工具调用",
@@ -1420,7 +1450,7 @@ class SessionStore(
         // until the user answers or _devingo/permission_resolved lands.
         val optionId = choice.await()
         popPermission(pending)
-        synchronized(permissionLock) { openRequests.remove(requestId, entry) }
+        synchronized(requestLock) { openRequests.remove(requestId, entry) }
         if (entry.resolvedByPeer) return // a peer answered; the hub resolved it
         entry.req.respond(
             buildJsonObject {
@@ -1436,23 +1466,138 @@ class SessionStore(
         )
     }
 
-    /** `_devingo/permission_resolved`: a peer answered request [requestId]. */
-    fun resolvePeerPermission(requestId: Long) {
-        synchronized(permissionLock) {
+    /**
+     * `_devingo/permission_resolved`: a peer answered request [requestId] —
+     * the broadcast covers every agent→client request kind, so it resolves
+     * both permissions and elicitations.
+     */
+    fun resolvePeerRequest(requestId: Long) {
+        synchronized(requestLock) {
             openRequests[requestId]?.let {
                 it.resolvedByPeer = true
                 it.pending.choice.complete(RESOLVED_BY_PEER)
+                return
+            }
+            openElicitations[requestId]?.let {
+                it.resolvedByPeer = true
+                it.pending.choice.complete(null)
             }
         }
     }
 
-    private fun pushPermission(p: PendingPermission) = synchronized(permissionLock) {
+    // ---- elicitation (A7.2) -------------------------------------------------
+
+    /**
+     * `elicitation/create` (or the `session/elicitation` draft name): parse
+     * the question form into the card's queue — the same pending-request
+     * machinery permissions use (re-delivery dedupe, peer resolution,
+     * teardown without a response). An unaskable form declines rather than
+     * leaving the agent's request open.
+     */
+    private suspend fun handleElicitation(req: IncomingRequest) {
+        val form = req.params?.let { ElicitationParser.parse(it) }
+        if (form == null || form.questions.isEmpty()) {
+            req.respond(buildJsonObject { put("action", "decline") })
+            return
+        }
+        // Same wire id = the same pending card after an attach re-delivery.
+        synchronized(requestLock) {
+            openElicitations.entries.firstOrNull { it.value.req.rpcId == req.rpcId }
+                ?.let { it.value.req = req; return }
+        }
+        val requestId = req.requestKey ?: syntheticRequestKey.getAndDecrement()
+        val choice = CompletableDeferred<ElicitationReply?>()
+        val pending = PendingElicitation(
+            message = form.message,
+            questions = form.questions,
+            choice = choice,
+            requestId = requestId,
+        )
+        val entry = ElicEntry(req, pending)
+        synchronized(requestLock) { openElicitations[requestId] = entry }
+        pushElicitation(pending)
+        notifier.notifyPermissionPending("Devin 有问题需要你回答", sessionId)
+        val reply = choice.await()
+        popElicitation(pending)
+        synchronized(requestLock) { openElicitations.remove(requestId, entry) }
+        // Peer answer / elicitation/complete / store teardown: never respond.
+        if (entry.resolvedByPeer) return
+        if (reply == null) {
+            entry.req.respond(buildJsonObject { put("action", "cancel") })
+        } else {
+            if (reply.lines.isNotEmpty()) {
+                append(
+                    Kind.Answered,
+                    text = if (reply.lines.size == 1) {
+                        "已回答 · ${reply.lines.first()}"
+                    } else {
+                        "已回答 ${reply.lines.size} 个问题"
+                    },
+                    detail = reply.lines.joinToString("\n")
+                        .takeIf { reply.lines.size > 1 },
+                )
+            }
+            entry.req.respond(
+                buildJsonObject {
+                    put("action", "accept")
+                    put("content", reply.content)
+                },
+            )
+        }
+    }
+
+    private fun pushElicitation(p: PendingElicitation) = synchronized(requestLock) {
+        elicitationQueue.addLast(p)
+        _pendingElicitation.value = elicitationQueue.firstOrNull()
+        _pendingElicitationCount.value = elicitationQueue.size
+    }
+
+    private fun popElicitation(p: PendingElicitation) = synchronized(requestLock) {
+        elicitationQueue.remove(p)
+        _pendingElicitation.value = elicitationQueue.firstOrNull()
+        _pendingElicitationCount.value = elicitationQueue.size
+    }
+
+    /**
+     * Same contract as [clearPermissions]: a teardown never answers — the
+     * hub's pending-request TTL re-delivers the elicitation after re-attach.
+     */
+    private fun clearElicitations() = synchronized(requestLock) {
+        openElicitations.values.forEach { it.resolvedByPeer = true }
+        elicitationQueue.forEach { it.choice.complete(null) }
+        elicitationQueue.clear()
+        openElicitations.clear()
+        _pendingElicitation.value = null
+        _pendingElicitationCount.value = 0
+    }
+
+    /** The card's submit/dismiss; null = declined without answers. */
+    fun resolveElicitation(reply: ElicitationReply?) {
+        _pendingElicitation.value?.choice?.complete(reply)
+    }
+
+    /**
+     * `elicitation/complete` — the agent withdrew the elicitation (answered
+     * elsewhere or dropped). Treated like a peer resolution: the create
+     * request gets no response from us.
+     */
+    fun dismissElicitation() {
+        synchronized(requestLock) {
+            val p = _pendingElicitation.value ?: return
+            openElicitations[p.requestId]?.let {
+                it.resolvedByPeer = true
+                it.pending.choice.complete(null)
+            }
+        }
+    }
+
+    private fun pushPermission(p: PendingPermission) = synchronized(requestLock) {
         permissionQueue.addLast(p)
         _pendingPermission.value = permissionQueue.firstOrNull()
         _pendingPermissionCount.value = permissionQueue.size
     }
 
-    private fun popPermission(p: PendingPermission) = synchronized(permissionLock) {
+    private fun popPermission(p: PendingPermission) = synchronized(requestLock) {
         permissionQueue.remove(p)
         _pendingPermission.value = permissionQueue.firstOrNull()
         _pendingPermissionCount.value = permissionQueue.size
@@ -1463,7 +1608,7 @@ class SessionStore(
      * permission for its own TTL and re-delivers it after re-attach, so a
      * teardown here must not resolve it as "cancelled" agent-side.
      */
-    private fun clearPermissions() = synchronized(permissionLock) {
+    private fun clearPermissions() = synchronized(requestLock) {
         openRequests.values.forEach { it.resolvedByPeer = true }
         permissionQueue.forEach { it.choice.complete(null) }
         permissionQueue.clear()
@@ -1491,7 +1636,7 @@ class SessionStore(
         requestId: Long,
         toolCallId: String?,
         allow: Boolean,
-    ): Boolean = synchronized(permissionLock) {
+    ): Boolean = synchronized(requestLock) {
         val p = openRequests[requestId]?.pending ?: return@synchronized false
         if (toolCallId != null && p.toolCall.toolCallId != toolCallId) {
             return@synchronized false

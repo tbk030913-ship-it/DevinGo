@@ -61,12 +61,10 @@ internal enum class ActivityPhase(
 
         fun forKey(key: String?) = entries.firstOrNull { it.key == key }
 
-        /**
-         * DevinGo session states → phases. INPUT is reserved — A7.2's
-         * elicitation surface maps onto it when it lands.
-         */
+        /** DevinGo session states → phases (INPUT = A7.2's elicitation). */
         fun forState(state: LiveStatus.State): ActivityPhase = when (state) {
             LiveStatus.State.NeedsPermission -> APPROVAL
+            LiveStatus.State.NeedsInput -> INPUT
             LiveStatus.State.Working -> RUNNING
             LiveStatus.State.Reconnecting, LiveStatus.State.Idle -> STALE
             LiveStatus.State.Done -> COMPLETED

@@ -209,6 +209,12 @@ class SessionService : Service() {
                     .setShortCriticalText("待授权")
                     .setRequestPromotedOngoing(status.promoteOngoing)
             }
+            LiveStatus.State.NeedsInput -> {
+                builder
+                    .setCategory(NotificationCompat.CATEGORY_SERVICE)
+                    .setShortCriticalText("待回答")
+                    .setRequestPromotedOngoing(status.promoteOngoing)
+            }
             LiveStatus.State.Reconnecting -> {
                 builder
                     .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -274,6 +280,7 @@ class SessionService : Service() {
     private fun notificationTitle(status: LiveStatus): String = when (status.state) {
         LiveStatus.State.Working -> "Devin 正在工作"
         LiveStatus.State.NeedsPermission -> "需要你的授权"
+        LiveStatus.State.NeedsInput -> "需要你的回答"
         LiveStatus.State.Reconnecting -> "正在重连…"
         LiveStatus.State.Done, LiveStatus.State.Failed -> status.title
         LiveStatus.State.Idle -> status.title
@@ -286,6 +293,7 @@ class SessionService : Service() {
         } else {
             status.detail.ifBlank { "等待授权" }
         }
+        LiveStatus.State.NeedsInput -> status.detail.ifBlank { "Devin 有问题需要你回答" }
         LiveStatus.State.Reconnecting -> "连接中断，正在重试"
         LiveStatus.State.Done, LiveStatus.State.Failed -> status.detail
         LiveStatus.State.Idle -> "等待指令"

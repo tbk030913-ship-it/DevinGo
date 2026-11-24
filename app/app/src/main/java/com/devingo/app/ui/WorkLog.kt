@@ -86,6 +86,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ChevronRight
+import me.rerere.hugeicons.stroke.Comment01
 import me.rerere.hugeicons.stroke.Expand
 import me.rerere.hugeicons.stroke.File01
 
@@ -228,6 +229,16 @@ internal fun WorkLogColumn(
                             },
                             onReviewDiff = onReviewDiff,
                         )
+                        // A7.2: elicitation answers the user submitted —
+                        // t3code's QuestionAnswerHistory row in the work log.
+                        Kind.Answered -> AnsweredLogRow(
+                            item = entry.item,
+                            expanded = expandedDetails[entry.item.id] == true,
+                            onToggleExpand = {
+                                expandedDetails[entry.item.id] =
+                                    expandedDetails[entry.item.id] != true
+                            },
+                        )
                         else -> Unit
                     }
                     is WorkEntry.ToolGroup -> ToolGroupRow(
@@ -362,6 +373,75 @@ private fun ThoughtLogRow(
                             ),
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * A7.2's "已回答" row (t3code QuestionAnswerHistory): the collapsed line is
+ * the summary — "已回答 · question → answer" or "已回答 N 个问题"; the
+ * expanded body lists every question's answer, one per line.
+ */
+@Composable
+private fun AnsweredLogRow(
+    item: ChatItem,
+    expanded: Boolean,
+    onToggleExpand: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    val detail = item.detail?.takeIf { it.isNotBlank() }
+    val rot by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        animationSpec = tween(200),
+        label = "answeredChevron",
+    )
+    Column(Modifier.animateContentSize()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 40.dp)
+                .clickable(enabled = detail != null, onClick = onToggleExpand),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                HugeIcons.Comment01, null,
+                modifier = Modifier.size(14.dp),
+                tint = cs.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                item.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (detail != null) {
+                Icon(
+                    HugeIcons.ChevronRight, null,
+                    modifier = Modifier
+                        .size(14.dp)
+                        .rotate(rot),
+                    tint = cs.onSurfaceVariant,
+                )
+            }
+        }
+        if (detail != null) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 6.dp),
+                )
             }
         }
     }

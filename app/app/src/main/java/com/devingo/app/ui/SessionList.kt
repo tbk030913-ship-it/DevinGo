@@ -344,6 +344,7 @@ private fun SessionMetaLine(s: AcpSession, lastSession: Boolean, badge: SessionB
         ?.let { items += it to false }
     if (s.isLocked) items += "占用中" to true
     if (s.pendingPermission || badge?.pendingPermission == true) items += "待授权" to true
+    if (badge?.pendingInput == true) items += "待回答" to true
     if (s.running || badge?.running == true) items += "运行中" to false
     if (badge?.unread == true) items += "新消息" to false
     if (s.planFilePath != null) items += "计划" to false

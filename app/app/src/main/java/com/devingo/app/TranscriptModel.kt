@@ -90,8 +90,10 @@ internal fun buildTurns(messages: List<ChatItem>): List<Turn> {
     var body = mutableListOf<ChatItem>()
     fun flush() {
         if (user != null || body.isNotEmpty()) {
-            val work =
-                body.filter { it.kind == Kind.Thought || it.kind == Kind.Tool }
+            val work = body.filter {
+                it.kind == Kind.Thought || it.kind == Kind.Tool ||
+                    it.kind == Kind.Answered
+            }
             turns += Turn(
                 user?.id ?: body.firstOrNull()?.id ?: 0L,
                 user,
@@ -183,9 +185,11 @@ internal fun buildTranscriptModel(
                 add(RowKind.Work(turn.key, isLast && running))
             }
             turn.body.asReversed().forEach { item ->
-                // Thoughts and tools collapse into the turn's WorkRow —
-                // they never render as inline body items.
-                if (item.kind != Kind.Thought && item.kind != Kind.Tool) {
+                // Thoughts, tools and answered questions collapse into the
+                // turn's WorkRow — they never render as inline body items.
+                if (item.kind != Kind.Thought && item.kind != Kind.Tool &&
+                    item.kind != Kind.Answered
+                ) {
                     add(RowKind.Body(item.id, turn.key))
                 }
             }

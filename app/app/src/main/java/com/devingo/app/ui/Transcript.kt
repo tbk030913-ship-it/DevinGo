@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.devingo.app.ChatItem
 import com.devingo.app.Kind
+import com.devingo.app.PendingElicitation
 import com.devingo.app.PendingPermission
 import com.devingo.app.QueuedPrompt
 import com.devingo.app.RowKind
@@ -164,6 +165,7 @@ internal fun Transcript(
     tail: ChatItem?,
     ui: UiState,
     pendingPermission: PendingPermission?,
+    pendingElicitation: PendingElicitation?,
     timings: Map<Long, TurnTiming>,
     expandedWork: Map<Long, Boolean>,
     queued: List<QueuedPrompt>,
@@ -240,7 +242,7 @@ internal fun Transcript(
             ) {
                 Box(Modifier.widthIn(max = 720.dp).fillMaxWidth()) {
                     when (row) {
-                        is RowKind.Status -> StatusLine(ui, pendingPermission)
+                        is RowKind.Status -> StatusLine(ui, pendingPermission, pendingElicitation)
                         is RowKind.User -> {
                             val m = itemById[row.itemId]
                                 ?.let { if (tail?.id == it.id) tail else it }
@@ -338,11 +340,20 @@ internal fun Transcript(
 
 /** Always the last transcript item: hexagon + one-line state. */
 @Composable
-private fun StatusLine(ui: UiState, pendingPermission: PendingPermission?) {
+private fun StatusLine(
+    ui: UiState,
+    pendingPermission: PendingPermission?,
+    pendingElicitation: PendingElicitation?,
+) {
     val cs = MaterialTheme.colorScheme
     val (text, hexColor, pulsing) = when {
         pendingPermission != null -> Triple(
             "Devin 正在等你授权",
+            DevinGoColors.statusOrange,
+            false,
+        )
+        pendingElicitation != null -> Triple(
+            "Devin 正在等你回答",
             DevinGoColors.statusOrange,
             false,
         )

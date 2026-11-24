@@ -9,7 +9,9 @@ import com.devingo.app.acp.PlanEntry
 import com.devingo.app.acp.SessionMode
 import com.devingo.app.acp.SessionModel
 import com.devingo.app.acp.ToolCallInfo
+import com.devingo.app.acp.UserInputQuestion
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Shared transcript/session types. They live outside [ChatViewModel] because
@@ -77,7 +79,7 @@ data class UiState(
     val revertSupported: Boolean = false,
 )
 
-enum class Kind { User, Agent, Thought, Tool, Plan, System, Error }
+enum class Kind { User, Agent, Thought, Tool, Plan, System, Error, Answered }
 
 @Immutable
 data class ChatItem(
@@ -169,6 +171,26 @@ data class PendingPermission(
     internal val requestId: Long = -1,
 )
 
+/**
+ * An `elicitation/create` request the user (or a peer client) can still
+ * answer — Devin asked questions via the question card (A7.2). [choice]
+ * completes with the card's reply (null = dismissed/withdrawn).
+ */
+@Immutable
+data class PendingElicitation(
+    val message: String,
+    val questions: List<UserInputQuestion>,
+    internal val choice: CompletableDeferred<ElicitationReply?>,
+    internal val requestId: Long = -1,
+)
+
+/** The question card's submit — wire `content` plus the WorkLog history lines. */
+data class ElicitationReply(
+    val content: JsonObject,
+    /** "question → answer" lines recorded into the turn's WorkLog. */
+    val lines: List<String>,
+)
+
 /** A photo/screenshot picked on-device, sent as an ACP `image` block. */
 class ImageAttachment(val bytes: ByteArray, val mimeType: String)
 
@@ -240,6 +262,8 @@ data class SessionUi(
 /** Live per-session flags rendered as sidebar badges on the session list. */
 data class SessionBadge(
     val pendingPermission: Boolean = false,
+    /** An elicitation card waits for answers in that session (A7.2). */
+    val pendingInput: Boolean = false,
     val running: Boolean = false,
     /** Output arrived while another session was bound. */
     val unread: Boolean = false,

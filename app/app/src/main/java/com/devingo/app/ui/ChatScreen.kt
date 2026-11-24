@@ -99,6 +99,7 @@ fun ChatScreen(
     val editingQueuedId by vm.editingQueuedId.collectAsState()
     val revertSteps by vm.revertSteps.collectAsState()
     val pendingPermission by vm.pendingPermission.collectAsState()
+    val pendingElicitation by vm.pendingElicitation.collectAsState()
     // Draft + per-turn timings live in the session store — they survive
     // switching away and back, which Compose-local state never did.
     val input by vm.draft.collectAsState()
@@ -228,6 +229,7 @@ fun ChatScreen(
                     tail = tail,
                     ui = ui,
                     pendingPermission = pendingPermission,
+                    pendingElicitation = pendingElicitation,
                     timings = turnTimes,
                     expandedWork = expandedWork,
                     queued = queuedPrompts,
@@ -299,8 +301,10 @@ fun ChatScreen(
             )
         }
         // Context warning chip once usage passes 80% — hidden while a
-        // permission card owns the bottom slot.
-        if (contextFrac >= 0.8f && ui.contextSize > 0 && pendingPermission == null) {
+        // permission/elicitation card owns the bottom slot.
+        if (contextFrac >= 0.8f && ui.contextSize > 0 &&
+            pendingPermission == null && pendingElicitation == null
+        ) {
             ContextChip(
                 pct = contextFrac,
                 onClick = { infoSheet = true },
@@ -309,10 +313,11 @@ fun ChatScreen(
                     .padding(bottom = 6.dp),
             )
         }
-        // Slash-command popup above the composer pill — hidden while the
-        // permission card is up (it owns the popup slot).
-        val showCommands = remember(ui.commands, input, pendingPermission) {
-            pendingPermission == null && commandMatches(ui, input).isNotEmpty()
+        // Slash-command popup above the composer pill — hidden while a
+        // pending card is up (it owns the popup slot).
+        val showCommands = remember(ui.commands, input, pendingPermission, pendingElicitation) {
+            pendingPermission == null && pendingElicitation == null &&
+                commandMatches(ui, input).isNotEmpty()
         }
         AnimatedVisibility(
             visible = showCommands,
@@ -331,6 +336,19 @@ fun ChatScreen(
         PermissionCard(
             pending = pendingPermission,
             onResolve = vm::resolvePermission,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .widthIn(max = 720.dp)
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 8.dp),
+        )
+        // A7.2: the elicitation card takes the same slot when Devin asks
+        // questions (FIFO with permissions — they're independent queues).
+        PendingUserInputCard(
+            pending = pendingElicitation,
+            running = ui.running,
+            onResolve = vm::resolveElicitation,
+            onStop = vm::cancelTurn,
             modifier = Modifier
                 .align(Alignment.CenterHorizontally)
                 .widthIn(max = 720.dp)

@@ -105,6 +105,11 @@ interface AcpEvent {
      * remote client's turn finished.
      */
     data class RemoteTurnEnd(val stopReason: String?) : AcpEvent
+    /**
+     * `elicitation/complete` as a notification — the agent closed the
+     * pending question card on its own; drop it without answering.
+     */
+    data object ElicitationComplete : AcpEvent
 }
 
 /**
@@ -698,6 +703,8 @@ class AcpClient(
                         ?: "devin 进程已退出",
                 ),
             )
+            AcpMethods.ELICITATION_COMPLETE ->
+                emit(sessionId, seq, AcpEvent.ElicitationComplete)
             "_devingo/permission_resolved" -> {
                 val requestId = (p["requestId"] as? JsonPrimitive)?.longOrNull ?: return
                 emit(

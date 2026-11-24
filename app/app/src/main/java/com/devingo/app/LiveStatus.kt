@@ -38,19 +38,21 @@ data class LiveStatus(
      */
     val pendingCount: Int = 0,
 ) {
-    enum class State { Working, NeedsPermission, Idle, Reconnecting, Done, Failed }
+    enum class State { Working, NeedsPermission, NeedsInput, Idle, Reconnecting, Done, Failed }
 }
 
 /**
  * Maps the live UI state onto a [LiveStatus]. Priority: a pending permission
- * beats everything (the user must act), then reconnect, then a running turn,
- * then idle. [runningDetail] comes precomputed with the transcript model so
- * this never scans the message list.
+ * beats everything (the user must act), then a pending elicitation (A7.2 —
+ * also needs-user), then reconnect, then a running turn, then idle.
+ * [runningDetail] comes precomputed with the transcript model so this never
+ * scans the message list.
  */
 fun deriveLiveStatus(
     ui: UiState,
     runningDetail: String?,
     pendingPermission: PendingPermission?,
+    pendingElicitation: PendingElicitation?,
     turnStartedAtMillis: Long,
     /** Set by the caller for a few minutes after a turn ends: Done or Failed. */
     finished: LiveStatus.State? = null,
@@ -78,6 +80,17 @@ fun deriveLiveStatus(
             sessionId = ui.sessionId,
             permissionRequestId = p.requestId,
             permissionToolCallId = p.toolCall.toolCallId,
+            pendingCount = pendingCount,
+        )
+    }
+
+    pendingElicitation?.let {
+        return LiveStatus(
+            state = LiveStatus.State.NeedsInput,
+            title = title,
+            detail = "Devin 有问题需要你回答",
+            startedAtMillis = turnStartedAtMillis,
+            sessionId = ui.sessionId,
             pendingCount = pendingCount,
         )
     }
